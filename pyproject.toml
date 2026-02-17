@@ -11,6 +11,13 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
+  "cfdb",
+  "h5py",
+  "numpy",
+  "pyproj",
+  "geointerp",
+  "rechunkit",
+  "typer",
 ]
 
 [dependency-groups]
@@ -171,6 +178,9 @@ exclude_lines = [
 [build-system]
 requires = ["hatchling>=1.26.1"]
 build-backend = "hatchling.build"
+
+[project.scripts]
+cfdb-ingest = "cfdb_ingest.cli:app"
 
 [project.urls]
 Documentation = "https://mullenkamp.github.io/cfdb-ingest/"
