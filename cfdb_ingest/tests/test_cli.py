@@ -9,7 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from cfdb_ingest.cli import app
-from cfdb_ingest.tests.conftest import requires_wrf_files, WRF_FILE_1
+from cfdb_ingest.tests.conftest import WRF_FILE_1
 
 runner = CliRunner()
 
@@ -34,7 +34,6 @@ class TestCliArgParsing:
         assert result.exit_code != 0
 
 
-@requires_wrf_files
 class TestCliConvert:
     def test_basic_conversion(self):
         """CLI converts a single variable from a real WRF file."""
@@ -95,7 +94,7 @@ class TestCliConvert:
 
             with cfdb.open_dataset(out, "r") as ds:
                 x = np.array(ds["x"][:])
-                assert len(x) < 315  # Less than full domain
+                assert len(x) < 55  # Less than full domain
 
     def test_target_levels(self):
         """CLI parses target-levels for 3D variable conversion."""

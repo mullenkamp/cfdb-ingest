@@ -1,11 +1,7 @@
 """
 Tests for cfdb_ingest.wrf (WrfIngest) and cfdb_ingest.base (H5Ingest).
 
-Uses real wrfout files from:
-  /home/mike/data/wrf/tests/nudge_tests/test_d03_no_nudge/
-
-All tests that need the real files are marked with @requires_wrf_files and
-will be skipped if the test data is absent.
+Uses subset wrfout files from cfdb_ingest/tests/data/.
 """
 import pathlib
 import tempfile
@@ -14,8 +10,6 @@ import h5py
 import numpy as np
 import pyproj
 import pytest
-
-from cfdb_ingest.tests.conftest import requires_wrf_files
 
 
 # ======================================================================
@@ -82,7 +76,6 @@ class TestWrfAttr:
 # WrfIngest — Initialization / Metadata
 # ======================================================================
 
-@requires_wrf_files
 class TestWrfInit:
     def test_crs_is_lambert(self, wrf_single):
         crs = wrf_single.crs
@@ -101,8 +94,8 @@ class TestWrfInit:
         assert wrf_multi.times[-1] == np.datetime64('2015-10-27T23:00', 'm')
 
     def test_spatial_coords_shape(self, wrf_single):
-        assert wrf_single.x.shape == (315,)
-        assert wrf_single.y.shape == (534,)
+        assert wrf_single.x.shape == (55,)
+        assert wrf_single.y.shape == (60,)
 
     def test_spatial_coords_spacing(self, wrf_single):
         dx = np.diff(wrf_single.x)
@@ -136,7 +129,7 @@ class TestWrfInit:
     def test_cosalpha_sinalpha_loaded(self, wrf_single):
         assert wrf_single._cosalpha is not None
         assert wrf_single._sinalpha is not None
-        assert wrf_single._cosalpha.shape == (534, 315)
+        assert wrf_single._cosalpha.shape == (60, 55)
 
     def test_bbox_geographic(self, wrf_single):
         bbox = wrf_single.bbox_geographic
@@ -167,7 +160,6 @@ class TestWrfInit:
 # Variable Resolution
 # ======================================================================
 
-@requires_wrf_files
 class TestVariableResolution:
     def test_resolve_by_mapping_key(self, wrf_single):
         assert wrf_single.resolve_variables(['T2']) == ['T2']
@@ -203,7 +195,6 @@ class TestVariableResolution:
 # Conversion — 2D Variables
 # ======================================================================
 
-@requires_wrf_files
 class TestConvert2D:
     def test_t2_values_match_raw(self, wrf_single, wrf_file_1):
         """T2 (no transform) should match raw WRF data."""
@@ -328,7 +319,6 @@ class TestConvert2D:
 # Conversion — Filtering
 # ======================================================================
 
-@requires_wrf_files
 class TestFiltering:
     def test_date_filter(self, wrf_single):
         """Date range selects correct number of timesteps."""
@@ -405,7 +395,6 @@ class TestFiltering:
 # Conversion — Multi-file
 # ======================================================================
 
-@requires_wrf_files
 class TestMultiFile:
     def test_all_timesteps_merged(self, wrf_multi):
         """48 hours across 2 files."""
@@ -453,7 +442,7 @@ class TestMultiFile:
             with cfdb.open_dataset(out, 'r') as ds:
                 cfdb_pr = np.squeeze(np.array(ds['precipitation'][0]))
 
-            i, j = 267, 157
+            i, j = 30, 25
             with h5py.File(wrf_file_1, 'r') as h5:
                 prev = h5['RAINNC'][-1, i, j] + h5['RAINC'][-1, i, j]
             with h5py.File(wrf_file_2, 'r') as h5:
@@ -467,7 +456,6 @@ class TestMultiFile:
 # Conversion — 3D Variables
 # ======================================================================
 
-@requires_wrf_files
 class TestConvert3D:
     def test_levels_requires_target_levels(self, wrf_single):
         """Converting a level-interpolated var without target_levels should raise."""
@@ -560,7 +548,6 @@ class TestConvert3D:
 # cfdb Output Structure
 # ======================================================================
 
-@requires_wrf_files
 class TestCfdbOutput:
     def test_crs_set(self, wrf_single):
         """CRS should be written to the cfdb dataset."""
@@ -659,7 +646,6 @@ class TestCfdbOutput:
 # Conversion — 3D Wind
 # ======================================================================
 
-@requires_wrf_files
 class TestConvert3DWind:
     def test_wind_speed_3d_shape(self, wrf_single):
         """3D wind speed should have correct shape (n_levels, ny, nx)."""
@@ -752,7 +738,6 @@ class TestConvert3DWind:
 # Conversion — Wind Components
 # ======================================================================
 
-@requires_wrf_files
 class TestConvertWindComponents:
     def test_u_wind_v_wind_10m(self, wrf_single, wrf_file_1):
         """U10/V10 wind components should match manual rotation."""
@@ -830,7 +815,6 @@ class TestConvertWindComponents:
 # Conversion — 3D Specific Humidity
 # ======================================================================
 
-@requires_wrf_files
 class TestConvert3DQ:
     def test_specific_humidity_3d_shape(self, wrf_single):
         """3D specific humidity should have correct shape."""
@@ -901,7 +885,6 @@ class TestConvert3DQ:
 # Conversion — Sea Level Pressure
 # ======================================================================
 
-@requires_wrf_files
 class TestConvertSLP:
     def test_slp_shape(self, wrf_single):
         """SLP should have correct 2D shape."""

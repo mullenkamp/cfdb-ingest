@@ -3,17 +3,10 @@ import pathlib
 import pytest
 
 
-WRF_TEST_DIR = pathlib.Path('/home/mike/data/wrf/tests/nudge_tests/test_d03_no_nudge')
+WRF_TEST_DIR = pathlib.Path(__file__).parent / 'data'
 
 WRF_FILE_1 = WRF_TEST_DIR / 'wrfout_d03_2015-10-26_00:00:00.nc'
 WRF_FILE_2 = WRF_TEST_DIR / 'wrfout_d03_2015-10-27_00:00:00.nc'
-
-wrf_files_available = WRF_FILE_1.exists() and WRF_FILE_2.exists()
-
-requires_wrf_files = pytest.mark.skipif(
-    not wrf_files_available,
-    reason='WRF test files not found',
-)
 
 
 @pytest.fixture
