@@ -113,6 +113,25 @@ class TestCliConvert:
             height = np.array(ds["height"][:])
             np.testing.assert_array_equal(height, [100.0, 500.0, 1000.0])
 
+    def test_chunk_shape(self, tmp_path):
+        """CLI parses --chunk-shape and applies it to the output."""
+        import cfdb
+
+        out = tmp_path / f"{uuid.uuid4().hex}.cfdb"
+        result = runner.invoke(app, [
+            str(WRF_FILE_1),
+            str(out),
+            "-v", "T2",
+            "-s", "2023-02-12T12:00",
+            "-e", "2023-02-12T12:00",
+            "-c", "1,1,50,50",
+        ])
+        assert result.exit_code == 0, result.output
+
+        with cfdb.open_dataset(out, "r") as ds:
+            cs = ds["air_temperature"].chunk_shape
+            assert cs == (1, 1, 50, 50)
+
     def test_nonexistent_input_file(self, tmp_path):
         """CLI should fail gracefully for missing input files."""
         out = tmp_path / f"{uuid.uuid4().hex}.cfdb"

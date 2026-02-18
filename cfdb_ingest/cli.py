@@ -20,6 +20,7 @@ def wrf(
     bbox: Annotated[Optional[str], typer.Option("--bbox", "-b", help="Bounding box: min_lon,min_lat,max_lon,max_lat")] = None,
     target_levels: Annotated[Optional[str], typer.Option("--target-levels", "-l", help="Comma-separated height levels in meters.")] = None,
     max_mem: Annotated[int, typer.Option(help="Read buffer size in bytes.")] = 2**27,
+    chunk_shape: Annotated[Optional[str], typer.Option("--chunk-shape", "-c", help="Output chunk shape as time,z,y,x (e.g. 1,1,50,50).")] = None,
     compression: Annotated[Optional[str], typer.Option(help="Compression: zstd or lz4.")] = None,
 ):
     """Convert WRF output files to cfdb."""
@@ -30,6 +31,7 @@ def wrf(
     var_list = [v.strip() for v in variables.split(",")] if variables else None
     bbox_tuple = tuple(float(x) for x in bbox.split(",")) if bbox else None
     levels = [float(x) for x in target_levels.split(",")] if target_levels else None
+    chunks = tuple(int(x) for x in chunk_shape.split(",")) if chunk_shape else None
 
     cfdb_kwargs = {}
     if compression is not None:
@@ -43,5 +45,6 @@ def wrf(
         bbox=bbox_tuple,
         target_levels=levels,
         max_mem=max_mem,
+        chunk_shape=chunks,
         **cfdb_kwargs,
     )

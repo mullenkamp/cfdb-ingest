@@ -545,6 +545,20 @@ class TestCfdbOutput:
             assert cs[2] > 1   # spatial y
             assert cs[3] > 1   # spatial x
 
+    def test_custom_chunk_shape(self, wrf_single, cfdb_out):
+        """Custom chunk_shape should be applied to the output data variable."""
+        import cfdb
+        wrf_single.convert(
+            cfdb_path=cfdb_out,
+            variables=['T2'],
+            start_date='2023-02-12T12:00',
+            end_date='2023-02-12T12:00',
+            chunk_shape=(1, 1, 50, 50),
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            cs = ds['air_temperature'].chunk_shape
+            assert cs == (1, 1, 50, 50)
+
     def test_cf_attributes_template(self, wrf_single, cfdb_out):
         """Template variables should have CF standard_name and units."""
         import cfdb
