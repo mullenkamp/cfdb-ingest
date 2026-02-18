@@ -213,6 +213,7 @@ class H5Ingest:
         bbox: Optional[Tuple[float, float, float, float]] = None,
         target_levels: Optional[List[float]] = None,
         max_mem: int = 2**27,
+        chunk_shape: Optional[Tuple[int, int, int, int]] = None,
         dataset_type: str = 'grid',
         **cfdb_kwargs,
     ):
@@ -241,6 +242,10 @@ class H5Ingest:
             Target height levels (meters) for level-interpolated variables.
         max_mem : int
             Memory budget in bytes for rechunkit read buffers.
+        chunk_shape : tuple of 4 ints or None
+            Output chunk shape as (time, z, y, x), following CF conventions.
+            Defaults to (1, 1, ny, nx) — one full spatial slab per timestep
+            per height level.
         dataset_type : str
             Passed to cfdb.open_dataset.
         **cfdb_kwargs
@@ -290,7 +295,8 @@ class H5Ingest:
         height_to_idx = {h: i for i, h in enumerate(sorted_heights)}
 
         coord_names = ('time', 'height', 'y', 'x')
-        chunk_shape = (1, 1, ny, nx)
+        if chunk_shape is None:
+            chunk_shape = (1, 1, ny, nx)
 
         with cfdb.open_dataset(cfdb_path, 'n', dataset_type=dataset_type, **cfdb_kwargs) as ds:
             # Create coordinates

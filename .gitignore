@@ -113,6 +113,7 @@ ENV/
 
 # Temp data
 data/*
+!cfdb_ingest/tests/data/
 
 # Test config files
 /cfdb-ingest/tests/*.toml

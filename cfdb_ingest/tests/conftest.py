@@ -1,19 +1,13 @@
 import pathlib
+import uuid
 
 import pytest
 
 
-WRF_TEST_DIR = pathlib.Path('/home/mike/data/wrf/tests/nudge_tests/test_d03_no_nudge')
+WRF_TEST_DIR = pathlib.Path(__file__).parent / 'data'
 
-WRF_FILE_1 = WRF_TEST_DIR / 'wrfout_d03_2015-10-26_00:00:00.nc'
-WRF_FILE_2 = WRF_TEST_DIR / 'wrfout_d03_2015-10-27_00:00:00.nc'
-
-wrf_files_available = WRF_FILE_1.exists() and WRF_FILE_2.exists()
-
-requires_wrf_files = pytest.mark.skipif(
-    not wrf_files_available,
-    reason='WRF test files not found',
-)
+WRF_FILE_1 = WRF_TEST_DIR / 'wrfout_d01_2023-02-12_00:00:00.nc'
+WRF_FILE_2 = WRF_TEST_DIR / 'wrfout_d01_2023-02-13_00:00:00.nc'
 
 
 @pytest.fixture
@@ -36,3 +30,9 @@ def wrf_single(wrf_file_1):
 def wrf_multi(wrf_file_1, wrf_file_2):
     from cfdb_ingest.wrf import WrfIngest
     return WrfIngest([wrf_file_1, wrf_file_2])
+
+
+@pytest.fixture
+def cfdb_out(tmp_path):
+    """Unique output path for each test to avoid collisions in parallel CI."""
+    return tmp_path / f'{uuid.uuid4().hex}.cfdb'
