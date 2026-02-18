@@ -9,7 +9,7 @@ dynamic = ["version"]
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
   "cfdb>=0.3.1",
   "h5py",
@@ -187,11 +187,14 @@ Source = "https://github.com/mullenkamp/cfdb-ingest"
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "/cfdb-ingest",
+    "/cfdb_ingest",
 ]
 exclude = [
     "/cfdb_ingest/tests/*",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["cfdb_ingest"]
 
 [tool.hatch.version]
 path = "cfdb_ingest/__init__.py"
