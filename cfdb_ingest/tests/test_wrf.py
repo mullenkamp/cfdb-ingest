@@ -85,23 +85,23 @@ class TestWrfInit:
 
     def test_times_single_file(self, wrf_single):
         assert len(wrf_single.times) == 24
-        assert wrf_single.times[0] == np.datetime64('2015-10-26T00:00', 'm')
-        assert wrf_single.times[-1] == np.datetime64('2015-10-26T23:00', 'm')
+        assert wrf_single.times[0] == np.datetime64('2023-02-12T00:00', 'm')
+        assert wrf_single.times[-1] == np.datetime64('2023-02-12T23:00', 'm')
 
     def test_times_multi_file(self, wrf_multi):
         assert len(wrf_multi.times) == 48
-        assert wrf_multi.times[0] == np.datetime64('2015-10-26T00:00', 'm')
-        assert wrf_multi.times[-1] == np.datetime64('2015-10-27T23:00', 'm')
+        assert wrf_multi.times[0] == np.datetime64('2023-02-12T00:00', 'm')
+        assert wrf_multi.times[-1] == np.datetime64('2023-02-13T23:00', 'm')
 
     def test_spatial_coords_shape(self, wrf_single):
-        assert wrf_single.x.shape == (55,)
-        assert wrf_single.y.shape == (60,)
+        assert wrf_single.x.shape == (99,)
+        assert wrf_single.y.shape == (111,)
 
     def test_spatial_coords_spacing(self, wrf_single):
         dx = np.diff(wrf_single.x)
         dy = np.diff(wrf_single.y)
-        np.testing.assert_allclose(dx, 3000.0, atol=0.1)
-        np.testing.assert_allclose(dy, 3000.0, atol=0.1)
+        np.testing.assert_allclose(dx, 27000.0, atol=0.1)
+        np.testing.assert_allclose(dy, 27000.0, atol=0.1)
 
     def test_available_variables(self, wrf_single):
         var_keys = set(wrf_single.variables.keys())
@@ -129,7 +129,7 @@ class TestWrfInit:
     def test_cosalpha_sinalpha_loaded(self, wrf_single):
         assert wrf_single._cosalpha is not None
         assert wrf_single._sinalpha is not None
-        assert wrf_single._cosalpha.shape == (60, 55)
+        assert wrf_single._cosalpha.shape == (111, 99)
 
     def test_bbox_geographic(self, wrf_single):
         bbox = wrf_single.bbox_geographic
@@ -204,8 +204,8 @@ class TestConvert2D:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['T2'],
-                start_date='2015-10-26T06:00',
-                end_date='2015-10-26T06:00',
+                start_date='2023-02-12T06:00',
+                end_date='2023-02-12T06:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 cfdb_data = np.squeeze(np.array(ds['air_temperature'][0]))
@@ -224,8 +224,8 @@ class TestConvert2D:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['precip'],
-                start_date='2015-10-26T06:00',
-                end_date='2015-10-26T06:00',
+                start_date='2023-02-12T06:00',
+                end_date='2023-02-12T06:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 cfdb_data = np.squeeze(np.array(ds['precipitation'][0]))
@@ -245,8 +245,8 @@ class TestConvert2D:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['precip'],
-                start_date='2015-10-26T00:00',
-                end_date='2015-10-26T00:00',
+                start_date='2023-02-12T00:00',
+                end_date='2023-02-12T00:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 cfdb_data = np.squeeze(np.array(ds['precipitation'][0]))
@@ -261,8 +261,8 @@ class TestConvert2D:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['WIND10'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 ws_cfdb = np.squeeze(np.array(ds['wind_speed'][0]))
@@ -286,8 +286,8 @@ class TestConvert2D:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['WIND_DIR10'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 wd = np.squeeze(np.array(ds['wind_direction'][0]))
@@ -303,8 +303,8 @@ class TestConvert2D:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['T2', 'TSK', 'SWDOWN', 'GLW', 'SNOWH'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 var_names = [v.name for v in ds.data_vars]
@@ -328,8 +328,8 @@ class TestFiltering:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['T2'],
-                start_date='2015-10-26T06:00',
-                end_date='2015-10-26T10:00',
+                start_date='2023-02-12T06:00',
+                end_date='2023-02-12T10:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 times = np.array(ds['time'][:])
@@ -346,9 +346,9 @@ class TestFiltering:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['T2'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 x = np.array(ds['x'][:])
@@ -378,9 +378,9 @@ class TestFiltering:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['T2'],
-                start_date='2015-10-26T10:00',
-                end_date='2015-10-26T14:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T10:00',
+                end_date='2023-02-12T14:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 times = np.array(ds['time'][:])
@@ -404,14 +404,14 @@ class TestMultiFile:
             wrf_multi.convert(
                 cfdb_path=out,
                 variables=['T2'],
-                start_date='2015-10-26T22:00',
-                end_date='2015-10-27T01:00',
+                start_date='2023-02-12T22:00',
+                end_date='2023-02-13T01:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 times = np.array(ds['time'][:])
                 assert len(times) == 4
-                assert times[0] == np.datetime64('2015-10-26T22:00')
-                assert times[-1] == np.datetime64('2015-10-27T01:00')
+                assert times[0] == np.datetime64('2023-02-12T22:00')
+                assert times[-1] == np.datetime64('2023-02-13T01:00')
 
     def test_precip_cross_file_no_nan(self, wrf_multi):
         """Precip at the first timestep of file 2 should not be NaN."""
@@ -421,8 +421,8 @@ class TestMultiFile:
             wrf_multi.convert(
                 cfdb_path=out,
                 variables=['precip'],
-                start_date='2015-10-27T00:00',
-                end_date='2015-10-27T00:00',
+                start_date='2023-02-13T00:00',
+                end_date='2023-02-13T00:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 pr = np.squeeze(np.array(ds['precipitation'][0]))
@@ -436,8 +436,8 @@ class TestMultiFile:
             wrf_multi.convert(
                 cfdb_path=out,
                 variables=['precip'],
-                start_date='2015-10-27T00:00',
-                end_date='2015-10-27T00:00',
+                start_date='2023-02-13T00:00',
+                end_date='2023-02-13T00:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 cfdb_pr = np.squeeze(np.array(ds['precipitation'][0]))
@@ -465,8 +465,8 @@ class TestConvert3D:
                 wrf_single.convert(
                     cfdb_path=out,
                     variables=['T'],
-                    start_date='2015-10-26T12:00',
-                    end_date='2015-10-26T12:00',
+                    start_date='2023-02-12T12:00',
+                    end_date='2023-02-12T12:00',
                 )
 
     def test_levels_temp_shape_and_height(self, wrf_single):
@@ -478,9 +478,9 @@ class TestConvert3D:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['T'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
                 target_levels=levels,
             )
             with cfdb.open_dataset(out, 'r') as ds:
@@ -499,9 +499,9 @@ class TestConvert3D:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['T'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
                 target_levels=levels,
             )
             with cfdb.open_dataset(out, 'r') as ds:
@@ -519,9 +519,9 @@ class TestConvert3D:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['T2', 'T'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
                 target_levels=[100.0, 500.0],
             )
             with cfdb.open_dataset(out, 'r') as ds:
@@ -557,8 +557,8 @@ class TestCfdbOutput:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['T2'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 assert ds.crs is not None
@@ -571,9 +571,9 @@ class TestCfdbOutput:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['T2'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 dv = ds['air_temperature']
@@ -591,8 +591,8 @@ class TestCfdbOutput:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['T2'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 dv = ds['air_temperature']
@@ -607,8 +607,8 @@ class TestCfdbOutput:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['PSFC', 'SWDOWN', 'SNOWH'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 psfc = ds['surface_pressure']
@@ -631,9 +631,9 @@ class TestCfdbOutput:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['T'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
                 target_levels=[100.0, 500.0],
             )
             with cfdb.open_dataset(out, 'r') as ds:
@@ -656,9 +656,9 @@ class TestConvert3DWind:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['WIND'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
                 target_levels=levels,
             )
             with cfdb.open_dataset(out, 'r') as ds:
@@ -677,9 +677,9 @@ class TestConvert3DWind:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['WIND'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
                 target_levels=levels,
             )
             with cfdb.open_dataset(out, 'r') as ds:
@@ -696,9 +696,9 @@ class TestConvert3DWind:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['WIND10', 'WIND'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
                 target_levels=levels,
             )
             with cfdb.open_dataset(out, 'r') as ds:
@@ -723,9 +723,9 @@ class TestConvert3DWind:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['WIND_DIR'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
                 target_levels=levels,
             )
             with cfdb.open_dataset(out, 'r') as ds:
@@ -747,8 +747,8 @@ class TestConvertWindComponents:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['U10', 'V10'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 u_cfdb = np.squeeze(np.array(ds['u_wind'][0]))
@@ -774,9 +774,9 @@ class TestConvertWindComponents:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['U'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
                 target_levels=levels,
             )
             with cfdb.open_dataset(out, 'r') as ds:
@@ -792,9 +792,9 @@ class TestConvertWindComponents:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['U10', 'U'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
                 target_levels=levels,
             )
             with cfdb.open_dataset(out, 'r') as ds:
@@ -825,9 +825,9 @@ class TestConvert3DQ:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['Q'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
                 target_levels=levels,
             )
             with cfdb.open_dataset(out, 'r') as ds:
@@ -843,9 +843,9 @@ class TestConvert3DQ:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['Q'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
                 target_levels=levels,
             )
             with cfdb.open_dataset(out, 'r') as ds:
@@ -862,9 +862,9 @@ class TestConvert3DQ:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['Q2', 'Q'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
                 target_levels=levels,
             )
             with cfdb.open_dataset(out, 'r') as ds:
@@ -894,9 +894,9 @@ class TestConvertSLP:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['SLP'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
-                bbox=(172.0, -44.0, 173.0, -43.0),
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
+                bbox=(165.0, -47.0, 175.0, -40.0),
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 slp_data = np.squeeze(np.array(ds['mslp'][0]))
@@ -912,8 +912,8 @@ class TestConvertSLP:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['SLP'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 slp = np.squeeze(np.array(ds['mslp'][0]))
@@ -928,8 +928,8 @@ class TestConvertSLP:
             wrf_single.convert(
                 cfdb_path=out,
                 variables=['SLP'],
-                start_date='2015-10-26T12:00',
-                end_date='2015-10-26T12:00',
+                start_date='2023-02-12T12:00',
+                end_date='2023-02-12T12:00',
             )
             with cfdb.open_dataset(out, 'r') as ds:
                 slp = np.squeeze(np.array(ds['mslp'][0]))

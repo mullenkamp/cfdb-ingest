@@ -5,8 +5,8 @@ import pytest
 
 WRF_TEST_DIR = pathlib.Path(__file__).parent / 'data'
 
-WRF_FILE_1 = WRF_TEST_DIR / 'wrfout_d03_2015-10-26_00:00:00.nc'
-WRF_FILE_2 = WRF_TEST_DIR / 'wrfout_d03_2015-10-27_00:00:00.nc'
+WRF_FILE_1 = WRF_TEST_DIR / 'wrfout_d01_2023-02-12_00:00:00.nc'
+WRF_FILE_2 = WRF_TEST_DIR / 'wrfout_d01_2023-02-13_00:00:00.nc'
 
 
 @pytest.fixture

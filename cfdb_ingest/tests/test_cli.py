@@ -45,8 +45,8 @@ class TestCliConvert:
                 str(WRF_FILE_1),
                 str(out),
                 "-v", "T2",
-                "-s", "2015-10-26T12:00",
-                "-e", "2015-10-26T12:00",
+                "-s", "2023-02-12T12:00",
+                "-e", "2023-02-12T12:00",
             ])
             assert result.exit_code == 0, result.output
 
@@ -66,8 +66,8 @@ class TestCliConvert:
                 str(WRF_FILE_1),
                 str(out),
                 "-v", "T2,WIND10",
-                "-s", "2015-10-26T12:00",
-                "-e", "2015-10-26T12:00",
+                "-s", "2023-02-12T12:00",
+                "-e", "2023-02-12T12:00",
             ])
             assert result.exit_code == 0, result.output
 
@@ -86,15 +86,15 @@ class TestCliConvert:
                 str(WRF_FILE_1),
                 str(out),
                 "-v", "T2",
-                "-s", "2015-10-26T12:00",
-                "-e", "2015-10-26T12:00",
-                "-b", "172.0,-44.0,173.0,-43.0",
+                "-s", "2023-02-12T12:00",
+                "-e", "2023-02-12T12:00",
+                "-b", "165.0,-47.0,175.0,-40.0",
             ])
             assert result.exit_code == 0, result.output
 
             with cfdb.open_dataset(out, "r") as ds:
                 x = np.array(ds["x"][:])
-                assert len(x) < 55  # Less than full domain
+                assert len(x) < 99  # Less than full domain
 
     def test_target_levels(self):
         """CLI parses target-levels for 3D variable conversion."""
@@ -106,9 +106,9 @@ class TestCliConvert:
                 str(WRF_FILE_1),
                 str(out),
                 "-v", "T",
-                "-s", "2015-10-26T12:00",
-                "-e", "2015-10-26T12:00",
-                "-b", "172.0,-44.0,173.0,-43.0",
+                "-s", "2023-02-12T12:00",
+                "-e", "2023-02-12T12:00",
+                "-b", "165.0,-47.0,175.0,-40.0",
                 "-l", "100.0,500.0,1000.0",
             ])
             assert result.exit_code == 0, result.output
