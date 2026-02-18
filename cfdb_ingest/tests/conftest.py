@@ -1,4 +1,5 @@
 import pathlib
+import uuid
 
 import pytest
 
@@ -29,3 +30,9 @@ def wrf_single(wrf_file_1):
 def wrf_multi(wrf_file_1, wrf_file_2):
     from cfdb_ingest.wrf import WrfIngest
     return WrfIngest([wrf_file_1, wrf_file_2])
+
+
+@pytest.fixture
+def cfdb_out(tmp_path):
+    """Unique output path for each test to avoid collisions in parallel CI."""
+    return tmp_path / f'{uuid.uuid4().hex}.cfdb'
