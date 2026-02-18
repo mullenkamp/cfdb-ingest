@@ -40,8 +40,10 @@ jobs:
 
       # 3. Run tests
       - name: Run tests
+        timeout-minutes: 3
         env:
           HDF5_USE_FILE_LOCKING: "FALSE"
+          PROJ_NETWORK: "OFF"
         run: uv run pytest --timeout=120
 
 
