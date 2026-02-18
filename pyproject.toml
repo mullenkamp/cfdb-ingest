@@ -28,6 +28,7 @@ dev = [
   "ruff",
   "pytest",
   "pytest-cov",
+  "pytest-timeout",
 ]
 
 [tool.hatch]

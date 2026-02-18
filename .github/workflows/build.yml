@@ -25,6 +25,8 @@ jobs:
       run: |
         hatch run lint-check
     - name: Test
+      env:
+        HDF5_USE_FILE_LOCKING: "FALSE"
       run: |
         hatch run test-cov-xml
     - uses: codecov/codecov-action@v3
