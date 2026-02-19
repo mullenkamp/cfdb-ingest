@@ -134,6 +134,19 @@ WRF_VARIABLE_MAPPING = {
         'transform': 'mixing_ratio_to_specific_humidity',
         'height': 'levels',
     },
+    # --- Vorticity ---
+    'VORT10': {
+        'cfdb_name': 'vorticity',
+        'source_vars': ['U10', 'V10'],
+        'transform': 'vorticity',
+        'height': 10.0,
+    },
+    'VORT': {
+        'cfdb_name': 'vorticity',
+        'source_vars': ['U', 'V', 'PH', 'PHB'],
+        'transform': 'vorticity_3d',
+        'height': 'levels',
+    },
     # --- Sea level pressure ---
     'SLP': {
         'cfdb_name': 'mslp',
@@ -200,6 +213,8 @@ class WrfIngest(H5Ingest):
 
         self.x = spatial['x']
         self.y = spatial['y']
+        self._dx = float(self.x[1] - self.x[0])
+        self._dy = float(self.y[1] - self.y[0])
 
         self._init_time()
         self._init_variables()
@@ -385,6 +400,12 @@ class WrfIngest(H5Ingest):
         elif transform == 'sea_level_pressure':
             return self._read_sea_level_pressure(h5, time_idx, spatial_slice)
 
+        elif transform == 'vorticity':
+            return self._read_vorticity(h5, time_idx, spatial_slice)
+
+        elif transform == 'vorticity_3d':
+            return self._read_vorticity_3d(h5, time_idx, spatial_slice)
+
         raise ValueError(f'Unknown transform: {transform!r}')
 
     def _read_precip_sum(self, h5, var_key, time_idx, spatial_slice):
@@ -547,6 +568,22 @@ class WrfIngest(H5Ingest):
         slp = psfc * np.exp(g * hgt / (rd * t_mean))
 
         return slp.astype('float32')
+
+    def _read_vorticity(self, h5, time_idx, spatial_slice):
+        """Compute vertical relative vorticity at 10m from earth-relative wind components."""
+        u_earth, v_earth = self._read_rotated_wind(h5, time_idx, spatial_slice)
+        dvdx = np.gradient(v_earth, self._dx, axis=1)
+        dudy = np.gradient(u_earth, self._dy, axis=0)
+        return (dvdx - dudy).astype('float32')
+
+    def _read_vorticity_3d(self, h5, time_idx, spatial_slice):
+        """Compute 3D vertical relative vorticity and interpolate to target height levels."""
+        u, v = self._read_rotated_wind_3d(h5, time_idx, spatial_slice)
+        dvdx = np.gradient(v, self._dx, axis=2)
+        dudy = np.gradient(u, self._dy, axis=1)
+        vorticity = dvdx - dudy
+        geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
+        return self._regrid_func(vorticity, geo_height).astype('float32')
 
     def _setup_populate(self, var_key, target_levels):
         """Set up level-interpolation regrid function for 3D variables."""
