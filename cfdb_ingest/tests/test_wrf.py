@@ -121,7 +121,7 @@ class TestWrfInit:
         assert 'V10' in var_keys
         assert 'U' in var_keys
         assert 'V' in var_keys
-        assert 'Q' in var_keys
+        assert 'Q_SH' in var_keys
         assert 'SLP' in var_keys
         # RH2 is not a standard WRF output; should be filtered
         # assert 'RH2' not in var_keys
@@ -778,7 +778,7 @@ class TestConvert3DQ:
         levels = [100.0, 500.0, 1000.0, 2000.0]
         wrf_single.convert(
             cfdb_path=cfdb_out,
-            variables=['Q'],
+            variables=['Q_SH'],
             start_date='2023-02-12T12:00',
             end_date='2023-02-12T12:00',
             bbox=(165.0, -47.0, 175.0, -40.0),
@@ -794,7 +794,7 @@ class TestConvert3DQ:
         levels = [100.0, 500.0, 1000.0]
         wrf_single.convert(
             cfdb_path=cfdb_out,
-            variables=['Q'],
+            variables=['Q_SH'],
             start_date='2023-02-12T12:00',
             end_date='2023-02-12T12:00',
             bbox=(165.0, -47.0, 175.0, -40.0),
@@ -806,12 +806,12 @@ class TestConvert3DQ:
             assert np.nanmax(q) < 0.04
 
     def test_specific_humidity_surface_and_levels_merged(self, wrf_single, cfdb_out):
-        """Q2 + Q merge into one specific_humidity variable."""
+        """Q2_SH + Q_SH merge into one specific_humidity variable."""
         import cfdb
         levels = [100.0, 500.0]
         wrf_single.convert(
             cfdb_path=cfdb_out,
-            variables=['Q2', 'Q'],
+            variables=['Q2_SH', 'Q_SH'],
             start_date='2023-02-12T12:00',
             end_date='2023-02-12T12:00',
             bbox=(165.0, -47.0, 175.0, -40.0),

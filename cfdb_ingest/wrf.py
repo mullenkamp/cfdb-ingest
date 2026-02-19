@@ -36,9 +36,15 @@ WRF_VARIABLE_MAPPING = {
         'height': 0.0,
     },
     'Q2': {
-        'cfdb_name': 'specific_humidity',
+        'cfdb_name': 'mixing_ratio',
         'source_vars': ['Q2'],
         'transform': None,
+        'height': 2.0,
+    },
+    'Q2_SH': {
+        'cfdb_name': 'specific_humidity',
+        'source_vars': ['Q2'],
+        'transform': 'mixing_ratio_to_specific_humidity_2d',
         'height': 2.0,
     },
     'RAIN': {
@@ -80,6 +86,36 @@ WRF_VARIABLE_MAPPING = {
     'SNOWH': {
         'cfdb_name': 'snow_depth',
         'source_vars': ['SNOWH'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'HFX': {
+        'cfdb_name': 'sensible_heat_flux',
+        'source_vars': ['HFX'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'QFX': {
+        'cfdb_name': 'moisture_flux',
+        'source_vars': ['QFX'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'ALBEDO': {
+        'cfdb_name': 'albedo',
+        'source_vars': ['ALBEDO'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'EMISS': {
+        'cfdb_name': 'emissivity',
+        'source_vars': ['EMISS'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'LU_INDEX': {
+        'cfdb_name': 'land_use_modis',
+        'source_vars': ['LU_INDEX'],
         'transform': None,
         'height': 0.0,
     },
@@ -127,8 +163,14 @@ WRF_VARIABLE_MAPPING = {
         'transform': 'v_wind_3d',
         'height': 'levels',
     },
-    # --- 3D specific humidity ---
-    'Q': {
+    # --- 3D moisture ---
+    'QVAPOR': {
+        'cfdb_name': 'mixing_ratio',
+        'source_vars': ['QVAPOR', 'PH', 'PHB'],
+        'transform': 'mixing_ratio_3d',
+        'height': 'levels',
+    },
+    'Q_SH': {
         'cfdb_name': 'specific_humidity',
         'source_vars': ['QVAPOR', 'PH', 'PHB'],
         'transform': 'mixing_ratio_to_specific_humidity',
@@ -145,6 +187,13 @@ WRF_VARIABLE_MAPPING = {
         'cfdb_name': 'vorticity',
         'source_vars': ['U', 'V', 'PH', 'PHB'],
         'transform': 'vorticity_3d',
+        'height': 'levels',
+    },
+    # --- Vertical velocity ---
+    'W': {
+        'cfdb_name': 'vertical_velocity',
+        'source_vars': ['W', 'PH', 'PHB'],
+        'transform': 'vertical_velocity_3d',
         'height': 'levels',
     },
     # --- Sea level pressure ---
@@ -394,6 +443,12 @@ class WrfIngest(H5Ingest):
         elif transform == 'v_wind_3d':
             return self._read_v_wind_3d(h5, time_idx, spatial_slice)
 
+        elif transform == 'mixing_ratio_to_specific_humidity_2d':
+            return self._read_specific_humidity_2d(h5, time_idx, spatial_slice)
+
+        elif transform == 'mixing_ratio_3d':
+            return self._read_mixing_ratio_3d(h5, time_idx, spatial_slice)
+
         elif transform == 'mixing_ratio_to_specific_humidity':
             return self._read_specific_humidity_3d(h5, time_idx, spatial_slice)
 
@@ -405,6 +460,9 @@ class WrfIngest(H5Ingest):
 
         elif transform == 'vorticity_3d':
             return self._read_vorticity_3d(h5, time_idx, spatial_slice)
+
+        elif transform == 'vertical_velocity_3d':
+            return self._read_vertical_velocity_3d(h5, time_idx, spatial_slice)
 
         raise ValueError(f'Unknown transform: {transform!r}')
 
@@ -545,6 +603,19 @@ class WrfIngest(H5Ingest):
         geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
         return self._regrid_func(v, geo_height).astype('float32')
 
+    def _read_specific_humidity_2d(self, h5, time_idx, spatial_slice):
+        """Convert 2m mixing ratio (Q2) to specific humidity."""
+        y_sl, x_sl = spatial_slice
+        mixing_ratio = h5['Q2'][time_idx, y_sl, x_sl].astype('float64')
+        return (mixing_ratio / (1.0 + mixing_ratio)).astype('float32')
+
+    def _read_mixing_ratio_3d(self, h5, time_idx, spatial_slice):
+        """Read 3D mixing ratio and interpolate to target height levels."""
+        y_sl, x_sl = spatial_slice
+        mixing_ratio = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
+        geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
+        return self._regrid_func(mixing_ratio, geo_height).astype('float32')
+
     def _read_specific_humidity_3d(self, h5, time_idx, spatial_slice):
         """Convert mixing ratio to specific humidity and interpolate to target height levels."""
         y_sl, x_sl = spatial_slice
@@ -584,6 +655,14 @@ class WrfIngest(H5Ingest):
         vorticity = dvdx - dudy
         geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
         return self._regrid_func(vorticity, geo_height).astype('float32')
+
+    def _read_vertical_velocity_3d(self, h5, time_idx, spatial_slice):
+        """Read W, unstagger vertically, and interpolate to target height levels."""
+        y_sl, x_sl = spatial_slice
+        w = h5['W'][time_idx, :, y_sl, x_sl].astype('float64')
+        w_unstag = unstagger(w, axis=0)
+        geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
+        return self._regrid_func(w_unstag, geo_height).astype('float32')
 
     def _setup_populate(self, var_key, target_levels):
         """Set up level-interpolation regrid function for 3D variables."""
