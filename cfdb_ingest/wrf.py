@@ -41,12 +41,6 @@ WRF_VARIABLE_MAPPING = {
         'transform': None,
         'height': 2.0,
     },
-    # 'RH2': {
-    #     'cfdb_name': 'relative_humidity',
-    #     'source_vars': ['RH2'],
-    #     'transform': None,
-    #     'height': 2.0,
-    # },
     'RAIN': {
         'cfdb_name': 'precip',
         'source_vars': ['RAINNC', 'RAINC'],
@@ -318,6 +312,22 @@ class WrfIngest(H5Ingest):
 
         return {'x': x, 'y': y}
 
+    def _init_variables(self):
+        """
+        Override to prefer PREC_ACC_C/PREC_ACC_NC (pre-computed hourly precip)
+        over RAINC/RAINNC (running accumulations) when available.
+        """
+        super()._init_variables()
+        if 'RAIN' in self.variables:
+            with h5py.File(self.input_paths[0], 'r') as h5:
+                if 'PREC_ACC_C' in h5 and 'PREC_ACC_NC' in h5:
+                    self.variables['RAIN'] = {
+                        'cfdb_name': 'precip',
+                        'source_vars': ['PREC_ACC_C', 'PREC_ACC_NC'],
+                        'transform': 'precip_sum',
+                        'height': 0.0,
+                    }
+
     def _get_variable_mapping(self):
         """Return the WRF variable mapping dictionary."""
         return WRF_VARIABLE_MAPPING
@@ -336,6 +346,9 @@ class WrfIngest(H5Ingest):
 
         elif transform == 'accumulation_increment':
             return self._read_accumulation_increment(h5, var_key, time_idx, spatial_slice)
+
+        elif transform == 'precip_sum':
+            return self._read_precip_sum(h5, var_key, time_idx, spatial_slice)
 
         elif transform == 'wind_speed':
             u_earth, v_earth = self._read_rotated_wind(h5, time_idx, spatial_slice)
@@ -373,6 +386,13 @@ class WrfIngest(H5Ingest):
             return self._read_sea_level_pressure(h5, time_idx, spatial_slice)
 
         raise ValueError(f'Unknown transform: {transform!r}')
+
+    def _read_precip_sum(self, h5, var_key, time_idx, spatial_slice):
+        """Sum pre-computed hourly precipitation fields (PREC_ACC_C + PREC_ACC_NC)."""
+        info = self.variables[var_key]
+        y_sl, x_sl = spatial_slice
+        total = sum(h5[sv][time_idx, y_sl, x_sl].astype('float64') for sv in info['source_vars'])
+        return total.astype('float32')
 
     def _read_rotated_wind(self, h5, time_idx, spatial_slice):
         """
