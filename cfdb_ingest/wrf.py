@@ -47,6 +47,18 @@ WRF_VARIABLE_MAPPING = {
         'transform': 'mixing_ratio_to_specific_humidity_2d',
         'height': 2.0,
     },
+    'RH2': {
+        'cfdb_name': 'relative_humidity',
+        'source_vars': ['T2', 'Q2', 'PSFC'],
+        'transform': 'relative_humidity_2d',
+        'height': 2.0,
+    },
+    'TD2': {
+        'cfdb_name': 'dew_temp',
+        'source_vars': ['Q2', 'PSFC'],
+        'transform': 'dew_point_2d',
+        'height': 2.0,
+    },
     'RAIN': {
         'cfdb_name': 'precip',
         'source_vars': ['RAINNC', 'RAINC'],
@@ -174,6 +186,18 @@ WRF_VARIABLE_MAPPING = {
         'cfdb_name': 'specific_humidity',
         'source_vars': ['QVAPOR', 'PH', 'PHB'],
         'transform': 'mixing_ratio_to_specific_humidity',
+        'height': 'levels',
+    },
+    'RH': {
+        'cfdb_name': 'relative_humidity',
+        'source_vars': ['T', 'P', 'PB', 'QVAPOR', 'PH', 'PHB'],
+        'transform': 'relative_humidity_3d',
+        'height': 'levels',
+    },
+    'TD': {
+        'cfdb_name': 'dew_temp',
+        'source_vars': ['QVAPOR', 'P', 'PB', 'PH', 'PHB'],
+        'transform': 'dew_point_3d',
         'height': 'levels',
     },
     # --- Vorticity ---
@@ -452,6 +476,18 @@ class WrfIngest(H5Ingest):
         elif transform == 'mixing_ratio_to_specific_humidity':
             return self._read_specific_humidity_3d(h5, time_idx, spatial_slice)
 
+        elif transform == 'relative_humidity_2d':
+            return self._read_relative_humidity_2d(h5, time_idx, spatial_slice)
+
+        elif transform == 'relative_humidity_3d':
+            return self._read_relative_humidity_3d(h5, time_idx, spatial_slice)
+
+        elif transform == 'dew_point_2d':
+            return self._read_dew_point_2d(h5, time_idx, spatial_slice)
+
+        elif transform == 'dew_point_3d':
+            return self._read_dew_point_3d(h5, time_idx, spatial_slice)
+
         elif transform == 'sea_level_pressure':
             return self._read_sea_level_pressure(h5, time_idx, spatial_slice)
 
@@ -623,6 +659,67 @@ class WrfIngest(H5Ingest):
         specific_humidity = mixing_ratio / (1.0 + mixing_ratio)
         geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
         return self._regrid_func(specific_humidity, geo_height).astype('float32')
+
+    def _read_relative_humidity_2d(self, h5, time_idx, spatial_slice):
+        """Compute 2m relative humidity from T2, Q2, and PSFC."""
+        y_sl, x_sl = spatial_slice
+        t2 = h5['T2'][time_idx, y_sl, x_sl].astype('float64')
+        q2 = h5['Q2'][time_idx, y_sl, x_sl].astype('float64')
+        psfc = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
+
+        # Saturation vapor pressure (Bolton 1980) [Pa]
+        es = 611.2 * np.exp(17.67 * (t2 - 273.15) / (t2 - 273.15 + 243.5))
+        # Actual vapor pressure from mixing ratio [Pa]
+        e = q2 * psfc / (0.622 + q2)
+        rh = np.clip(e / es, 0.0, 1.0)
+        return rh.astype('float32')
+
+    def _read_relative_humidity_3d(self, h5, time_idx, spatial_slice):
+        """Compute 3D relative humidity and interpolate to target height levels."""
+        y_sl, x_sl = spatial_slice
+        t_pert = h5['T'][time_idx, :, y_sl, x_sl].astype('float64')
+        p = h5['P'][time_idx, :, y_sl, x_sl].astype('float64')
+        pb = h5['PB'][time_idx, :, y_sl, x_sl].astype('float64')
+        q = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
+
+        theta = t_pert + 300.0
+        pressure = p + pb
+        t_actual = theta * (pressure / 100000.0) ** 0.2854
+
+        es = 611.2 * np.exp(17.67 * (t_actual - 273.15) / (t_actual - 273.15 + 243.5))
+        e = q * pressure / (0.622 + q)
+        rh = np.clip(e / es, 0.0, 1.0)
+
+        geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
+        return self._regrid_func(rh, geo_height).astype('float32')
+
+    def _read_dew_point_2d(self, h5, time_idx, spatial_slice):
+        """Compute 2m dew point temperature from Q2 and PSFC."""
+        y_sl, x_sl = spatial_slice
+        q2 = h5['Q2'][time_idx, y_sl, x_sl].astype('float64')
+        psfc = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
+
+        # Actual vapor pressure from mixing ratio [Pa]
+        e = q2 * psfc / (0.622 + q2)
+        # Inverse Bolton formula for dew point [K]
+        ln_ratio = np.log(e / 611.2)
+        td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+        return td.astype('float32')
+
+    def _read_dew_point_3d(self, h5, time_idx, spatial_slice):
+        """Compute 3D dew point temperature and interpolate to target height levels."""
+        y_sl, x_sl = spatial_slice
+        q = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
+        p = h5['P'][time_idx, :, y_sl, x_sl].astype('float64')
+        pb = h5['PB'][time_idx, :, y_sl, x_sl].astype('float64')
+        pressure = p + pb
+
+        e = q * pressure / (0.622 + q)
+        ln_ratio = np.log(e / 611.2)
+        td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+
+        geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
+        return self._regrid_func(td, geo_height).astype('float32')
 
     def _read_sea_level_pressure(self, h5, time_idx, spatial_slice):
         """Compute sea level pressure using hypsometric reduction."""
