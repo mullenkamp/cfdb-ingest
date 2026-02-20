@@ -131,11 +131,41 @@ WRF_VARIABLE_MAPPING = {
         'transform': None,
         'height': 0.0,
     },
+    'HGT': {
+        'cfdb_name': 'terrain_height',
+        'source_vars': ['HGT'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'THETA2': {
+        'cfdb_name': 'potential_temperature',
+        'source_vars': ['T2', 'PSFC'],
+        'transform': 'potential_temperature_2d',
+        'height': 2.0,
+    },
+    'THETA_E2': {
+        'cfdb_name': 'equivalent_potential_temperature',
+        'source_vars': ['T2', 'Q2', 'PSFC'],
+        'transform': 'equivalent_potential_temperature_2d',
+        'height': 2.0,
+    },
     # --- Level-interpolated variables ---
     'T': {
         'cfdb_name': 'air_temp',
         'source_vars': ['T', 'P', 'PB', 'PH', 'PHB'],
         'transform': 'potential_to_actual_temp',
+        'height': 'levels',
+    },
+    'THETA': {
+        'cfdb_name': 'potential_temperature',
+        'source_vars': ['T', 'PH', 'PHB'],
+        'transform': 'potential_temperature_3d',
+        'height': 'levels',
+    },
+    'THETA_E': {
+        'cfdb_name': 'equivalent_potential_temperature',
+        'source_vars': ['T', 'P', 'PB', 'QVAPOR', 'PH', 'PHB'],
+        'transform': 'equivalent_potential_temperature_3d',
         'height': 'levels',
     },
     'WIND': {
@@ -500,6 +530,18 @@ class WrfIngest(H5Ingest):
         elif transform == 'vertical_velocity_3d':
             return self._read_vertical_velocity_3d(h5, time_idx, spatial_slice)
 
+        elif transform == 'potential_temperature_2d':
+            return self._read_potential_temperature_2d(h5, time_idx, spatial_slice)
+
+        elif transform == 'potential_temperature_3d':
+            return self._read_potential_temperature_3d(h5, time_idx, spatial_slice)
+
+        elif transform == 'equivalent_potential_temperature_2d':
+            return self._read_equivalent_potential_temperature_2d(h5, time_idx, spatial_slice)
+
+        elif transform == 'equivalent_potential_temperature_3d':
+            return self._read_equivalent_potential_temperature_3d(h5, time_idx, spatial_slice)
+
         raise ValueError(f'Unknown transform: {transform!r}')
 
     def _read_precip_sum(self, h5, var_key, time_idx, spatial_slice):
@@ -736,6 +778,69 @@ class WrfIngest(H5Ingest):
         slp = psfc * np.exp(g * hgt / (rd * t_mean))
 
         return slp.astype('float32')
+
+    def _read_potential_temperature_2d(self, h5, time_idx, spatial_slice):
+        """Compute 2m potential temperature from T2 and PSFC."""
+        y_sl, x_sl = spatial_slice
+        t2 = h5['T2'][time_idx, y_sl, x_sl].astype('float64')
+        psfc = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
+        theta = t2 * (100000.0 / psfc) ** 0.2854
+        return theta.astype('float32')
+
+    def _read_potential_temperature_3d(self, h5, time_idx, spatial_slice):
+        """Read WRF potential temperature (T + 300) and interpolate to target height levels."""
+        y_sl, x_sl = spatial_slice
+        t_pert = h5['T'][time_idx, :, y_sl, x_sl].astype('float64')
+        theta = t_pert + 300.0
+        geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
+        return self._regrid_func(theta, geo_height).astype('float32')
+
+    def _read_equivalent_potential_temperature_2d(self, h5, time_idx, spatial_slice):
+        """Compute 2m equivalent potential temperature using Bolton (1980)."""
+        y_sl, x_sl = spatial_slice
+        t2 = h5['T2'][time_idx, y_sl, x_sl].astype('float64')
+        q2 = h5['Q2'][time_idx, y_sl, x_sl].astype('float64')
+        psfc = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
+
+        # Vapor pressure and dew point for LCL temperature
+        e = q2 * psfc / (0.622 + q2)
+        ln_ratio = np.log(e / 611.2)
+        td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+
+        # LCL temperature (Bolton 1980, eq. 15)
+        tl = 1.0 / (1.0 / (td - 56.0) + np.log(t2 / td) / 800.0) + 56.0
+
+        # Bolton (1980) eq. 43
+        theta_e = t2 * (100000.0 / psfc) ** (0.2854 * (1.0 - 0.28 * q2)) \
+            * np.exp(q2 * (1.0 + 0.81 * q2) * (3376.0 / tl - 2.54))
+        return theta_e.astype('float32')
+
+    def _read_equivalent_potential_temperature_3d(self, h5, time_idx, spatial_slice):
+        """Compute 3D equivalent potential temperature (Bolton 1980) and interpolate to target levels."""
+        y_sl, x_sl = spatial_slice
+        t_pert = h5['T'][time_idx, :, y_sl, x_sl].astype('float64')
+        p = h5['P'][time_idx, :, y_sl, x_sl].astype('float64')
+        pb = h5['PB'][time_idx, :, y_sl, x_sl].astype('float64')
+        q = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
+
+        theta = t_pert + 300.0
+        pressure = p + pb
+        t_actual = theta * (pressure / 100000.0) ** 0.2854
+
+        # Vapor pressure and dew point for LCL temperature
+        e = q * pressure / (0.622 + q)
+        ln_ratio = np.log(e / 611.2)
+        td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+
+        # LCL temperature (Bolton 1980, eq. 15)
+        tl = 1.0 / (1.0 / (td - 56.0) + np.log(t_actual / td) / 800.0) + 56.0
+
+        # Bolton (1980) eq. 43
+        theta_e = t_actual * (100000.0 / pressure) ** (0.2854 * (1.0 - 0.28 * q)) \
+            * np.exp(q * (1.0 + 0.81 * q) * (3376.0 / tl - 2.54))
+
+        geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
+        return self._regrid_func(theta_e, geo_height).astype('float32')
 
     def _read_vorticity(self, h5, time_idx, spatial_slice):
         """Compute vertical relative vorticity at 10m from earth-relative wind components."""
