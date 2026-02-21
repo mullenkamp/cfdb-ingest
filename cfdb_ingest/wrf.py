@@ -563,6 +563,10 @@ class WrfIngest(H5Ingest):
         u_earth, v_earth : np.ndarray
             Earth-relative wind components.
         """
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 'wind_2d' in cache:
+            return cache['wind_2d']
+
         y_sl, x_sl = spatial_slice
         u_grid = h5['U10'][time_idx, y_sl, x_sl].astype('float64')
         v_grid = h5['V10'][time_idx, y_sl, x_sl].astype('float64')
@@ -576,14 +580,27 @@ class WrfIngest(H5Ingest):
             u_earth = u_grid
             v_earth = v_grid
 
-        return u_earth, v_earth
+        result = (u_earth, v_earth)
+        if cache is not None:
+            cache['wind_2d'] = result
+
+        return result
 
     def _compute_geo_height(self, h5, time_idx, spatial_slice):
         """Compute unstaggered geopotential height from PH + PHB."""
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 'geo_height' in cache:
+            return cache['geo_height']
+
         y_sl, x_sl = spatial_slice
         ph = h5['PH'][time_idx, :, y_sl, x_sl].astype('float64')
         phb = h5['PHB'][time_idx, :, y_sl, x_sl].astype('float64')
-        return unstagger((ph + phb) / 9.81, axis=0)
+        result = unstagger((ph + phb) / 9.81, axis=0)
+
+        if cache is not None:
+            cache['geo_height'] = result
+
+        return result
 
     def _read_rotated_wind_3d(self, h5, time_idx, spatial_slice):
         """
@@ -594,14 +611,23 @@ class WrfIngest(H5Ingest):
         u_earth, v_earth : np.ndarray
             Earth-relative wind components, each shape (nz, ny, nx).
         """
-        y_sl, x_sl = spatial_slice
-        # U is staggered in x (last dim): shape (nz, ny, nx+1)
-        u_raw = h5['U'][time_idx, :, y_sl, :].astype('float64')
-        u_unstag = unstagger(u_raw, axis=2)[:, :, x_sl]
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 'wind_3d' in cache:
+            return cache['wind_3d']
 
-        # V is staggered in y (second-to-last dim): shape (nz, ny+1, nx)
-        v_raw = h5['V'][time_idx, :, :, x_sl].astype('float64')
-        v_unstag = unstagger(v_raw, axis=1)[:, y_sl, :]
+        y_sl, x_sl = spatial_slice
+
+        # U is staggered in x (last dim): read only the needed stagger range
+        nx_unstag = h5['U'].shape[3] - 1
+        x_start, x_stop, _ = x_sl.indices(nx_unstag)
+        u_raw = h5['U'][time_idx, :, y_sl, x_start:x_stop + 1].astype('float64')
+        u_unstag = unstagger(u_raw, axis=2)
+
+        # V is staggered in y (second-to-last dim): read only the needed stagger range
+        ny_unstag = h5['V'].shape[2] - 1
+        y_start, y_stop, _ = y_sl.indices(ny_unstag)
+        v_raw = h5['V'][time_idx, :, y_start:y_stop + 1, x_sl].astype('float64')
+        v_unstag = unstagger(v_raw, axis=1)
 
         if self._cosalpha is not None:
             cosa = self._cosalpha[y_sl, x_sl]
@@ -612,7 +638,11 @@ class WrfIngest(H5Ingest):
             u_earth = u_unstag
             v_earth = v_unstag
 
-        return u_earth, v_earth
+        result = (u_earth, v_earth)
+        if cache is not None:
+            cache['wind_3d'] = result
+
+        return result
 
     def _read_potential_to_actual_temp(self, h5, time_idx, spatial_slice):
         """

@@ -102,10 +102,12 @@ wheels = [
 
 [[package]]
 name = "cfdb"
-version = "0.3.1"
+version = "0.3.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "booklet" },
+    { name = "cfdb-models" },
+    { name = "cfdb-vars" },
     { name = "geointerp" },
     { name = "lz4" },
     { name = "msgspec" },
@@ -117,9 +119,9 @@ dependencies = [
     { name = "shapely" },
     { name = "zstandard" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/13/6f/85556ffb43d5b3705cbd0fe2ac04cbca1d25049142f775ee4b4152a1ef3c/cfdb-0.3.1.tar.gz", hash = "sha256:510b014280b988a9f585734e6afb7b27e715674d6bf0fa925fd8b5533cc8c4bb", size = 55228, upload-time = "2026-02-18T00:56:24.705Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/03/22/f8a94335c7e812aa46a80a01f4e126b53de031d45954fe69701ca0fe1bbb/cfdb-0.3.5.tar.gz", hash = "sha256:0da8bd22741297ce207761bed7bf7ab4b47a7cca1822f2baf71d84a696d45920", size = 53642, upload-time = "2026-02-20T05:36:31.222Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bf/88/c8cc28845b7a094c23cdf8f8b386562f620ad7403dbcf37eca180d1d10c9/cfdb-0.3.1-py3-none-any.whl", hash = "sha256:b96105aa1c26305c9aa7ac7d1ee662227b070eab2d2708e1b24e2dc51f63935a", size = 61061, upload-time = "2026-02-18T00:56:23.193Z" },
+    { url = "https://files.pythonhosted.org/packages/74/62/456786eed71776dd50033b57563467b4c19ef7d66f7b31715b437f2a6580/cfdb-0.3.5-py3-none-any.whl", hash = "sha256:2f02485b0089ecf174d8d08534f80bd1bca90820c2c6c043f3c18902d88dda88", size = 59579, upload-time = "2026-02-20T05:36:29.341Z" },
 ]
 
 [[package]]
@@ -150,7 +152,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cfdb", specifier = ">=0.3.1" },
+    { name = "cfdb", specifier = ">=0.3.5" },
     { name = "geointerp" },
     { name = "h5py" },
     { name = "numpy" },
@@ -168,6 +170,28 @@ dev = [
     { name = "pytest-timeout" },
     { name = "ruff" },
     { name = "spyder-kernels", specifier = "==2.5.2" },
+]
+
+[[package]]
+name = "cfdb-models"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f1/50/1357bef5ff8b440c519fd0fb4868112d4aa1122009c591e896e20969db75/cfdb_models-0.1.0.tar.gz", hash = "sha256:63a7d6abff0ee28479cca83ca798fd6e8903a6539382a8f6639679895dfeb32f", size = 4220, upload-time = "2026-02-20T03:02:18.204Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d6/f7/29112de4955eba16fccc97ac4a8e973665ac72a46b9923be8e3a0b47d365/cfdb_models-0.1.0-py3-none-any.whl", hash = "sha256:90a903f2d35fa41064298352d37be92f4092997af85cb845075663edfb330704", size = 3736, upload-time = "2026-02-20T03:02:17.038Z" },
+]
+
+[[package]]
+name = "cfdb-vars"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cfdb-models" },
+    { name = "msgspec" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c7/17/5390693433fa3d8412b14dc83c5b157db15eb64b2161cc892872b0bb4762/cfdb_vars-0.1.0.tar.gz", hash = "sha256:54a115363ecd56614c27dcf39386cb348b67849777c3150450411962ca8b4470", size = 5643, upload-time = "2026-02-20T04:25:18.382Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/66/7250cc947da3595774a8fffc5f7502c35add555cd2f6f734242c29d419a4/cfdb_vars-0.1.0-py3-none-any.whl", hash = "sha256:ca1fa167cd792122adce9cd546c6bdcfb5b9537e0d9315d0b3cd764d084fecc7", size = 5777, upload-time = "2026-02-20T04:25:16.957Z" },
 ]
 
 [[package]]

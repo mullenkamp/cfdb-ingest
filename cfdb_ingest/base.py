@@ -308,16 +308,43 @@ class H5Ingest:
             # Set CRS
             ds.create.crs.from_user_input(self.crs, x_coord='x', y_coord='y')
 
-            # Create and populate data variables
+            # Classify each (var_key, data_var, height_indices) into processing groups
+            rechunkit_items = []
+            accumulation_items = []
+            batch_items = []
+
             for cfdb_name, var_group in cfdb_var_groups.items():
                 data_var = self._create_cfdb_data_var(ds, cfdb_name, coord_names, chunk_shape)
 
                 for var_key, heights in var_group:
                     height_indices = [height_to_idx[h] for h in heights]
-                    self._populate_data_var(
-                        data_var, var_key, time_mask, spatial_slice, max_mem,
-                        height_indices, target_levels,
-                    )
+                    info = self.variables[var_key]
+                    transform = info.get('transform')
+                    is_simple = transform is None and len(info['source_vars']) == 1
+                    is_accumulation = transform == 'accumulation_increment'
+
+                    item = (var_key, data_var, height_indices)
+                    if is_simple:
+                        rechunkit_items.append(item)
+                    elif is_accumulation:
+                        accumulation_items.append(item)
+                    else:
+                        batch_items.append(item)
+
+            # Process each group with its optimal strategy
+            for var_key, data_var, height_indices in rechunkit_items:
+                self._setup_populate(var_key, target_levels)
+                self._populate_with_rechunkit(data_var, var_key, time_mask, spatial_slice, max_mem, height_indices)
+
+            for var_key, data_var, height_indices in accumulation_items:
+                self._setup_populate(var_key, target_levels)
+                self._prev_accum_total = None
+                self._populate_per_timestep(data_var, var_key, time_mask, spatial_slice, height_indices, is_accumulation=True)
+
+            if batch_items:
+                for var_key, _, _ in batch_items:
+                    self._setup_populate(var_key, target_levels)
+                self._populate_batch_per_timestep(batch_items, time_mask, spatial_slice)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -420,29 +447,6 @@ class H5Ingest:
 
         return result.astype('float32')
 
-    def _populate_data_var(self, data_var, var_key, time_mask, spatial_slice, max_mem, height_indices, target_levels):
-        """
-        Dispatch data population to the appropriate strategy.
-
-        Simple variables (no transform, single source var) use rechunkit for
-        optimal HDF5 reads. Transform variables (accumulation, wind, 3D temp)
-        use per-timestep iteration.
-        """
-        info = self.variables[var_key]
-        transform = info.get('transform')
-        is_simple = transform is None and len(info['source_vars']) == 1
-        is_accumulation = transform == 'accumulation_increment'
-
-        self._setup_populate(var_key, target_levels)
-
-        if is_accumulation:
-            self._prev_accum_total = None
-
-        if is_simple:
-            self._populate_with_rechunkit(data_var, var_key, time_mask, spatial_slice, max_mem, height_indices)
-        else:
-            self._populate_per_timestep(data_var, var_key, time_mask, spatial_slice, height_indices, is_accumulation)
-
     def _populate_with_rechunkit(self, data_var, var_key, time_mask, spatial_slice, max_mem, height_indices):
         """
         Populate a simple (no-transform, single source var) data variable using
@@ -531,6 +535,40 @@ class H5Ingest:
                         for sv in info['source_vars']
                     )
                     self._prev_accum_total = total.astype('float32')
+
+    def _populate_batch_per_timestep(self, batch_items, time_mask, spatial_slice):
+        """
+        Populate multiple transform variables with timestep-outer, variable-inner
+        loop order, enabling per-timestep caching of shared intermediates
+        (e.g., geo_height, rotated winds).
+        """
+        global_time_idx = 0
+        output_time_idx = 0
+
+        for path, file_times, _ in self._file_time_map:
+            n_file_times = len(file_times)
+
+            with h5py.File(path, 'r') as h5:
+                for local_t in range(n_file_times):
+                    if not time_mask[global_time_idx]:
+                        global_time_idx += 1
+                        continue
+
+                    self._ts_cache = {}
+
+                    for var_key, data_var, height_indices in batch_items:
+                        data = self._read_variable(h5, var_key, local_t, spatial_slice)
+
+                        if len(height_indices) == 1:
+                            data_var[(output_time_idx, height_indices[0], slice(None), slice(None))] = data
+                        else:
+                            for lev_i, h_idx in enumerate(height_indices):
+                                data_var[(output_time_idx, h_idx, slice(None), slice(None))] = data[lev_i]
+
+                    self._ts_cache = None
+
+                    output_time_idx += 1
+                    global_time_idx += 1
 
     def _get_file_for_global_time(self, global_idx):
         """

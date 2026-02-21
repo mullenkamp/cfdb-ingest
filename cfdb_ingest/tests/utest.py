@@ -61,11 +61,11 @@ combo = (rainc1 + rainnc1)
 precip1.values.round(2)
 
 
-precipc = x1['PREC_ACC_C']
-precipnc = x1['PREC_ACC_NC']
+precipc = x1['PREC_ACC_C'][1, :, :]
+precipnc = x1['PREC_ACC_NC'][1, :, :]
 
 
-
+precip2 = (precipc.values + precipnc.values).round(2)
 
 
 

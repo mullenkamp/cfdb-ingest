@@ -11,7 +11,7 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-  "cfdb>=0.3.1",
+  "cfdb>=0.3.5",
   "h5py",
   "numpy",
   "pyproj",
@@ -155,6 +155,7 @@ ban-relative-imports = "all"
 # Tests can use magic values, assertions, and relative imports
 "tests/**/*" = ["PLR2004", "S101", "TID252"]
 "cfdb_ingest/tests/create_test_data.py" = ["T201"]
+"benchmarks/**/*" = ["T201", "S101"]
 
 [tool.coverage.run]
 source_pkgs = ["cfdb_ingest", "tests"]
