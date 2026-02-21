@@ -774,8 +774,10 @@ class WrfIngest(H5Ingest):
         # Actual vapor pressure from mixing ratio [Pa]
         e = q2 * psfc / (0.622 + q2)
         # Inverse Bolton formula for dew point [K]
-        ln_ratio = np.log(e / 611.2)
-        td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+        # NaN is expected where moisture is zero (e <= 0)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ln_ratio = np.log(e / 611.2)
+            td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
         return td.astype('float32')
 
     def _read_dew_point_3d(self, h5, time_idx, spatial_slice):
@@ -787,8 +789,9 @@ class WrfIngest(H5Ingest):
         pressure = p + pb
 
         e = q * pressure / (0.622 + q)
-        ln_ratio = np.log(e / 611.2)
-        td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ln_ratio = np.log(e / 611.2)
+            td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
 
         geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
         return self._regrid_func(td, geo_height).astype('float32')
@@ -833,16 +836,18 @@ class WrfIngest(H5Ingest):
         psfc = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
 
         # Vapor pressure and dew point for LCL temperature
+        # NaN is expected where moisture is zero (e <= 0)
         e = q2 * psfc / (0.622 + q2)
-        ln_ratio = np.log(e / 611.2)
-        td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ln_ratio = np.log(e / 611.2)
+            td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
 
-        # LCL temperature (Bolton 1980, eq. 15)
-        tl = 1.0 / (1.0 / (td - 56.0) + np.log(t2 / td) / 800.0) + 56.0
+            # LCL temperature (Bolton 1980, eq. 15)
+            tl = 1.0 / (1.0 / (td - 56.0) + np.log(t2 / td) / 800.0) + 56.0
 
-        # Bolton (1980) eq. 43
-        theta_e = t2 * (100000.0 / psfc) ** (0.2854 * (1.0 - 0.28 * q2)) \
-            * np.exp(q2 * (1.0 + 0.81 * q2) * (3376.0 / tl - 2.54))
+            # Bolton (1980) eq. 43
+            theta_e = t2 * (100000.0 / psfc) ** (0.2854 * (1.0 - 0.28 * q2)) \
+                * np.exp(q2 * (1.0 + 0.81 * q2) * (3376.0 / tl - 2.54))
         return theta_e.astype('float32')
 
     def _read_equivalent_potential_temperature_3d(self, h5, time_idx, spatial_slice):
@@ -858,16 +863,18 @@ class WrfIngest(H5Ingest):
         t_actual = theta * (pressure / 100000.0) ** 0.2854
 
         # Vapor pressure and dew point for LCL temperature
+        # NaN is expected where moisture is zero (e <= 0)
         e = q * pressure / (0.622 + q)
-        ln_ratio = np.log(e / 611.2)
-        td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ln_ratio = np.log(e / 611.2)
+            td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
 
-        # LCL temperature (Bolton 1980, eq. 15)
-        tl = 1.0 / (1.0 / (td - 56.0) + np.log(t_actual / td) / 800.0) + 56.0
+            # LCL temperature (Bolton 1980, eq. 15)
+            tl = 1.0 / (1.0 / (td - 56.0) + np.log(t_actual / td) / 800.0) + 56.0
 
-        # Bolton (1980) eq. 43
-        theta_e = t_actual * (100000.0 / pressure) ** (0.2854 * (1.0 - 0.28 * q)) \
-            * np.exp(q * (1.0 + 0.81 * q) * (3376.0 / tl - 2.54))
+            # Bolton (1980) eq. 43
+            theta_e = t_actual * (100000.0 / pressure) ** (0.2854 * (1.0 - 0.28 * q)) \
+                * np.exp(q * (1.0 + 0.81 * q) * (3376.0 / tl - 2.54))
 
         geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
         return self._regrid_func(theta_e, geo_height).astype('float32')

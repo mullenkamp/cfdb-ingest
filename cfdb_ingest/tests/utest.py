@@ -21,7 +21,7 @@ files = ['wrfout_d03_2023-02-12_00:00:00.nc', 'wrfout_d03_2023-02-13_00:00:00.nc
 
 output_path = pathlib.Path('/home/mike/data/wrf/tests/physics_tests/2023-02-10/gabriele_3km.cfdb')
 
-
+# output_path2 = pathlib.Path('/home/mike/data/wrf/tests/physics_tests/2023-02-10/gabriele_3km2.cfdb')
 
 
 
@@ -32,6 +32,7 @@ wrf1 = cfdb_ingest.WrfIngest([base_dir.joinpath(file) for file in files])
 
 wrf1.convert(output_path, target_levels=[20, 50, 100])
 
+# d2 = cfdb.open_dataset(output_path2)
 d1 = cfdb.open_dataset(output_path)
 
 air_temp = d1['air_temperature']
