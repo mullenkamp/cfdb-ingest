@@ -1,6 +1,7 @@
 """
 Base class for HDF5/netCDF4 ingestion to cfdb via h5py.
 """
+import datetime
 import pathlib
 from typing import Union, List, Tuple, Dict, Optional
 
@@ -159,6 +160,24 @@ class H5Ingest:
         """
         raise NotImplementedError
 
+    def _get_dataset_attrs(self) -> Dict[str, object]:
+        """
+        Return dataset-level CF attributes for the cfdb output.
+
+        Subclasses should override and call super() to add source-specific
+        attributes (e.g., model version, physics parameters).
+        """
+        import cfdb_ingest
+
+        filenames = ', '.join(p.name for p in self.input_paths)
+        now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        return {
+            'Conventions': 'CF-1.11',
+            'history': f'{now} Converted using cfdb-ingest {cfdb_ingest.__version__}',
+            'source_files': filenames,
+        }
+
     # ------------------------------------------------------------------
     # Public methods
     # ------------------------------------------------------------------
@@ -307,6 +326,10 @@ class H5Ingest:
 
             # Set CRS
             ds.create.crs.from_user_input(self.crs, x_coord='x', y_coord='y')
+
+            # Set dataset attributes
+            for key, value in self._get_dataset_attrs().items():
+                ds.attrs[key] = value
 
             # Classify each (var_key, data_var, height_indices) into processing groups
             rechunkit_items = []

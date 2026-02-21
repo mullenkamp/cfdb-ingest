@@ -15,7 +15,7 @@ def _wrf_attr(attrs, key):
     """Extract a scalar value from a WRF HDF5 attribute (may be a 1-element array)."""
     val = attrs[key]
     if hasattr(val, 'item'):
-        return val.item()
+        val = val.item()
     if isinstance(val, bytes):
         return val.decode()
     return val
@@ -259,6 +259,30 @@ WRF_VARIABLE_MAPPING = {
     },
 }
 
+_WRF_DATASET_ATTRS = [
+    # Grid
+    'GRID_ID', 'DX', 'DY', 'DT',
+    # Microphysics
+    'MP_PHYSICS',
+    # Radiation
+    'RA_LW_PHYSICS', 'RA_SW_PHYSICS', 'RADT',
+    # PBL
+    'BL_PBL_PHYSICS', 'SF_SFCLAY_PHYSICS',
+    # Cumulus
+    'CU_PHYSICS', 'CUDT', 'SHCU_PHYSICS',
+    # Land surface
+    'SF_SURFACE_PHYSICS', 'MMINLU', 'NUM_LAND_CAT',
+    # Diffusion
+    'DIFF_OPT', 'KM_OPT', 'DAMP_OPT',
+    # Dynamics
+    'HYBRID_OPT', 'MOIST_ADV_OPT', 'USE_THETA_M',
+    # Nudging
+    'GRID_FDDA', 'GFDDA_INTERVAL_M',
+    # Other
+    'GWD_OPT', 'SF_LAKE_PHYSICS', 'SF_OCEAN_PHYSICS',
+    'SF_URBAN_PHYSICS', 'SST_UPDATE', 'PREC_ACC_DT',
+]
+
 
 def unstagger(data, axis):
     """
@@ -300,7 +324,7 @@ class WrfIngest(H5Ingest):
 
     def _init_metadata(self):
         """
-        Override to also load wind rotation fields (COSALPHA, SINALPHA).
+        Override to also load wind rotation fields and WRF source attributes.
         """
         with h5py.File(self.input_paths[0], 'r') as h5:
             self.crs = self._parse_crs(h5)
@@ -313,6 +337,13 @@ class WrfIngest(H5Ingest):
             else:
                 self._cosalpha = None
                 self._sinalpha = None
+
+            # Extract WRF source info and physics parameters
+            self._source_title = _wrf_attr(h5.attrs, 'TITLE').strip()
+            self._wrf_params = {}
+            for key in _WRF_DATASET_ATTRS:
+                if key in h5.attrs:
+                    self._wrf_params[key] = _wrf_attr(h5.attrs, key)
 
         self.x = spatial['x']
         self.y = spatial['y']
@@ -449,6 +480,13 @@ class WrfIngest(H5Ingest):
     def _get_variable_mapping(self):
         """Return the WRF variable mapping dictionary."""
         return WRF_VARIABLE_MAPPING
+
+    def _get_dataset_attrs(self):
+        """Return CF + WRF-specific dataset attributes."""
+        attrs = super()._get_dataset_attrs()
+        attrs['source'] = self._source_title
+        attrs.update(self._wrf_params)
+        return attrs
 
     def _read_variable(self, h5, var_key, time_idx, spatial_slice):
         """
