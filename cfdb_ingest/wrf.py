@@ -464,18 +464,19 @@ class WrfIngest(H5Ingest):
     def _init_variables(self):
         """
         Override to prefer PREC_ACC_C/PREC_ACC_NC (pre-computed hourly precip)
-        over RAINC/RAINNC (running accumulations) when available.
+        over RAINC/RAINNC (running accumulations) when available, and also
+        allow precipitation when only PREC_ACC_* variables exist.
         """
         super()._init_variables()
-        if 'RAIN' in self.variables:
-            with h5py.File(self.input_paths[0], 'r') as h5:
-                if 'PREC_ACC_C' in h5 and 'PREC_ACC_NC' in h5:
-                    self.variables['RAIN'] = {
-                        'cfdb_name': 'precip',
-                        'source_vars': ['PREC_ACC_C', 'PREC_ACC_NC'],
-                        'transform': 'precip_sum',
-                        'height': 0.0,
-                    }
+        with h5py.File(self.input_paths[0], 'r') as h5:
+            has_prec_acc = 'PREC_ACC_C' in h5 and 'PREC_ACC_NC' in h5
+        if has_prec_acc:
+            self.variables['RAIN'] = {
+                'cfdb_name': 'precip',
+                'source_vars': ['PREC_ACC_C', 'PREC_ACC_NC'],
+                'transform': 'precip_sum',
+                'height': 0.0,
+            }
 
     def _get_variable_mapping(self):
         """Return the WRF variable mapping dictionary."""
