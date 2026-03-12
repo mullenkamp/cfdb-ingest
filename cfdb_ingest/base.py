@@ -30,7 +30,13 @@ class H5Ingest:
 
     def __init__(self, input_paths: Union[str, pathlib.Path, List[Union[str, pathlib.Path]]]):
         if isinstance(input_paths, (str, pathlib.Path)):
-            input_paths = [input_paths]
+            p = pathlib.Path(input_paths)
+            if p.is_dir():
+                input_paths = list(p.glob('wrfout*'))
+                if not input_paths:
+                    raise FileNotFoundError(f'No wrfout files found in directory: {p}')
+            else:
+                input_paths = [p]
         self.input_paths = sorted(pathlib.Path(p) for p in input_paths)
 
         for p in self.input_paths:
