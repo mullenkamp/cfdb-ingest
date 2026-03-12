@@ -62,7 +62,11 @@ class H5Ingest:
 
     def _init_time(self):
         """
-        Build self.times and self._file_time_map from all input files.
+        Build self.times, self._file_time_map, and self._raw_to_unique from all input files.
+
+        When files have overlapping timesteps, _raw_to_unique maps each raw
+        timestep index to its position in the deduplicated self.times array,
+        or -1 for duplicates that should be skipped.
         """
         file_time_map = []
         all_times = []
@@ -80,6 +84,13 @@ class H5Ingest:
         unique_idx.sort()
         self.times = combined[unique_idx]
         self._file_time_map = file_time_map
+
+        # Map raw timestep indices to unique time indices (-1 = duplicate)
+        unique_set = set(unique_idx.tolist())
+        time_to_unique = {t: i for i, t in enumerate(self.times)}
+        self._raw_to_unique = np.full(len(combined), -1, dtype='int64')
+        for raw_i in unique_set:
+            self._raw_to_unique[raw_i] = time_to_unique[combined[raw_i]]
 
     def _init_variables(self):
         """
@@ -485,15 +496,15 @@ class H5Ingest:
         y_sl, x_sl = spatial_slice
         h_idx = height_indices[0]
 
-        # Pre-compute global_time_idx -> output_time_idx mapping
+        # Pre-compute unique_time_idx -> output_time_idx mapping
         output_map = {}
         out_idx = 0
-        for g_idx in range(len(time_mask)):
-            if time_mask[g_idx]:
-                output_map[g_idx] = out_idx
+        for u_idx in range(len(time_mask)):
+            if time_mask[u_idx]:
+                output_map[u_idx] = out_idx
                 out_idx += 1
 
-        global_time_idx = 0
+        raw_offset = 0
         for path, file_times, _ in self._file_time_map:
             n_file_times = len(file_times)
 
@@ -517,13 +528,13 @@ class H5Ingest:
                     source_chunks, target_chunks, max_mem, sel=sel,
                 ):
                     local_t = write_slices[0].start
-                    g_idx = global_time_idx + local_t
-                    if g_idx not in output_map:
+                    u_idx = self._raw_to_unique[raw_offset + local_t]
+                    if u_idx == -1 or u_idx not in output_map:
                         continue
 
-                    data_var[(output_map[g_idx], h_idx, slice(None), slice(None))] = data[0].astype('float32')
+                    data_var[(output_map[u_idx], h_idx, slice(None), slice(None))] = data[0].astype('float32')
 
-            global_time_idx += n_file_times
+            raw_offset += n_file_times
 
     def _populate_per_timestep(self, data_var, var_key, time_mask, spatial_slice, height_indices, is_accumulation):
         """
@@ -532,7 +543,7 @@ class H5Ingest:
         Used for transform variables (accumulation, wind, 3D temp) that need
         per-timestep logic. Handles accumulation cross-file caching.
         """
-        global_time_idx = 0
+        raw_offset = 0
         output_time_idx = 0
 
         for path, file_times, _ in self._file_time_map:
@@ -540,8 +551,8 @@ class H5Ingest:
 
             with h5py.File(path, 'r') as h5:
                 for local_t in range(n_file_times):
-                    if not time_mask[global_time_idx]:
-                        global_time_idx += 1
+                    u_idx = self._raw_to_unique[raw_offset + local_t]
+                    if u_idx == -1 or not time_mask[u_idx]:
                         continue
 
                     data = self._read_variable(h5, var_key, local_t, spatial_slice)
@@ -553,7 +564,6 @@ class H5Ingest:
                             data_var[(output_time_idx, h_idx, slice(None), slice(None))] = data[lev_i]
 
                     output_time_idx += 1
-                    global_time_idx += 1
 
                 # Cache last accumulated total for cross-file boundary
                 if is_accumulation:
@@ -565,13 +575,15 @@ class H5Ingest:
                     )
                     self._prev_accum_total = total.astype('float32')
 
+            raw_offset += n_file_times
+
     def _populate_batch_per_timestep(self, batch_items, time_mask, spatial_slice):
         """
         Populate multiple transform variables with timestep-outer, variable-inner
         loop order, enabling per-timestep caching of shared intermediates
         (e.g., geo_height, rotated winds).
         """
-        global_time_idx = 0
+        raw_offset = 0
         output_time_idx = 0
 
         for path, file_times, _ in self._file_time_map:
@@ -579,8 +591,8 @@ class H5Ingest:
 
             with h5py.File(path, 'r') as h5:
                 for local_t in range(n_file_times):
-                    if not time_mask[global_time_idx]:
-                        global_time_idx += 1
+                    u_idx = self._raw_to_unique[raw_offset + local_t]
+                    if u_idx == -1 or not time_mask[u_idx]:
                         continue
 
                     self._ts_cache = {}
@@ -597,7 +609,8 @@ class H5Ingest:
                     self._ts_cache = None
 
                     output_time_idx += 1
-                    global_time_idx += 1
+
+            raw_offset += n_file_times
 
     def _get_file_for_global_time(self, global_idx):
         """

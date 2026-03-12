@@ -33,6 +33,13 @@ def wrf_multi(wrf_file_1, wrf_file_2):
 
 
 @pytest.fixture
+def wrf_overlap(wrf_file_1, wrf_file_2):
+    """Two files passed as [file1, file2, file1] so all of file1's times are duplicated."""
+    from cfdb_ingest.wrf import WrfIngest
+    return WrfIngest([wrf_file_1, wrf_file_2, wrf_file_1])
+
+
+@pytest.fixture
 def cfdb_out(tmp_path):
     """Unique output path for each test to avoid collisions in parallel CI."""
     return tmp_path / f'{uuid.uuid4().hex}.cfdb'

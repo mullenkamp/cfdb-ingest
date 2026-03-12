@@ -426,6 +426,60 @@ class TestMultiFile:
         np.testing.assert_allclose(float(cfdb_pr[i, j]), expected, atol=0.02)
 
 
+class TestOverlappingTimesteps:
+    """Files with overlapping time ranges should deduplicate, first-file-wins."""
+
+    def test_times_deduplicated(self, wrf_overlap):
+        """Passing [file1, file2, file1] should still yield 48 unique times."""
+        assert len(wrf_overlap.times) == 48
+        assert wrf_overlap.times[0] == np.datetime64('2023-02-12T00:00', 'm')
+        assert wrf_overlap.times[-1] == np.datetime64('2023-02-13T23:00', 'm')
+
+    def test_raw_to_unique_marks_duplicates(self, wrf_overlap):
+        """Sorted order is [file1, file1, file2]; second file1 should be all -1."""
+        r2u = wrf_overlap._raw_to_unique
+        # 24 + 24 + 24 = 72 raw timesteps
+        assert len(r2u) == 72
+        # First 24 (file1, first occurrence) are unique
+        assert (r2u[:24] != -1).all()
+        # Next 24 (file1, duplicate) are all -1
+        assert (r2u[24:48] == -1).all()
+        # Last 24 (file2) are unique
+        assert (r2u[48:] != -1).all()
+
+    def test_simple_var_rechunkit(self, wrf_overlap, wrf_file_1, cfdb_out):
+        """Rechunkit path (no-transform) produces correct data with overlaps."""
+        import cfdb
+        wrf_overlap.convert(cfdb_path=cfdb_out, variables=['T2'])
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            assert np.array(ds['time'][:]).shape[0] == 48
+            cfdb_data = np.squeeze(np.array(ds['air_temperature'][6]))
+
+        with h5py.File(wrf_file_1, 'r') as h5:
+            raw_data = h5['T2'][6]
+        np.testing.assert_allclose(cfdb_data, raw_data, atol=0.02)
+
+    def test_batch_var_with_overlap(self, wrf_overlap, wrf_file_1, cfdb_out):
+        """Batch path (transform vars) produces correct data with overlaps."""
+        import cfdb
+        wrf_overlap.convert(
+            cfdb_path=cfdb_out,
+            variables=['WIND10'],
+            start_date='2023-02-12T06:00',
+            end_date='2023-02-12T06:00',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            times = np.array(ds['time'][:])
+            assert len(times) == 1
+            cfdb_ws = np.squeeze(np.array(ds['wind_speed'][0]))
+
+        with h5py.File(wrf_file_1, 'r') as h5:
+            u = h5['U10'][6].astype('float64')
+            v = h5['V10'][6].astype('float64')
+        expected = np.sqrt(u**2 + v**2)
+        np.testing.assert_allclose(cfdb_ws, expected, atol=0.1)
+
+
 # ======================================================================
 # Conversion — 3D Variables
 # ======================================================================
