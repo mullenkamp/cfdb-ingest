@@ -129,14 +129,9 @@ name = "cfdb-ingest"
 source = { editable = "." }
 dependencies = [
     { name = "cfdb" },
-    { name = "geointerp" },
     { name = "h5py" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "pyproj", version = "3.7.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "pyproj", version = "3.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "rechunkit" },
     { name = "typer" },
+    { name = "wrf-to-int" },
 ]
 
 [package.dev-dependencies]
@@ -153,12 +148,9 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cfdb", specifier = ">=0.3.5" },
-    { name = "geointerp" },
     { name = "h5py" },
-    { name = "numpy" },
-    { name = "pyproj" },
-    { name = "rechunkit" },
     { name = "typer" },
+    { name = "wrf-to-int", specifier = ">=0.1.1" },
 ]
 
 [package.metadata.requires-dev]
@@ -507,6 +499,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f4/4b/edb916daf796c48bd5a53071a9b210dbafecb86df9b5c7a50399ff02e568/geointerp-0.1.1.tar.gz", hash = "sha256:a930130e860b8ddbc80810d6ab431b1abf4bc3feae1229c693caf402db611d12", size = 13146, upload-time = "2026-02-14T00:46:18.489Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/03/7d/3e404a33055dc88bfead298076f0a99b5013b5a555d3062ae73bc92e836c/geointerp-0.1.1-py3-none-any.whl", hash = "sha256:342a63e1df777f7e78b98b74cbe6f7e72ece23a6c01bc1924e9f670d88daebd2", size = 15442, upload-time = "2026-02-14T00:46:16.861Z" },
+]
+
+[[package]]
+name = "h5netcdf"
+version = "1.8.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "packaging" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ef/03/92d6cc02c0055158167255980461155d6e17f1c4143c03f8bcc18d3e3f3a/h5netcdf-1.8.1.tar.gz", hash = "sha256:9b396a4cc346050fc1a4df8523bc1853681ec3544e0449027ae397cb953c7a16", size = 78679, upload-time = "2026-01-23T07:35:31.233Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b1/8b/88f16936a8e8070a83d36239555227ecd91728f9ef222c5382cda07e0fd6/h5netcdf-1.8.1-py3-none-any.whl", hash = "sha256:a76ed7cfc9b8a8908ea7057c4e57e27307acff1049b7f5ed52db6c2247636879", size = 62915, upload-time = "2026-01-23T07:35:30.195Z" },
 ]
 
 [[package]]
@@ -2050,6 +2056,22 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/35/a2/8e3becb46433538a38726c948d3399905a4c7cabd0df578ede5dc51f0ec2/wcwidth-0.6.0.tar.gz", hash = "sha256:cdc4e4262d6ef9a1a57e018384cbeb1208d8abbc64176027e2c2455c81313159", size = 159684, upload-time = "2026-02-06T19:19:40.919Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/68/5a/199c59e0a824a3db2b89c5d2dade7ab5f9624dbf6448dc291b46d5ec94d3/wcwidth-0.6.0-py3-none-any.whl", hash = "sha256:1a3a1e510b553315f8e146c54764f4fb6264ffad731b3d78088cdb1478ffbdad", size = 94189, upload-time = "2026-02-06T19:19:39.646Z" },
+]
+
+[[package]]
+name = "wrf-to-int"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "h5netcdf" },
+    { name = "h5py" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "typer" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4e/ff/7ddb99f2e536bb4ddae36cc8ca8cce8eb4a5885ad259b460d1ac320df547/wrf_to_int-0.1.1.tar.gz", hash = "sha256:d88e17a7c8481457e62d334de2ae035f8ceeecc96c0ad23891dd8860e28eda9c", size = 13724, upload-time = "2026-03-21T07:19:59.938Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/10/c8/1b82e8e39ac29fd1d3933871e4c9d2c0757e0ea71db265e32cf92e58f8c3/wrf_to_int-0.1.1-py3-none-any.whl", hash = "sha256:ab222ed164bdcfbd0a841731111a5365af1984e20c1ef4f8bdb7e3a9e01f88c9", size = 14550, upload-time = "2026-03-21T07:19:58.579Z" },
 ]
 
 [[package]]

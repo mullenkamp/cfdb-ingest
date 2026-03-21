@@ -124,21 +124,12 @@ convert_cfdb_to_int(
 
 ## Implementation Notes
 
-### WPS intermediate file format
+### WPS intermediate file writing
 
-The WPS intermediate file writer was originally based on code from [era5_to_int](https://github.com/era5_to_int). During testing with metgrid.exe, several issues were discovered that only manifested with non-LATLON projections:
+The WPS intermediate file format is handled by the [wrf_to_int](https://github.com/wrf_to_int) package, which provides the shared `IntermediateFile`, `Projections`, `MapProjection`, and `write_slab` tools used by both `cfdb-to-int` and `era5_to_int`. See the [wrf_to_int library API](https://github.com/wrf_to_int#library-api) for details on building custom converters.
 
-**Projection codes**: The WPS intermediate file format uses different integer codes than WPS internal codes:
+Key conventions for the WPS intermediate file format:
 
-| Projection | File code |
-|---|---|
-| Lat-Lon | 0 |
-| Mercator | 1 |
-| Lambert Conformal | 3 |
-| Gaussian | 4 |
-| Polar Stereographic | 5 |
-| Cassini | 6 |
-
-**dx/dy units**: metgrid reads dx/dy from the file and multiplies by 1000 -- values must be in **km**, not meters.
-
-**earth_radius units**: Same convention -- metgrid multiplies by 1000, so the value must be in **km** (6371.229), not meters (6371229.0).
+- **Projection codes**: Lat-Lon=0, Mercator=1, Lambert Conformal=3, Gaussian=4, Polar Stereographic=5, Cassini=6
+- **dx/dy**: must be in **km** (metgrid multiplies by 1000)
+- **earth_radius**: must be in **km** (6371.229, not 6371229.0)
