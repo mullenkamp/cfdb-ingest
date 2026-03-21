@@ -15,7 +15,7 @@ def _wrf_attr(attrs, key):
     """Extract a scalar value from a WRF HDF5 attribute (may be a 1-element array)."""
     val = attrs[key]
     if hasattr(val, 'item'):
-        return val.item()
+        val = val.item()
     if isinstance(val, bytes):
         return val.decode()
     return val
@@ -36,17 +36,29 @@ WRF_VARIABLE_MAPPING = {
         'height': 0.0,
     },
     'Q2': {
-        'cfdb_name': 'specific_humidity',
+        'cfdb_name': 'mixing_ratio',
         'source_vars': ['Q2'],
         'transform': None,
         'height': 2.0,
     },
-    # 'RH2': {
-    #     'cfdb_name': 'relative_humidity',
-    #     'source_vars': ['RH2'],
-    #     'transform': None,
-    #     'height': 2.0,
-    # },
+    'Q2_SH': {
+        'cfdb_name': 'specific_humidity',
+        'source_vars': ['Q2'],
+        'transform': 'mixing_ratio_to_specific_humidity_2d',
+        'height': 2.0,
+    },
+    'RH2': {
+        'cfdb_name': 'relative_humidity',
+        'source_vars': ['T2', 'Q2', 'PSFC'],
+        'transform': 'relative_humidity_2d',
+        'height': 2.0,
+    },
+    'TD2': {
+        'cfdb_name': 'dew_temp',
+        'source_vars': ['Q2', 'PSFC'],
+        'transform': 'dew_point_2d',
+        'height': 2.0,
+    },
     'RAIN': {
         'cfdb_name': 'precip',
         'source_vars': ['RAINNC', 'RAINC'],
@@ -89,11 +101,71 @@ WRF_VARIABLE_MAPPING = {
         'transform': None,
         'height': 0.0,
     },
+    'HFX': {
+        'cfdb_name': 'sensible_heat_flux',
+        'source_vars': ['HFX'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'QFX': {
+        'cfdb_name': 'moisture_flux',
+        'source_vars': ['QFX'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'ALBEDO': {
+        'cfdb_name': 'albedo',
+        'source_vars': ['ALBEDO'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'EMISS': {
+        'cfdb_name': 'emissivity',
+        'source_vars': ['EMISS'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'LU_INDEX': {
+        'cfdb_name': 'land_use_modis',
+        'source_vars': ['LU_INDEX'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'HGT': {
+        'cfdb_name': 'terrain_height',
+        'source_vars': ['HGT'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'THETA2': {
+        'cfdb_name': 'potential_temperature',
+        'source_vars': ['T2', 'PSFC'],
+        'transform': 'potential_temperature_2d',
+        'height': 2.0,
+    },
+    'THETA_E2': {
+        'cfdb_name': 'equivalent_potential_temperature',
+        'source_vars': ['T2', 'Q2', 'PSFC'],
+        'transform': 'equivalent_potential_temperature_2d',
+        'height': 2.0,
+    },
     # --- Level-interpolated variables ---
     'T': {
         'cfdb_name': 'air_temp',
         'source_vars': ['T', 'P', 'PB', 'PH', 'PHB'],
         'transform': 'potential_to_actual_temp',
+        'height': 'levels',
+    },
+    'THETA': {
+        'cfdb_name': 'potential_temperature',
+        'source_vars': ['T', 'PH', 'PHB'],
+        'transform': 'potential_temperature_3d',
+        'height': 'levels',
+    },
+    'THETA_E': {
+        'cfdb_name': 'equivalent_potential_temperature',
+        'source_vars': ['T', 'P', 'PB', 'QVAPOR', 'PH', 'PHB'],
+        'transform': 'equivalent_potential_temperature_3d',
         'height': 'levels',
     },
     'WIND': {
@@ -133,11 +205,49 @@ WRF_VARIABLE_MAPPING = {
         'transform': 'v_wind_3d',
         'height': 'levels',
     },
-    # --- 3D specific humidity ---
-    'Q': {
+    # --- 3D moisture ---
+    'QVAPOR': {
+        'cfdb_name': 'mixing_ratio',
+        'source_vars': ['QVAPOR', 'PH', 'PHB'],
+        'transform': 'mixing_ratio_3d',
+        'height': 'levels',
+    },
+    'Q_SH': {
         'cfdb_name': 'specific_humidity',
         'source_vars': ['QVAPOR', 'PH', 'PHB'],
         'transform': 'mixing_ratio_to_specific_humidity',
+        'height': 'levels',
+    },
+    'RH': {
+        'cfdb_name': 'relative_humidity',
+        'source_vars': ['T', 'P', 'PB', 'QVAPOR', 'PH', 'PHB'],
+        'transform': 'relative_humidity_3d',
+        'height': 'levels',
+    },
+    'TD': {
+        'cfdb_name': 'dew_temp',
+        'source_vars': ['QVAPOR', 'P', 'PB', 'PH', 'PHB'],
+        'transform': 'dew_point_3d',
+        'height': 'levels',
+    },
+    # --- Vorticity ---
+    'VORT10': {
+        'cfdb_name': 'vorticity',
+        'source_vars': ['U10', 'V10'],
+        'transform': 'vorticity',
+        'height': 10.0,
+    },
+    'VORT': {
+        'cfdb_name': 'vorticity',
+        'source_vars': ['U', 'V', 'PH', 'PHB'],
+        'transform': 'vorticity_3d',
+        'height': 'levels',
+    },
+    # --- Vertical velocity ---
+    'W': {
+        'cfdb_name': 'vertical_velocity',
+        'source_vars': ['W', 'PH', 'PHB'],
+        'transform': 'vertical_velocity_3d',
         'height': 'levels',
     },
     # --- Sea level pressure ---
@@ -147,7 +257,76 @@ WRF_VARIABLE_MAPPING = {
         'transform': 'sea_level_pressure',
         'height': 0.0,
     },
+    # --- Geopotential height (for WPS intermediate files) ---
+    'GHT': {
+        'cfdb_name': 'geopotential_height',
+        'source_vars': ['PH', 'PHB'],
+        'transform': 'geopotential_height_3d',
+        'height': 'levels',
+    },
+    # --- Additional surface variables for WPS ---
+    'XLAND': {
+        'cfdb_name': 'land_sea_mask',
+        'source_vars': ['XLAND'],
+        'transform': 'land_sea_mask',
+        'height': 0.0,
+    },
+    'SEAICE_VAR': {
+        'cfdb_name': 'sea_ice',
+        'source_vars': ['SEAICE'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'SST_VAR': {
+        'cfdb_name': 'sea_surface_temp',
+        'source_vars': ['SST'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'SNOW_VAR': {
+        'cfdb_name': 'snow_water_equiv',
+        'source_vars': ['SNOW'],
+        'transform': None,
+        'height': 0.0,
+    },
+    # --- Soil variables ---
+    'SMOIS': {
+        'cfdb_name': 'soil_moisture',
+        'source_vars': ['SMOIS'],
+        'transform': 'soil_3d',
+        'height': 'soil',
+    },
+    'TSLB': {
+        'cfdb_name': 'soil_layer_temp',
+        'source_vars': ['TSLB'],
+        'transform': 'soil_3d',
+        'height': 'soil',
+    },
 }
+
+_WRF_DATASET_ATTRS = [
+    # Grid
+    'GRID_ID', 'DX', 'DY', 'DT',
+    # Microphysics
+    'MP_PHYSICS',
+    # Radiation
+    'RA_LW_PHYSICS', 'RA_SW_PHYSICS', 'RADT',
+    # PBL
+    'BL_PBL_PHYSICS', 'SF_SFCLAY_PHYSICS',
+    # Cumulus
+    'CU_PHYSICS', 'CUDT', 'SHCU_PHYSICS',
+    # Land surface
+    'SF_SURFACE_PHYSICS', 'MMINLU', 'NUM_LAND_CAT',
+    # Diffusion
+    'DIFF_OPT', 'KM_OPT', 'DAMP_OPT',
+    # Dynamics
+    'HYBRID_OPT', 'MOIST_ADV_OPT', 'USE_THETA_M',
+    # Nudging
+    'GRID_FDDA', 'GFDDA_INTERVAL_M',
+    # Other
+    'GWD_OPT', 'SF_LAKE_PHYSICS', 'SF_OCEAN_PHYSICS',
+    'SF_URBAN_PHYSICS', 'SST_UPDATE', 'PREC_ACC_DT',
+]
 
 
 def unstagger(data, axis):
@@ -190,7 +369,7 @@ class WrfIngest(H5Ingest):
 
     def _init_metadata(self):
         """
-        Override to also load wind rotation fields (COSALPHA, SINALPHA).
+        Override to also load wind rotation fields and WRF source attributes.
         """
         with h5py.File(self.input_paths[0], 'r') as h5:
             self.crs = self._parse_crs(h5)
@@ -204,8 +383,17 @@ class WrfIngest(H5Ingest):
                 self._cosalpha = None
                 self._sinalpha = None
 
+            # Extract WRF source info and physics parameters
+            self._source_title = _wrf_attr(h5.attrs, 'TITLE').strip()
+            self._wrf_params = {}
+            for key in _WRF_DATASET_ATTRS:
+                if key in h5.attrs:
+                    self._wrf_params[key] = _wrf_attr(h5.attrs, key)
+
         self.x = spatial['x']
         self.y = spatial['y']
+        self._dx = float(self.x[1] - self.x[0])
+        self._dy = float(self.y[1] - self.y[0])
 
         self._init_time()
         self._init_variables()
@@ -318,9 +506,33 @@ class WrfIngest(H5Ingest):
 
         return {'x': x, 'y': y}
 
+    def _init_variables(self):
+        """
+        Override to prefer PREC_ACC_C/PREC_ACC_NC (pre-computed hourly precip)
+        over RAINC/RAINNC (running accumulations) when available, and also
+        allow precipitation when only PREC_ACC_* variables exist.
+        """
+        super()._init_variables()
+        with h5py.File(self.input_paths[0], 'r') as h5:
+            has_prec_acc = 'PREC_ACC_C' in h5 and 'PREC_ACC_NC' in h5
+        if has_prec_acc:
+            self.variables['RAIN'] = {
+                'cfdb_name': 'precip',
+                'source_vars': ['PREC_ACC_C', 'PREC_ACC_NC'],
+                'transform': 'precip_sum',
+                'height': 0.0,
+            }
+
     def _get_variable_mapping(self):
         """Return the WRF variable mapping dictionary."""
         return WRF_VARIABLE_MAPPING
+
+    def _get_dataset_attrs(self):
+        """Return CF + WRF-specific dataset attributes."""
+        attrs = super()._get_dataset_attrs()
+        attrs['source'] = self._source_title
+        attrs.update(self._wrf_params)
+        return attrs
 
     def _read_variable(self, h5, var_key, time_idx, spatial_slice):
         """
@@ -336,6 +548,9 @@ class WrfIngest(H5Ingest):
 
         elif transform == 'accumulation_increment':
             return self._read_accumulation_increment(h5, var_key, time_idx, spatial_slice)
+
+        elif transform == 'precip_sum':
+            return self._read_precip_sum(h5, var_key, time_idx, spatial_slice)
 
         elif transform == 'wind_speed':
             u_earth, v_earth = self._read_rotated_wind(h5, time_idx, spatial_slice)
@@ -366,13 +581,68 @@ class WrfIngest(H5Ingest):
         elif transform == 'v_wind_3d':
             return self._read_v_wind_3d(h5, time_idx, spatial_slice)
 
+        elif transform == 'mixing_ratio_to_specific_humidity_2d':
+            return self._read_specific_humidity_2d(h5, time_idx, spatial_slice)
+
+        elif transform == 'mixing_ratio_3d':
+            return self._read_mixing_ratio_3d(h5, time_idx, spatial_slice)
+
         elif transform == 'mixing_ratio_to_specific_humidity':
             return self._read_specific_humidity_3d(h5, time_idx, spatial_slice)
+
+        elif transform == 'relative_humidity_2d':
+            return self._read_relative_humidity_2d(h5, time_idx, spatial_slice)
+
+        elif transform == 'relative_humidity_3d':
+            return self._read_relative_humidity_3d(h5, time_idx, spatial_slice)
+
+        elif transform == 'dew_point_2d':
+            return self._read_dew_point_2d(h5, time_idx, spatial_slice)
+
+        elif transform == 'dew_point_3d':
+            return self._read_dew_point_3d(h5, time_idx, spatial_slice)
 
         elif transform == 'sea_level_pressure':
             return self._read_sea_level_pressure(h5, time_idx, spatial_slice)
 
+        elif transform == 'vorticity':
+            return self._read_vorticity(h5, time_idx, spatial_slice)
+
+        elif transform == 'vorticity_3d':
+            return self._read_vorticity_3d(h5, time_idx, spatial_slice)
+
+        elif transform == 'vertical_velocity_3d':
+            return self._read_vertical_velocity_3d(h5, time_idx, spatial_slice)
+
+        elif transform == 'potential_temperature_2d':
+            return self._read_potential_temperature_2d(h5, time_idx, spatial_slice)
+
+        elif transform == 'potential_temperature_3d':
+            return self._read_potential_temperature_3d(h5, time_idx, spatial_slice)
+
+        elif transform == 'equivalent_potential_temperature_2d':
+            return self._read_equivalent_potential_temperature_2d(h5, time_idx, spatial_slice)
+
+        elif transform == 'equivalent_potential_temperature_3d':
+            return self._read_equivalent_potential_temperature_3d(h5, time_idx, spatial_slice)
+
+        elif transform == 'geopotential_height_3d':
+            return self._read_geopotential_height_3d(h5, time_idx, spatial_slice)
+
+        elif transform == 'land_sea_mask':
+            return self._read_land_sea_mask(h5, time_idx, spatial_slice)
+
+        elif transform == 'soil_3d':
+            return self._read_soil_3d(h5, var_key, time_idx, spatial_slice)
+
         raise ValueError(f'Unknown transform: {transform!r}')
+
+    def _read_precip_sum(self, h5, var_key, time_idx, spatial_slice):
+        """Sum pre-computed hourly precipitation fields (PREC_ACC_C + PREC_ACC_NC)."""
+        info = self.variables[var_key]
+        y_sl, x_sl = spatial_slice
+        total = sum(h5[sv][time_idx, y_sl, x_sl].astype('float64') for sv in info['source_vars'])
+        return total.astype('float32')
 
     def _read_rotated_wind(self, h5, time_idx, spatial_slice):
         """
@@ -386,6 +656,10 @@ class WrfIngest(H5Ingest):
         u_earth, v_earth : np.ndarray
             Earth-relative wind components.
         """
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 'wind_2d' in cache:
+            return cache['wind_2d']
+
         y_sl, x_sl = spatial_slice
         u_grid = h5['U10'][time_idx, y_sl, x_sl].astype('float64')
         v_grid = h5['V10'][time_idx, y_sl, x_sl].astype('float64')
@@ -399,14 +673,66 @@ class WrfIngest(H5Ingest):
             u_earth = u_grid
             v_earth = v_grid
 
-        return u_earth, v_earth
+        result = (u_earth, v_earth)
+        if cache is not None:
+            cache['wind_2d'] = result
+
+        return result
 
     def _compute_geo_height(self, h5, time_idx, spatial_slice):
         """Compute unstaggered geopotential height from PH + PHB."""
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 'geo_height' in cache:
+            return cache['geo_height']
+
         y_sl, x_sl = spatial_slice
         ph = h5['PH'][time_idx, :, y_sl, x_sl].astype('float64')
         phb = h5['PHB'][time_idx, :, y_sl, x_sl].astype('float64')
-        return unstagger((ph + phb) / 9.81, axis=0)
+        result = unstagger((ph + phb) / 9.81, axis=0)
+
+        if cache is not None:
+            cache['geo_height'] = result
+
+        return result
+
+    def _compute_pressure(self, h5, time_idx, spatial_slice):
+        """Compute full pressure (P + PB) on eta levels."""
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 'pressure' in cache:
+            return cache['pressure']
+
+        y_sl, x_sl = spatial_slice
+        p = h5['P'][time_idx, :, y_sl, x_sl].astype('float64')
+        pb = h5['PB'][time_idx, :, y_sl, x_sl].astype('float64')
+        result = p + pb
+
+        if cache is not None:
+            cache['pressure'] = result
+
+        return result
+
+    def _get_source_levels(self, h5, time_idx, spatial_slice):
+        """Return source levels for vertical interpolation (height or pressure)."""
+        if getattr(self, '_vertical_coord', 'height') == 'pressure':
+            return self._compute_pressure(h5, time_idx, spatial_slice)
+        return self._compute_geo_height(h5, time_idx, spatial_slice)
+
+    def _get_soil_depths(self):
+        """
+        Return soil depth coordinate values in meters from WRF DZS.
+
+        Returns cumulative bottom boundary depths (ascending). For Noah LSM
+        layers [0.1, 0.3, 0.6, 1.0] m, this returns [0.1, 0.4, 1.0, 2.0].
+        These can be used to reconstruct WPS layer names (SM000010, SM010040, etc.)
+        since the top of layer k is the bottom of layer k-1 (or 0 for k=0).
+        """
+        with h5py.File(self.input_paths[0], 'r') as h5:
+            if 'DZS' not in h5:
+                return None
+            dzs = h5['DZS'][0, :].astype('float64')
+
+        depths = np.cumsum(dzs)
+        return depths
 
     def _read_rotated_wind_3d(self, h5, time_idx, spatial_slice):
         """
@@ -417,14 +743,23 @@ class WrfIngest(H5Ingest):
         u_earth, v_earth : np.ndarray
             Earth-relative wind components, each shape (nz, ny, nx).
         """
-        y_sl, x_sl = spatial_slice
-        # U is staggered in x (last dim): shape (nz, ny, nx+1)
-        u_raw = h5['U'][time_idx, :, y_sl, :].astype('float64')
-        u_unstag = unstagger(u_raw, axis=2)[:, :, x_sl]
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 'wind_3d' in cache:
+            return cache['wind_3d']
 
-        # V is staggered in y (second-to-last dim): shape (nz, ny+1, nx)
-        v_raw = h5['V'][time_idx, :, :, x_sl].astype('float64')
-        v_unstag = unstagger(v_raw, axis=1)[:, y_sl, :]
+        y_sl, x_sl = spatial_slice
+
+        # U is staggered in x (last dim): read only the needed stagger range
+        nx_unstag = h5['U'].shape[3] - 1
+        x_start, x_stop, _ = x_sl.indices(nx_unstag)
+        u_raw = h5['U'][time_idx, :, y_sl, x_start:x_stop + 1].astype('float64')
+        u_unstag = unstagger(u_raw, axis=2)
+
+        # V is staggered in y (second-to-last dim): read only the needed stagger range
+        ny_unstag = h5['V'].shape[2] - 1
+        y_start, y_stop, _ = y_sl.indices(ny_unstag)
+        v_raw = h5['V'][time_idx, :, y_start:y_stop + 1, x_sl].astype('float64')
+        v_unstag = unstagger(v_raw, axis=1)
 
         if self._cosalpha is not None:
             cosa = self._cosalpha[y_sl, x_sl]
@@ -435,7 +770,11 @@ class WrfIngest(H5Ingest):
             u_earth = u_unstag
             v_earth = v_unstag
 
-        return u_earth, v_earth
+        result = (u_earth, v_earth)
+        if cache is not None:
+            cache['wind_3d'] = result
+
+        return result
 
     def _read_potential_to_actual_temp(self, h5, time_idx, spatial_slice):
         """
@@ -463,24 +802,22 @@ class WrfIngest(H5Ingest):
         pressure = p + pb
         t_actual = theta * (pressure / 100000.0) ** 0.2854
 
-        geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
-
-        # Interpolate to target height levels
-        return self._regrid_func(t_actual, geo_height).astype('float32')
+        source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
+        return self._regrid_func(t_actual, source_levels).astype('float32')
 
     def _read_wind_speed_3d(self, h5, time_idx, spatial_slice):
         """Compute 3D wind speed and interpolate to target height levels."""
         u, v = self._read_rotated_wind_3d(h5, time_idx, spatial_slice)
         speed = np.sqrt(u**2 + v**2)
-        geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
-        return self._regrid_func(speed, geo_height).astype('float32')
+        source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
+        return self._regrid_func(speed, source_levels).astype('float32')
 
     def _read_wind_direction_3d(self, h5, time_idx, spatial_slice):
         """Compute 3D wind direction and interpolate to target height levels."""
         u, v = self._read_rotated_wind_3d(h5, time_idx, spatial_slice)
         direction = (270.0 - np.degrees(np.arctan2(v, u))) % 360.0
-        geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
-        return self._regrid_func(direction, geo_height).astype('float32')
+        source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
+        return self._regrid_func(direction, source_levels).astype('float32')
 
     def _read_u_wind(self, h5, time_idx, spatial_slice):
         """Read earth-relative U wind component at 10m."""
@@ -495,22 +832,99 @@ class WrfIngest(H5Ingest):
     def _read_u_wind_3d(self, h5, time_idx, spatial_slice):
         """Read 3D earth-relative U wind and interpolate to target height levels."""
         u, _ = self._read_rotated_wind_3d(h5, time_idx, spatial_slice)
-        geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
-        return self._regrid_func(u, geo_height).astype('float32')
+        source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
+        return self._regrid_func(u, source_levels).astype('float32')
 
     def _read_v_wind_3d(self, h5, time_idx, spatial_slice):
         """Read 3D earth-relative V wind and interpolate to target height levels."""
         _, v = self._read_rotated_wind_3d(h5, time_idx, spatial_slice)
-        geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
-        return self._regrid_func(v, geo_height).astype('float32')
+        source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
+        return self._regrid_func(v, source_levels).astype('float32')
+
+    def _read_specific_humidity_2d(self, h5, time_idx, spatial_slice):
+        """Convert 2m mixing ratio (Q2) to specific humidity."""
+        y_sl, x_sl = spatial_slice
+        mixing_ratio = h5['Q2'][time_idx, y_sl, x_sl].astype('float64')
+        return (mixing_ratio / (1.0 + mixing_ratio)).astype('float32')
+
+    def _read_mixing_ratio_3d(self, h5, time_idx, spatial_slice):
+        """Read 3D mixing ratio and interpolate to target height levels."""
+        y_sl, x_sl = spatial_slice
+        mixing_ratio = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
+        source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
+        return self._regrid_func(mixing_ratio, source_levels).astype('float32')
 
     def _read_specific_humidity_3d(self, h5, time_idx, spatial_slice):
         """Convert mixing ratio to specific humidity and interpolate to target height levels."""
         y_sl, x_sl = spatial_slice
         mixing_ratio = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
         specific_humidity = mixing_ratio / (1.0 + mixing_ratio)
-        geo_height = self._compute_geo_height(h5, time_idx, spatial_slice)
-        return self._regrid_func(specific_humidity, geo_height).astype('float32')
+        source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
+        return self._regrid_func(specific_humidity, source_levels).astype('float32')
+
+    def _read_relative_humidity_2d(self, h5, time_idx, spatial_slice):
+        """Compute 2m relative humidity from T2, Q2, and PSFC."""
+        y_sl, x_sl = spatial_slice
+        t2 = h5['T2'][time_idx, y_sl, x_sl].astype('float64')
+        q2 = h5['Q2'][time_idx, y_sl, x_sl].astype('float64')
+        psfc = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
+
+        # Saturation vapor pressure (Bolton 1980) [Pa]
+        es = 611.2 * np.exp(17.67 * (t2 - 273.15) / (t2 - 273.15 + 243.5))
+        # Actual vapor pressure from mixing ratio [Pa]
+        e = q2 * psfc / (0.622 + q2)
+        rh = np.clip(e / es, 0.0, 1.0)
+        return rh.astype('float32')
+
+    def _read_relative_humidity_3d(self, h5, time_idx, spatial_slice):
+        """Compute 3D relative humidity and interpolate to target height levels."""
+        y_sl, x_sl = spatial_slice
+        t_pert = h5['T'][time_idx, :, y_sl, x_sl].astype('float64')
+        p = h5['P'][time_idx, :, y_sl, x_sl].astype('float64')
+        pb = h5['PB'][time_idx, :, y_sl, x_sl].astype('float64')
+        q = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
+
+        theta = t_pert + 300.0
+        pressure = p + pb
+        t_actual = theta * (pressure / 100000.0) ** 0.2854
+
+        es = 611.2 * np.exp(17.67 * (t_actual - 273.15) / (t_actual - 273.15 + 243.5))
+        e = q * pressure / (0.622 + q)
+        rh = np.clip(e / es, 0.0, 1.0)
+
+        source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
+        return self._regrid_func(rh, source_levels).astype('float32')
+
+    def _read_dew_point_2d(self, h5, time_idx, spatial_slice):
+        """Compute 2m dew point temperature from Q2 and PSFC."""
+        y_sl, x_sl = spatial_slice
+        q2 = h5['Q2'][time_idx, y_sl, x_sl].astype('float64')
+        psfc = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
+
+        # Actual vapor pressure from mixing ratio [Pa]
+        e = q2 * psfc / (0.622 + q2)
+        # Inverse Bolton formula for dew point [K]
+        # NaN is expected where moisture is zero (e <= 0)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ln_ratio = np.log(e / 611.2)
+            td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+        return td.astype('float32')
+
+    def _read_dew_point_3d(self, h5, time_idx, spatial_slice):
+        """Compute 3D dew point temperature and interpolate to target height levels."""
+        y_sl, x_sl = spatial_slice
+        q = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
+        p = h5['P'][time_idx, :, y_sl, x_sl].astype('float64')
+        pb = h5['PB'][time_idx, :, y_sl, x_sl].astype('float64')
+        pressure = p + pb
+
+        e = q * pressure / (0.622 + q)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ln_ratio = np.log(e / 611.2)
+            td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+
+        source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
+        return self._regrid_func(td, source_levels).astype('float32')
 
     def _read_sea_level_pressure(self, h5, time_idx, spatial_slice):
         """Compute sea level pressure using hypsometric reduction."""
@@ -528,12 +942,140 @@ class WrfIngest(H5Ingest):
 
         return slp.astype('float32')
 
+    def _read_potential_temperature_2d(self, h5, time_idx, spatial_slice):
+        """Compute 2m potential temperature from T2 and PSFC."""
+        y_sl, x_sl = spatial_slice
+        t2 = h5['T2'][time_idx, y_sl, x_sl].astype('float64')
+        psfc = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
+        theta = t2 * (100000.0 / psfc) ** 0.2854
+        return theta.astype('float32')
+
+    def _read_potential_temperature_3d(self, h5, time_idx, spatial_slice):
+        """Read WRF potential temperature (T + 300) and interpolate to target height levels."""
+        y_sl, x_sl = spatial_slice
+        t_pert = h5['T'][time_idx, :, y_sl, x_sl].astype('float64')
+        theta = t_pert + 300.0
+        source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
+        return self._regrid_func(theta, source_levels).astype('float32')
+
+    def _read_equivalent_potential_temperature_2d(self, h5, time_idx, spatial_slice):
+        """Compute 2m equivalent potential temperature using Bolton (1980)."""
+        y_sl, x_sl = spatial_slice
+        t2 = h5['T2'][time_idx, y_sl, x_sl].astype('float64')
+        q2 = h5['Q2'][time_idx, y_sl, x_sl].astype('float64')
+        psfc = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
+
+        # Vapor pressure and dew point for LCL temperature
+        # NaN is expected where moisture is zero (e <= 0)
+        e = q2 * psfc / (0.622 + q2)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ln_ratio = np.log(e / 611.2)
+            td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+
+            # LCL temperature (Bolton 1980, eq. 15)
+            tl = 1.0 / (1.0 / (td - 56.0) + np.log(t2 / td) / 800.0) + 56.0
+
+            # Bolton (1980) eq. 43
+            theta_e = t2 * (100000.0 / psfc) ** (0.2854 * (1.0 - 0.28 * q2)) \
+                * np.exp(q2 * (1.0 + 0.81 * q2) * (3376.0 / tl - 2.54))
+        return theta_e.astype('float32')
+
+    def _read_equivalent_potential_temperature_3d(self, h5, time_idx, spatial_slice):
+        """Compute 3D equivalent potential temperature (Bolton 1980) and interpolate to target levels."""
+        y_sl, x_sl = spatial_slice
+        t_pert = h5['T'][time_idx, :, y_sl, x_sl].astype('float64')
+        p = h5['P'][time_idx, :, y_sl, x_sl].astype('float64')
+        pb = h5['PB'][time_idx, :, y_sl, x_sl].astype('float64')
+        q = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
+
+        theta = t_pert + 300.0
+        pressure = p + pb
+        t_actual = theta * (pressure / 100000.0) ** 0.2854
+
+        # Vapor pressure and dew point for LCL temperature
+        # NaN is expected where moisture is zero (e <= 0)
+        e = q * pressure / (0.622 + q)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ln_ratio = np.log(e / 611.2)
+            td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+
+            # LCL temperature (Bolton 1980, eq. 15)
+            tl = 1.0 / (1.0 / (td - 56.0) + np.log(t_actual / td) / 800.0) + 56.0
+
+            # Bolton (1980) eq. 43
+            theta_e = t_actual * (100000.0 / pressure) ** (0.2854 * (1.0 - 0.28 * q)) \
+                * np.exp(q * (1.0 + 0.81 * q) * (3376.0 / tl - 2.54))
+
+        source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
+        return self._regrid_func(theta_e, source_levels).astype('float32')
+
+    def _read_vorticity(self, h5, time_idx, spatial_slice):
+        """Compute vertical relative vorticity at 10m from earth-relative wind components."""
+        u_earth, v_earth = self._read_rotated_wind(h5, time_idx, spatial_slice)
+        dvdx = np.gradient(v_earth, self._dx, axis=1)
+        dudy = np.gradient(u_earth, self._dy, axis=0)
+        return (dvdx - dudy).astype('float32')
+
+    def _read_vorticity_3d(self, h5, time_idx, spatial_slice):
+        """Compute 3D vertical relative vorticity and interpolate to target height levels."""
+        u, v = self._read_rotated_wind_3d(h5, time_idx, spatial_slice)
+        dvdx = np.gradient(v, self._dx, axis=2)
+        dudy = np.gradient(u, self._dy, axis=1)
+        vorticity = dvdx - dudy
+        source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
+        return self._regrid_func(vorticity, source_levels).astype('float32')
+
+    def _read_vertical_velocity_3d(self, h5, time_idx, spatial_slice):
+        """Read W, unstagger vertically, and interpolate to target height levels."""
+        y_sl, x_sl = spatial_slice
+        w = h5['W'][time_idx, :, y_sl, x_sl].astype('float64')
+        w_unstag = unstagger(w, axis=0)
+        source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
+        return self._regrid_func(w_unstag, source_levels).astype('float32')
+
+    def _read_geopotential_height_3d(self, h5, time_idx, spatial_slice):
+        """Compute geopotential height and interpolate to target levels."""
+        ght = self._compute_geo_height(h5, time_idx, spatial_slice)
+        source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
+        return self._regrid_func(ght, source_levels).astype('float32')
+
+    def _read_land_sea_mask(self, h5, time_idx, spatial_slice):
+        """Convert XLAND (1=land, 2=water) to (1=land, 0=water)."""
+        y_sl, x_sl = spatial_slice
+        xland = h5['XLAND'][time_idx, y_sl, x_sl].astype('float64')
+        return np.where(xland < 1.5, 1.0, 0.0).astype('float32')
+
+    def _read_soil_3d(self, h5, var_key, time_idx, spatial_slice):
+        """Read a 3D soil variable (SMOIS or TSLB) — no vertical interpolation."""
+        info = self.variables[var_key]
+        src = info['source_vars'][0]
+        y_sl, x_sl = spatial_slice
+        return h5[src][time_idx, :, y_sl, x_sl].astype('float32')
+
     def _setup_populate(self, var_key, target_levels):
         """Set up level-interpolation regrid function for 3D variables."""
         info = self.variables[var_key]
         if info['height'] == 'levels' and target_levels is not None:
-            from geointerp import GridInterpolator
-            gi = GridInterpolator()
-            self._regrid_func = gi.regrid_levels(
-                np.array(target_levels, dtype='float64'), axis=0, method='linear',
-            )
+            levels = np.array(target_levels, dtype='float64')
+
+            if getattr(self, '_vertical_coord', 'height') == 'pressure':
+                # Pressure decreases with altitude, but np.interp (used by geointerp)
+                # requires ascending source values. Wrap the regrid function to negate
+                # both source and target pressure so they become ascending.
+                # Negated targets: e.g. [50000, 70000, 90000] -> [-90000, -70000, -50000]
+                from geointerp import GridInterpolator
+                gi = GridInterpolator()
+                neg_targets = np.sort(-levels)
+                inner = gi.regrid_levels(neg_targets, axis=0, method='linear')
+
+                def _pressure_regrid(data, source_levels):
+                    # Negate source pressure so it's ascending, interpolate,
+                    # then reverse output to match original target order (ascending pressure)
+                    result = inner(data, -source_levels)
+                    return result[::-1]
+
+                self._regrid_func = _pressure_regrid
+            else:
+                from geointerp import GridInterpolator
+                gi = GridInterpolator()
+                self._regrid_func = gi.regrid_levels(levels, axis=0, method='linear')

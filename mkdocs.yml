@@ -1,5 +1,6 @@
 site_name: cfdb-ingest
 site_description: File format conversions to cfdb
+site_url: https://mullenkamp.github.io/cfdb-ingest/
 
 repo_url: https://github.com/mullenkamp/cfdb-ingest
 repo_name: mullenkamp/cfdb-ingest
@@ -27,9 +28,18 @@ theme:
             icon: material/brightness-4
             name: Switch to light mode
 
+    features:
+        - navigation.sections
+        - navigation.expand
+        - navigation.top
+        - content.code.copy
+        - toc.follow
+
 markdown_extensions:
     - toc:
         permalink: true
+    - admonition
+    - pymdownx.details
     - pymdownx.highlight:
         anchor_linenums: true
     - pymdownx.tasklist:
@@ -43,16 +53,26 @@ plugins:
     - mkdocstrings:
         handlers:
             python:
-                import:
+                inventories:
                     - https://docs.python.org/3.11/objects.inv
                 options:
                     docstring_style: google
+                    show_root_heading: false
+                    show_source: false
 
 watch:
     - docs
     - cfdb_ingest
 
 nav:
-    - About: index.md
+    - Home: index.md
+    - Getting Started:
+        - Installation: getting-started/installation.md
+        - Quick Start: getting-started/quickstart.md
+    - User Guide:
+        - WRF Ingestion: guide/wrf-ingestion.md
+        - WPS Export: guide/wps-export.md
     - Reference:
-        - cfdb_ingest: reference/cfdb_ingest.md
+        - WRF Variables: reference/wrf-variables.md
+        - API: reference/cfdb_ingest.md
+    - Development: development.md

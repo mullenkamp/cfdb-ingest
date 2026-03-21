@@ -1,6 +1,7 @@
 """
 Base class for HDF5/netCDF4 ingestion to cfdb via h5py.
 """
+import datetime
 import pathlib
 from typing import Union, List, Tuple, Dict, Optional
 
@@ -30,7 +31,19 @@ class H5Ingest:
     def __init__(self, input_paths: Union[str, pathlib.Path, List[Union[str, pathlib.Path]]]):
         if isinstance(input_paths, (str, pathlib.Path)):
             input_paths = [input_paths]
-        self.input_paths = sorted(pathlib.Path(p) for p in input_paths)
+
+        # Expand any directories in the list to their wrfout files
+        expanded = []
+        for p in input_paths:
+            p = pathlib.Path(p)
+            if p.is_dir():
+                found = sorted(p.glob('wrfout*'))
+                if not found:
+                    raise FileNotFoundError(f'No wrfout files found in directory: {p}')
+                expanded.extend(found)
+            else:
+                expanded.append(p)
+        self.input_paths = sorted(expanded)
 
         for p in self.input_paths:
             if not p.exists():
@@ -55,7 +68,11 @@ class H5Ingest:
 
     def _init_time(self):
         """
-        Build self.times and self._file_time_map from all input files.
+        Build self.times, self._file_time_map, and self._raw_to_unique from all input files.
+
+        When files have overlapping timesteps, _raw_to_unique maps each raw
+        timestep index to its position in the deduplicated self.times array,
+        or -1 for duplicates that should be skipped.
         """
         file_time_map = []
         all_times = []
@@ -73,6 +90,13 @@ class H5Ingest:
         unique_idx.sort()
         self.times = combined[unique_idx]
         self._file_time_map = file_time_map
+
+        # Map raw timestep indices to unique time indices (-1 = duplicate)
+        unique_set = set(unique_idx.tolist())
+        time_to_unique = {t: i for i, t in enumerate(self.times)}
+        self._raw_to_unique = np.full(len(combined), -1, dtype='int64')
+        for raw_i in unique_set:
+            self._raw_to_unique[raw_i] = time_to_unique[combined[raw_i]]
 
     def _init_variables(self):
         """
@@ -129,9 +153,9 @@ class H5Ingest:
         - 'cfdb_name': str — cfdb short name (e.g., 'air_temp')
         - 'source_vars': list of str — source variable names needed
         - 'transform': str or None — name of a transform method
-        - 'height': float or 'levels' — height above ground in meters,
-          or 'levels' for variables that require vertical interpolation
-          to user-specified target_levels
+        - 'height': float, 'levels', or 'soil' — height above ground in meters,
+          'levels' for variables requiring vertical interpolation to target_levels,
+          or 'soil' for soil-layer variables using a depth coordinate
         """
         raise NotImplementedError
 
@@ -158,6 +182,24 @@ class H5Ingest:
             3D array (n_levels, ny, nx) for level-interpolated vars.
         """
         raise NotImplementedError
+
+    def _get_dataset_attrs(self) -> Dict[str, object]:
+        """
+        Return dataset-level CF attributes for the cfdb output.
+
+        Subclasses should override and call super() to add source-specific
+        attributes (e.g., model version, physics parameters).
+        """
+        import cfdb_ingest
+
+        filenames = ', '.join(p.name for p in self.input_paths)
+        now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        return {
+            'Conventions': 'CF-1.11',
+            'history': f'{now} Converted using cfdb-ingest {cfdb_ingest.__version__}',
+            'source_files': filenames,
+        }
 
     # ------------------------------------------------------------------
     # Public methods
@@ -204,6 +246,13 @@ class H5Ingest:
 
         return resolved
 
+    def _get_soil_depths(self) -> Optional[np.ndarray]:
+        """
+        Return soil depth coordinate values in meters (ascending), or None
+        if the source has no soil data. Override in subclasses that support soil.
+        """
+        return None
+
     def convert(
         self,
         cfdb_path: Union[str, pathlib.Path],
@@ -212,20 +261,19 @@ class H5Ingest:
         end_date: Union[str, np.datetime64, None] = None,
         bbox: Optional[Tuple[float, float, float, float]] = None,
         target_levels: Optional[List[float]] = None,
+        vertical_coord: str = 'height',
         max_mem: int = 2**27,
-        chunk_shape: Optional[Tuple[int, int, int, int]] = None,
+        chunk_shape: Optional[Tuple[int, ...]] = None,
         dataset_type: str = 'grid',
         **cfdb_kwargs,
     ):
         """
         Convert source files to a cfdb dataset.
 
-        All output data variables have dimensions (time, height, y, x).
-        Surface variables are placed at their physical height above ground
-        (e.g., 2 m for T2, 10 m for U10/V10, 0 m for surface fluxes).
-        Variables with height='levels' are interpolated to target_levels.
-        Variables sharing a cfdb_name are merged into one data variable
-        spanning all their height levels.
+        Variables are stored with coordinates appropriate to their type:
+        - Surface variables (height is a float): (time, y, x)
+        - Level-interpolated variables (height='levels'): (time, <vertical_coord>, y, x)
+        - Soil variables (height='soil'): (time, depth, y, x)
 
         Parameters
         ----------
@@ -239,23 +287,36 @@ class H5Ingest:
         bbox : tuple of 4 floats or None
             Bounding box as (min_lon, min_lat, max_lon, max_lat) in WGS84.
         target_levels : list of float or None
-            Target height levels (meters) for level-interpolated variables.
+            Target levels for level-interpolated variables. Interpretation
+            depends on vertical_coord: height in meters or pressure in Pa.
+        vertical_coord : str
+            Name of the vertical coordinate for level-interpolated variables.
+            'height' (default) or 'pressure'.
         max_mem : int
             Memory budget in bytes for rechunkit read buffers.
-        chunk_shape : tuple of 4 ints or None
-            Output chunk shape as (time, z, y, x), following CF conventions.
-            Defaults to (1, 1, ny, nx) — one full spatial slab per timestep
-            per height level.
+        chunk_shape : tuple of ints or None
+            Output chunk shape. For 4D variables: (time, z, y, x).
+            For 3D surface variables: (1, ny, nx) is used automatically.
+            Defaults to (1, 1, ny, nx) for 4D.
         dataset_type : str
             Passed to cfdb.open_dataset.
         **cfdb_kwargs
             Extra kwargs for cfdb.open_dataset (e.g., compression).
         """
+        self._vertical_coord = vertical_coord
+
         var_keys = self.resolve_variables(variables)
 
         has_level_interp = any(self.variables[k]['height'] == 'levels' for k in var_keys)
         if has_level_interp and target_levels is None:
             raise ValueError('target_levels is required when converting level-interpolated variables.')
+
+        has_soil = any(self.variables[k]['height'] == 'soil' for k in var_keys)
+        soil_depths = None
+        if has_soil:
+            soil_depths = self._get_soil_depths()
+            if soil_depths is None:
+                raise ValueError('Soil variables requested but source has no soil depth data.')
 
         # Filter time
         time_mask, filtered_times = self._filter_time(start_date, end_date)
@@ -273,51 +334,122 @@ class H5Ingest:
         ny = len(filtered_y)
         nx = len(filtered_x)
 
-        # Group variables by cfdb_name (variables sharing a name are merged)
-        cfdb_var_groups = {}
-        all_heights = set()
+        # Classify variables into coordinate groups
+        level_vars = {}      # cfdb_name -> [(var_key, level_indices)]
+        surface_vars = {}    # cfdb_name -> [(var_key,)]
+        soil_vars = {}       # cfdb_name -> [(var_key, depth_indices)]
+
+        sorted_levels = np.array(sorted(target_levels), dtype='float64') if target_levels else None
+        level_to_idx = {float(v): i for i, v in enumerate(sorted_levels)} if sorted_levels is not None else {}
+
+        soil_to_idx = {}
+        if soil_depths is not None:
+            soil_to_idx = {float(v): i for i, v in enumerate(soil_depths)}
+
         for var_key in var_keys:
             info = self.variables[var_key]
             cfdb_name = info['cfdb_name']
             height_spec = info['height']
 
             if height_spec == 'levels':
-                heights = [float(h) for h in target_levels]
+                level_vars.setdefault(cfdb_name, []).append(var_key)
+            elif height_spec == 'soil':
+                soil_vars.setdefault(cfdb_name, []).append(var_key)
             else:
-                heights = [float(height_spec)]
+                surface_vars.setdefault(cfdb_name, []).append(var_key)
 
-            if cfdb_name not in cfdb_var_groups:
-                cfdb_var_groups[cfdb_name] = []
-            cfdb_var_groups[cfdb_name].append((var_key, heights))
-            all_heights.update(heights)
+        # Resolve cfdb_name conflicts between surface and level/soil groups.
+        # When a cfdb_name appears in both surface and level groups, suffix
+        # the surface variant with '_sfc' to avoid creating two data variables
+        # with the same name but different coordinates.
+        conflicting = set(surface_vars) & (set(level_vars) | set(soil_vars))
+        for name in conflicting:
+            new_name = name + '_sfc'
+            surface_vars[new_name] = surface_vars.pop(name)
 
-        sorted_heights = np.array(sorted(all_heights), dtype='float64')
-        height_to_idx = {h: i for i, h in enumerate(sorted_heights)}
-
-        coord_names = ('time', 'height', 'y', 'x')
-        if chunk_shape is None:
-            chunk_shape = (1, 1, ny, nx)
+        # Default chunk shapes per coordinate type
+        chunk_4d = chunk_shape if chunk_shape is not None else (1, 1, ny, nx)
+        chunk_3d = (1, ny, nx)
 
         with cfdb.open_dataset(cfdb_path, 'n', dataset_type=dataset_type, **cfdb_kwargs) as ds:
             # Create coordinates
             ds.create.coord.time(data=filtered_times)
-            ds.create.coord.height(data=sorted_heights)
             ds.create.coord.y(data=filtered_y.astype('float32'))
             ds.create.coord.x(data=filtered_x.astype('float32'))
+
+            if sorted_levels is not None and level_vars:
+                if vertical_coord == 'pressure':
+                    ds.create.coord.generic('pressure', data=sorted_levels, axis='z')
+                else:
+                    ds.create.coord.height(data=sorted_levels)
+
+            if soil_depths is not None and soil_vars:
+                ds.create.coord.generic('depth', data=soil_depths)
 
             # Set CRS
             ds.create.crs.from_user_input(self.crs, x_coord='x', y_coord='y')
 
-            # Create and populate data variables
-            for cfdb_name, var_group in cfdb_var_groups.items():
-                data_var = self._create_cfdb_data_var(ds, cfdb_name, coord_names, chunk_shape)
+            # Set dataset attributes
+            for key, value in self._get_dataset_attrs().items():
+                ds.attrs[key] = value
 
-                for var_key, heights in var_group:
-                    height_indices = [height_to_idx[h] for h in heights]
-                    self._populate_data_var(
-                        data_var, var_key, time_mask, spatial_slice, max_mem,
-                        height_indices, target_levels,
-                    )
+            # Classify into processing groups
+            rechunkit_items = []
+            accumulation_items = []
+            batch_items = []
+
+            # Level-interpolated variables: (time, <vertical_coord>, y, x)
+            level_coord_names = ('time', vertical_coord, 'y', 'x')
+            for cfdb_name, var_key_list in level_vars.items():
+                data_var = self._create_cfdb_data_var(ds, cfdb_name, level_coord_names, chunk_4d)
+                for var_key in var_key_list:
+                    level_indices = list(range(len(sorted_levels)))
+                    info = self.variables[var_key]
+                    transform = info.get('transform')
+                    item = (var_key, data_var, level_indices)
+                    batch_items.append(item)
+
+            # Surface variables: (time, y, x)
+            surface_coord_names = ('time', 'y', 'x')
+            for cfdb_name, var_key_list in surface_vars.items():
+                data_var = self._create_cfdb_data_var(ds, cfdb_name, surface_coord_names, chunk_3d)
+                for var_key in var_key_list:
+                    info = self.variables[var_key]
+                    transform = info.get('transform')
+                    is_simple = transform is None and len(info['source_vars']) == 1
+                    is_accumulation = transform == 'accumulation_increment'
+
+                    item = (var_key, data_var, None)  # None = no vertical indices
+                    if is_simple:
+                        rechunkit_items.append(item)
+                    elif is_accumulation:
+                        accumulation_items.append(item)
+                    else:
+                        batch_items.append(item)
+
+            # Soil variables: (time, depth, y, x)
+            soil_coord_names = ('time', 'depth', 'y', 'x')
+            for cfdb_name, var_key_list in soil_vars.items():
+                data_var = self._create_cfdb_data_var(ds, cfdb_name, soil_coord_names, chunk_4d)
+                for var_key in var_key_list:
+                    depth_indices = list(range(len(soil_depths)))
+                    item = (var_key, data_var, depth_indices)
+                    batch_items.append(item)
+
+            # Process each group with its optimal strategy
+            for var_key, data_var, vert_indices in rechunkit_items:
+                self._setup_populate(var_key, target_levels)
+                self._populate_with_rechunkit(data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices)
+
+            for var_key, data_var, vert_indices in accumulation_items:
+                self._setup_populate(var_key, target_levels)
+                self._prev_accum_total = None
+                self._populate_per_timestep(data_var, var_key, time_mask, spatial_slice, vert_indices, is_accumulation=True)
+
+            if batch_items:
+                for var_key, _, _ in batch_items:
+                    self._setup_populate(var_key, target_levels)
+                self._populate_batch_per_timestep(batch_items, time_mask, spatial_slice)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -383,15 +515,14 @@ class H5Ingest:
 
         Template methods (e.g., ds.create.data_var.air_temp) auto-set the
         appropriate dtype, encoding, and CF attributes from cfdb's defaults.
+        Falls back to generic float32 for names without a cfdb template.
         """
         creator = ds.create.data_var
         template = getattr(creator, cfdb_name, None)
-        if template is None:
-            raise TypeError(f'{cfdb_name} does not exist in cfdb')
+        if template is not None:
+            return template(coord_names, chunk_shape=chunk_shape)
 
-        return template(coord_names, chunk_shape=chunk_shape)
-
-        # return creator.generic(cfdb_name, coord_names, dtype='float32', chunk_shape=chunk_shape)
+        return creator.generic(cfdb_name, coord_names, dtype='float32', chunk_shape=chunk_shape)
 
     def _setup_populate(self, var_key, target_levels):
         """Hook called before populating a data variable. Override as needed."""
@@ -420,47 +551,27 @@ class H5Ingest:
 
         return result.astype('float32')
 
-    def _populate_data_var(self, data_var, var_key, time_mask, spatial_slice, max_mem, height_indices, target_levels):
-        """
-        Dispatch data population to the appropriate strategy.
-
-        Simple variables (no transform, single source var) use rechunkit for
-        optimal HDF5 reads. Transform variables (accumulation, wind, 3D temp)
-        use per-timestep iteration.
-        """
-        info = self.variables[var_key]
-        transform = info.get('transform')
-        is_simple = transform is None and len(info['source_vars']) == 1
-        is_accumulation = transform == 'accumulation_increment'
-
-        self._setup_populate(var_key, target_levels)
-
-        if is_accumulation:
-            self._prev_accum_total = None
-
-        if is_simple:
-            self._populate_with_rechunkit(data_var, var_key, time_mask, spatial_slice, max_mem, height_indices)
-        else:
-            self._populate_per_timestep(data_var, var_key, time_mask, spatial_slice, height_indices, is_accumulation)
-
-    def _populate_with_rechunkit(self, data_var, var_key, time_mask, spatial_slice, max_mem, height_indices):
+    def _populate_with_rechunkit(self, data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices):
         """
         Populate a simple (no-transform, single source var) data variable using
         rechunkit for optimized HDF5 chunk reads.
+
+        vert_indices is None for surface (time, y, x) variables, or a list
+        with one element for 4D variables at a single vertical index.
         """
         src_var = self.variables[var_key]['source_vars'][0]
         y_sl, x_sl = spatial_slice
-        h_idx = height_indices[0]
+        is_surface = vert_indices is None
 
-        # Pre-compute global_time_idx -> output_time_idx mapping
+        # Pre-compute unique_time_idx -> output_time_idx mapping
         output_map = {}
         out_idx = 0
-        for g_idx in range(len(time_mask)):
-            if time_mask[g_idx]:
-                output_map[g_idx] = out_idx
+        for u_idx in range(len(time_mask)):
+            if time_mask[u_idx]:
+                output_map[u_idx] = out_idx
                 out_idx += 1
 
-        global_time_idx = 0
+        raw_offset = 0
         for path, file_times, _ in self._file_time_map:
             n_file_times = len(file_times)
 
@@ -484,22 +595,40 @@ class H5Ingest:
                     source_chunks, target_chunks, max_mem, sel=sel,
                 ):
                     local_t = write_slices[0].start
-                    g_idx = global_time_idx + local_t
-                    if g_idx not in output_map:
+                    u_idx = self._raw_to_unique[raw_offset + local_t]
+                    if u_idx == -1 or u_idx not in output_map:
                         continue
 
-                    data_var[(output_map[g_idx], h_idx, slice(None), slice(None))] = data[0].astype('float32')
+                    t_out = output_map[u_idx]
+                    if is_surface:
+                        data_var[(t_out, slice(None), slice(None))] = data[0].astype('float32')
+                    else:
+                        data_var[(t_out, vert_indices[0], slice(None), slice(None))] = data[0].astype('float32')
 
-            global_time_idx += n_file_times
+            raw_offset += n_file_times
 
-    def _populate_per_timestep(self, data_var, var_key, time_mask, spatial_slice, height_indices, is_accumulation):
+    @staticmethod
+    def _write_data_var(data_var, data, output_time_idx, vert_indices):
+        """Write data to a data variable at the correct indices."""
+        if vert_indices is None:
+            # Surface: (time, y, x)
+            data_var[(output_time_idx, slice(None), slice(None))] = data
+        elif len(vert_indices) == 1:
+            data_var[(output_time_idx, vert_indices[0], slice(None), slice(None))] = data
+        else:
+            for lev_i, v_idx in enumerate(vert_indices):
+                data_var[(output_time_idx, v_idx, slice(None), slice(None))] = data[lev_i]
+
+    def _populate_per_timestep(self, data_var, var_key, time_mask, spatial_slice, vert_indices, is_accumulation):
         """
         Populate a data variable using per-timestep iteration.
 
         Used for transform variables (accumulation, wind, 3D temp) that need
         per-timestep logic. Handles accumulation cross-file caching.
+
+        vert_indices is None for surface (time, y, x) variables.
         """
-        global_time_idx = 0
+        raw_offset = 0
         output_time_idx = 0
 
         for path, file_times, _ in self._file_time_map:
@@ -507,20 +636,14 @@ class H5Ingest:
 
             with h5py.File(path, 'r') as h5:
                 for local_t in range(n_file_times):
-                    if not time_mask[global_time_idx]:
-                        global_time_idx += 1
+                    u_idx = self._raw_to_unique[raw_offset + local_t]
+                    if u_idx == -1 or not time_mask[u_idx]:
                         continue
 
                     data = self._read_variable(h5, var_key, local_t, spatial_slice)
-
-                    if len(height_indices) == 1:
-                        data_var[(output_time_idx, height_indices[0], slice(None), slice(None))] = data
-                    else:
-                        for lev_i, h_idx in enumerate(height_indices):
-                            data_var[(output_time_idx, h_idx, slice(None), slice(None))] = data[lev_i]
+                    self._write_data_var(data_var, data, output_time_idx, vert_indices)
 
                     output_time_idx += 1
-                    global_time_idx += 1
 
                 # Cache last accumulated total for cross-file boundary
                 if is_accumulation:
@@ -531,6 +654,38 @@ class H5Ingest:
                         for sv in info['source_vars']
                     )
                     self._prev_accum_total = total.astype('float32')
+
+            raw_offset += n_file_times
+
+    def _populate_batch_per_timestep(self, batch_items, time_mask, spatial_slice):
+        """
+        Populate multiple transform variables with timestep-outer, variable-inner
+        loop order, enabling per-timestep caching of shared intermediates
+        (e.g., geo_height, rotated winds).
+        """
+        raw_offset = 0
+        output_time_idx = 0
+
+        for path, file_times, _ in self._file_time_map:
+            n_file_times = len(file_times)
+
+            with h5py.File(path, 'r') as h5:
+                for local_t in range(n_file_times):
+                    u_idx = self._raw_to_unique[raw_offset + local_t]
+                    if u_idx == -1 or not time_mask[u_idx]:
+                        continue
+
+                    self._ts_cache = {}
+
+                    for var_key, data_var, vert_indices in batch_items:
+                        data = self._read_variable(h5, var_key, local_t, spatial_slice)
+                        self._write_data_var(data_var, data, output_time_idx, vert_indices)
+
+                    self._ts_cache = None
+
+                    output_time_idx += 1
+
+            raw_offset += n_file_times
 
     def _get_file_for_global_time(self, global_idx):
         """

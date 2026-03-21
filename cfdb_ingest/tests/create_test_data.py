@@ -27,9 +27,11 @@ SOURCE_FILES = [
 
 VARIABLES = [
     "Times", "XLAT", "XLONG", "XTIME", "XLONG_U", "XLONG_V", "XLAT_U", "XLAT_V",
-    "T2", "T", "U", "U10", "V", "V10", "COSALPHA", "SINALPHA", "TSK", "HGT",
+    "T2", "T", "U", "U10", "V", "V10", "W", "COSALPHA", "SINALPHA", "TSK", "HGT",
     "PH", "PSFC", "SWDOWN", "GLW", "SNOWH", "RAINNC", "RAINC", "P", "PB",
     "Q2", "QVAPOR", "PHB",
+    "XLAND", "SST", "SEAICE", "SNOW",     # surface variables for WPS
+    "SMOIS", "TSLB", "DZS",               # soil variables
 ]
 
 # Vertical levels to keep (bottom 16 of 32 unstaggered, covers ~5000 m)
@@ -43,6 +45,7 @@ def create_subset_file(src_path, dst_path):
         f"ncks -O -4 -L 5"
         f" --cnk_dmn Time,1 --cnk_dmn bottom_top,{N_Z}"
         f" --cnk_dmn south_north,111 --cnk_dmn west_east,99"
+        f" --cnk_dmn soil_layers_stag,4"
         f" -d bottom_top,0,{N_Z - 1} -d bottom_top_stag,0,{N_Z}"
         f" -v {vars_str}"
         f" {src_path} {dst_path}"
