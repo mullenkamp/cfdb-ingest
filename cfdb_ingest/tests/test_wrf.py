@@ -286,7 +286,7 @@ class TestConvert2D:
         assert np.nanmax(wd) <= 360.0
 
     def test_multiple_surface_vars(self, wrf_single, cfdb_out):
-        """Convert several surface vars at once; height coord is built correctly."""
+        """Convert several surface vars at once; stored as (time, y, x) without height coord."""
         import cfdb
         wrf_single.convert(
             cfdb_path=cfdb_out,
@@ -298,9 +298,13 @@ class TestConvert2D:
             var_names = [v.name for v in ds.data_vars]
             assert len(var_names) == 5
 
-            # T2 at 2m, rest at 0m → height = [0.0, 2.0]
-            height = np.array(ds['height'][:])
-            np.testing.assert_array_equal(height, [0.0, 2.0])
+            # Surface-only conversion has no height coordinate
+            assert 'height' not in ds.coord_names
+
+            # Each variable is (time, y, x)
+            for dv in ds.data_vars:
+                assert dv.ndims == 3
+                assert dv.coord_names == ('time', 'y', 'x')
 
 
 # ======================================================================
@@ -533,8 +537,8 @@ class TestConvert3D:
             # Mean temp at 100m should be greater than at 3000m
             assert mean_by_level[0] > mean_by_level[-1]
 
-    def test_surface_and_levels_merged(self, wrf_single, cfdb_out):
-        """T2 (2m) and T (levels) merge into one air_temperature variable."""
+    def test_surface_and_levels_separate(self, wrf_single, cfdb_out):
+        """T2 (surface) and T (levels) stored as separate variables with different coords."""
         import cfdb
         wrf_single.convert(
             cfdb_path=cfdb_out,
@@ -545,23 +549,34 @@ class TestConvert3D:
             target_levels=[100.0, 500.0],
         )
         with cfdb.open_dataset(cfdb_out, 'r') as ds:
-            # T2 and T both map to air_temp → one merged data var
-            var_names = [v.name for v in ds.data_vars]
-            assert len(var_names) == 1
-            assert var_names[0] == 'air_temperature'
+            var_names = sorted(v.name for v in ds.data_vars)
+            # T2 gets suffixed to avoid conflict: air_temp_sfc
+            assert len(var_names) == 2
+            assert 'air_temperature' in var_names
+            assert 'air_temp_sfc' in var_names
 
-            # Height coordinate has surface (2m) + target levels
+            # 3D variable on height coordinate
+            t3d = ds['air_temperature']
+            assert t3d.ndims == 4
+            assert t3d.coord_names == ('time', 'height', 'y', 'x')
+
             height = np.array(ds['height'][:])
-            np.testing.assert_array_equal(height, [2.0, 100.0, 500.0])
+            np.testing.assert_array_equal(height, [100.0, 500.0])
 
-            # Data at all 3 height levels should be populated
-            t_data = np.squeeze(np.array(ds['air_temperature'][0]))
-            assert t_data.shape[0] == 3
-            for lev in range(3):
-                assert not np.all(np.isnan(t_data[lev]))
-                # Temperature values should be physically reasonable (200-330 K)
-                assert np.nanmean(t_data[lev]) > 200.0
-                assert np.nanmean(t_data[lev]) < 330.0
+            # Surface variable without height coordinate
+            t2 = ds['air_temp_sfc']
+            assert t2.ndims == 3
+            assert t2.coord_names == ('time', 'y', 'x')
+
+            # Temperature values should be physically reasonable
+            t3d_data = np.squeeze(np.array(t3d[0]))
+            for lev in range(2):
+                assert np.nanmean(t3d_data[lev]) > 200.0
+                assert np.nanmean(t3d_data[lev]) < 330.0
+
+            t2_data = np.array(t2[0])
+            assert np.nanmean(t2_data) > 200.0
+            assert np.nanmean(t2_data) < 330.0
 
 
 # ======================================================================
@@ -582,7 +597,7 @@ class TestCfdbOutput:
             assert ds.crs is not None
 
     def test_chunk_shape(self, wrf_single, cfdb_out):
-        """Data var chunk shape should be (1, 1, ny, nx)."""
+        """Surface data var chunk shape should be (1, ny, nx)."""
         import cfdb
         wrf_single.convert(
             cfdb_path=cfdb_out,
@@ -595,18 +610,18 @@ class TestCfdbOutput:
             dv = ds['air_temperature']
             cs = dv.chunk_shape
             assert cs[0] == 1  # one timestep per chunk
-            assert cs[1] == 1  # one height level per chunk
-            assert cs[2] > 1   # spatial y
-            assert cs[3] > 1   # spatial x
+            assert cs[1] > 1   # spatial y
+            assert cs[2] > 1   # spatial x
 
     def test_custom_chunk_shape(self, wrf_single, cfdb_out):
-        """Custom chunk_shape should be applied to the output data variable."""
+        """Custom chunk_shape for 4D should be applied to level-interpolated vars."""
         import cfdb
         wrf_single.convert(
             cfdb_path=cfdb_out,
-            variables=['T2'],
+            variables=['T'],
             start_date='2023-02-12T12:00',
             end_date='2023-02-12T12:00',
+            target_levels=[100.0, 500.0],
             chunk_shape=(1, 1, 50, 50),
         )
         with cfdb.open_dataset(cfdb_out, 'r') as ds:
@@ -707,8 +722,8 @@ class TestConvert3DWind:
             assert np.nanmin(ws) >= 0.0
             assert np.nanmax(ws) < 100.0
 
-    def test_wind_speed_surface_and_levels_merged(self, wrf_single, cfdb_out):
-        """WIND10 + WIND merge into one wind_speed variable with surface + level heights."""
+    def test_wind_speed_surface_and_levels_separate(self, wrf_single, cfdb_out):
+        """WIND10 + WIND stored as separate variables with different coords."""
         import cfdb
         levels = [100.0, 500.0]
         wrf_single.convert(
@@ -720,17 +735,18 @@ class TestConvert3DWind:
             target_levels=levels,
         )
         with cfdb.open_dataset(cfdb_out, 'r') as ds:
-            var_names = [v.name for v in ds.data_vars]
-            assert len(var_names) == 1
-            assert var_names[0] == 'wind_speed'
+            var_names = sorted(v.name for v in ds.data_vars)
+            assert len(var_names) == 2
+            assert 'wind_speed' in var_names
+            assert 'wind_speed_sfc' in var_names
 
-            height = np.array(ds['height'][:])
-            np.testing.assert_array_equal(height, [10.0, 100.0, 500.0])
+            # 3D on height
+            ws3d = ds['wind_speed']
+            assert ws3d.coord_names == ('time', 'height', 'y', 'x')
 
-            ws_data = np.squeeze(np.array(ds['wind_speed'][0]))
-            assert ws_data.shape[0] == 3
-            for lev in range(3):
-                assert not np.all(np.isnan(ws_data[lev]))
+            # Surface without height
+            ws_sfc = ds['wind_speed_sfc']
+            assert ws_sfc.coord_names == ('time', 'y', 'x')
 
     def test_wind_direction_3d_range(self, wrf_single, cfdb_out):
         """3D wind direction should be in [0, 360)."""
@@ -795,8 +811,8 @@ class TestConvertWindComponents:
             u_data = np.squeeze(np.array(ds['u_wind'][0]))
             assert u_data.shape[0] == len(levels)
 
-    def test_wind_components_surface_and_levels_merged(self, wrf_single, cfdb_out):
-        """U10 + U merge into one u_wind variable with surface + level heights."""
+    def test_wind_components_surface_and_levels_separate(self, wrf_single, cfdb_out):
+        """U10 + U stored as separate variables with different coords."""
         import cfdb
         levels = [100.0, 500.0]
         wrf_single.convert(
@@ -808,17 +824,13 @@ class TestConvertWindComponents:
             target_levels=levels,
         )
         with cfdb.open_dataset(cfdb_out, 'r') as ds:
-            var_names = [v.name for v in ds.data_vars]
-            assert len(var_names) == 1
-            assert var_names[0] == 'u_wind'
+            var_names = sorted(v.name for v in ds.data_vars)
+            assert len(var_names) == 2
+            assert 'u_wind' in var_names
+            assert 'u_wind_sfc' in var_names
 
-            height = np.array(ds['height'][:])
-            np.testing.assert_array_equal(height, [10.0, 100.0, 500.0])
-
-            u_data = np.squeeze(np.array(ds['u_wind'][0]))
-            assert u_data.shape[0] == 3
-            for lev in range(3):
-                assert not np.all(np.isnan(u_data[lev]))
+            assert ds['u_wind'].coord_names == ('time', 'height', 'y', 'x')
+            assert ds['u_wind_sfc'].coord_names == ('time', 'y', 'x')
 
 
 # ======================================================================
@@ -859,8 +871,8 @@ class TestConvert3DQ:
             assert np.nanmin(q) >= 0.0
             assert np.nanmax(q) < 0.04
 
-    def test_specific_humidity_surface_and_levels_merged(self, wrf_single, cfdb_out):
-        """Q2_SH + Q_SH merge into one specific_humidity variable."""
+    def test_specific_humidity_surface_and_levels_separate(self, wrf_single, cfdb_out):
+        """Q2_SH + Q_SH stored as separate variables with different coords."""
         import cfdb
         levels = [100.0, 500.0]
         wrf_single.convert(
@@ -872,17 +884,13 @@ class TestConvert3DQ:
             target_levels=levels,
         )
         with cfdb.open_dataset(cfdb_out, 'r') as ds:
-            var_names = [v.name for v in ds.data_vars]
-            assert len(var_names) == 1
-            assert var_names[0] == 'specific_humidity'
+            var_names = sorted(v.name for v in ds.data_vars)
+            assert len(var_names) == 2
+            assert 'specific_humidity' in var_names
+            assert 'specific_humidity_sfc' in var_names
 
-            height = np.array(ds['height'][:])
-            np.testing.assert_array_equal(height, [2.0, 100.0, 500.0])
-
-            q_data = np.squeeze(np.array(ds['specific_humidity'][0]))
-            assert q_data.shape[0] == 3
-            for lev in range(3):
-                assert not np.all(np.isnan(q_data[lev]))
+            assert ds['specific_humidity'].coord_names == ('time', 'height', 'y', 'x')
+            assert ds['specific_humidity_sfc'].coord_names == ('time', 'y', 'x')
 
 
 # ======================================================================
@@ -938,3 +946,223 @@ class TestConvertSLP:
         # SLP should be >= PSFC everywhere (reduction to sea level increases pressure)
         # Allow small tolerance for floating point and near-sea-level points
         assert np.all(slp >= psfc - 1.0)
+
+
+# ======================================================================
+# Conversion — Pressure-level mode
+# ======================================================================
+
+class TestConvertPressureLevels:
+    def test_pressure_coord_created(self, wrf_single, cfdb_out):
+        """vertical_coord='pressure' creates a pressure coordinate, not height."""
+        import cfdb
+        wrf_single.convert(
+            cfdb_path=cfdb_out,
+            variables=['T'],
+            start_date='2023-02-12T12:00',
+            end_date='2023-02-12T12:00',
+            bbox=(165.0, -47.0, 175.0, -40.0),
+            target_levels=[90000.0, 70000.0, 50000.0],
+            vertical_coord='pressure',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            assert 'pressure' in ds.coord_names
+            assert 'height' not in ds.coord_names
+
+    def test_pressure_levels_values(self, wrf_single, cfdb_out):
+        """Pressure coordinate contains the requested levels."""
+        import cfdb
+        levels = [90000.0, 70000.0, 50000.0]
+        wrf_single.convert(
+            cfdb_path=cfdb_out,
+            variables=['T'],
+            start_date='2023-02-12T12:00',
+            end_date='2023-02-12T12:00',
+            bbox=(165.0, -47.0, 175.0, -40.0),
+            target_levels=levels,
+            vertical_coord='pressure',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            pressure = np.array(ds['pressure'][:])
+            np.testing.assert_array_equal(pressure, sorted(levels))
+
+    def test_pressure_temp_shape(self, wrf_single, cfdb_out):
+        """3D temperature on pressure levels has correct shape."""
+        import cfdb
+        levels = [90000.0, 70000.0, 50000.0]
+        wrf_single.convert(
+            cfdb_path=cfdb_out,
+            variables=['T'],
+            start_date='2023-02-12T12:00',
+            end_date='2023-02-12T12:00',
+            bbox=(165.0, -47.0, 175.0, -40.0),
+            target_levels=levels,
+            vertical_coord='pressure',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            t = ds['air_temperature']
+            assert t.ndims == 4
+            assert t.coord_names == ('time', 'pressure', 'y', 'x')
+            assert t.shape[1] == 3  # 3 pressure levels
+
+    def test_pressure_temp_reasonable(self, wrf_single, cfdb_out):
+        """Temperature values on pressure levels are physically reasonable."""
+        import cfdb
+        wrf_single.convert(
+            cfdb_path=cfdb_out,
+            variables=['T'],
+            start_date='2023-02-12T12:00',
+            end_date='2023-02-12T12:00',
+            bbox=(165.0, -47.0, 175.0, -40.0),
+            target_levels=[90000.0, 70000.0, 50000.0],
+            vertical_coord='pressure',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            t_data = np.squeeze(np.array(ds['air_temperature'][0]))
+            for lev in range(3):
+                mean_t = np.nanmean(t_data[lev])
+                assert mean_t > 200.0
+                assert mean_t < 330.0
+
+    def test_pressure_surface_and_3d_separate(self, wrf_single, cfdb_out):
+        """Surface T2 and pressure-level T are separate variables."""
+        import cfdb
+        wrf_single.convert(
+            cfdb_path=cfdb_out,
+            variables=['T2', 'T'],
+            start_date='2023-02-12T12:00',
+            end_date='2023-02-12T12:00',
+            bbox=(165.0, -47.0, 175.0, -40.0),
+            target_levels=[90000.0, 70000.0],
+            vertical_coord='pressure',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            var_names = sorted(v.name for v in ds.data_vars)
+            assert 'air_temperature' in var_names
+            assert 'air_temp_sfc' in var_names
+
+            assert ds['air_temperature'].coord_names == ('time', 'pressure', 'y', 'x')
+            assert ds['air_temp_sfc'].coord_names == ('time', 'y', 'x')
+
+
+# ======================================================================
+# Conversion — Geopotential height 3D
+# ======================================================================
+
+class TestConvertGHT:
+    def test_ght_shape(self, wrf_single, cfdb_out):
+        """GHT variable has correct shape on height levels."""
+        import cfdb
+        levels = [100.0, 500.0, 1000.0]
+        wrf_single.convert(
+            cfdb_path=cfdb_out,
+            variables=['GHT'],
+            start_date='2023-02-12T12:00',
+            end_date='2023-02-12T12:00',
+            bbox=(165.0, -47.0, 175.0, -40.0),
+            target_levels=levels,
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            ght = ds['geopotential_height']
+            assert ght.ndims == 4
+            assert ght.shape[1] == 3
+
+    def test_ght_on_pressure_levels(self, wrf_single, cfdb_out):
+        """GHT on pressure levels produces reasonable geopotential heights."""
+        import cfdb
+        wrf_single.convert(
+            cfdb_path=cfdb_out,
+            variables=['GHT'],
+            start_date='2023-02-12T12:00',
+            end_date='2023-02-12T12:00',
+            bbox=(165.0, -47.0, 175.0, -40.0),
+            target_levels=[90000.0, 50000.0],
+            vertical_coord='pressure',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            # Pressure coord sorted ascending: [50000, 90000]
+            pressure = np.array(ds['pressure'][:])
+            ght = np.squeeze(np.array(ds['geopotential_height'][0]))
+
+            idx_900 = np.searchsorted(pressure, 90000.0)
+            idx_500 = np.searchsorted(pressure, 50000.0)
+
+            # 900 hPa should be ~1000m, 500 hPa should be ~5500m
+            assert 500.0 < np.nanmean(ght[idx_900]) < 2000.0
+            assert 4000.0 < np.nanmean(ght[idx_500]) < 7000.0
+
+    def test_ght_increases_with_lower_pressure(self, wrf_single, cfdb_out):
+        """Geopotential height should increase as pressure decreases (ascending pressure coord)."""
+        import cfdb
+        wrf_single.convert(
+            cfdb_path=cfdb_out,
+            variables=['GHT'],
+            start_date='2023-02-12T12:00',
+            end_date='2023-02-12T12:00',
+            bbox=(165.0, -47.0, 175.0, -40.0),
+            target_levels=[90000.0, 70000.0, 50000.0],
+            vertical_coord='pressure',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            # Pressure sorted ascending [50000, 70000, 90000]
+            # GHT should decrease with increasing pressure (higher pressure = lower altitude)
+            ght = np.squeeze(np.array(ds['geopotential_height'][0]))
+            assert np.nanmean(ght[0]) > np.nanmean(ght[1]) > np.nanmean(ght[2])
+
+
+# ======================================================================
+# Conversion — Soil variables (skip if not in test data)
+# ======================================================================
+
+class TestConvertSoil:
+    def test_soil_depth_coord_created(self, wrf_single, cfdb_out):
+        """Soil variables create a depth coordinate."""
+        import cfdb
+        if 'SMOIS' not in wrf_single.variables:
+            pytest.skip('SMOIS not available in test data')
+        wrf_single.convert(
+            cfdb_path=cfdb_out,
+            variables=['SMOIS'],
+            start_date='2023-02-12T12:00',
+            end_date='2023-02-12T12:00',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            assert 'depth' in ds.coord_names
+
+    def test_soil_moisture_shape(self, wrf_single, cfdb_out):
+        """Soil moisture has 4D shape (time, depth, y, x)."""
+        import cfdb
+        if 'SMOIS' not in wrf_single.variables:
+            pytest.skip('SMOIS not available in test data')
+        wrf_single.convert(
+            cfdb_path=cfdb_out,
+            variables=['SMOIS'],
+            start_date='2023-02-12T12:00',
+            end_date='2023-02-12T12:00',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            sm = ds['soil_moisture']
+            assert sm.ndims == 4
+            assert sm.coord_names == ('time', 'depth', 'y', 'x')
+
+
+# ======================================================================
+# Conversion — New surface variables (skip if not in test data)
+# ======================================================================
+
+class TestNewSurfaceVars:
+    def test_land_sea_mask_values(self, wrf_single, cfdb_out):
+        """XLAND transform produces only 0.0 and 1.0 values."""
+        import cfdb
+        if 'XLAND' not in wrf_single.variables:
+            pytest.skip('XLAND not available in test data')
+        wrf_single.convert(
+            cfdb_path=cfdb_out,
+            variables=['XLAND'],
+            start_date='2023-02-12T12:00',
+            end_date='2023-02-12T12:00',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            mask = np.squeeze(np.array(ds['land_sea_mask'][0]))
+            unique_vals = set(np.unique(mask))
+            assert unique_vals <= {0.0, 1.0}

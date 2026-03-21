@@ -182,6 +182,7 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 cfdb-ingest = "cfdb_ingest.cli:app"
+cfdb-to-int = "cfdb_ingest.cfdb_to_int:app"
 
 [project.urls]
 Documentation = "https://mullenkamp.github.io/cfdb-ingest/"
