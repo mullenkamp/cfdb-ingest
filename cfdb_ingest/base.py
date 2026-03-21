@@ -379,12 +379,12 @@ class H5Ingest:
 
             if sorted_levels is not None and level_vars:
                 if vertical_coord == 'pressure':
-                    ds.create.coord.generic('pressure', data=sorted_levels, axis='z')
+                    ds.create.coord.pressure(data=sorted_levels)
                 else:
                     ds.create.coord.height(data=sorted_levels)
 
             if soil_depths is not None and soil_vars:
-                ds.create.coord.generic('depth', data=soil_depths)
+                ds.create.coord.depth(data=soil_depths, axis=None)
 
             # Set CRS
             ds.create.crs.from_user_input(self.crs, x_coord='x', y_coord='y')
