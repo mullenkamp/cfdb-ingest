@@ -11,30 +11,12 @@ import typer
 import cfdb
 from typing_extensions import Annotated
 
-from cfdb_ingest import WPSUtils
+from wrf_to_int import IntermediateFile, Projections, MapProjection, write_slab
 
 
 ######################################################
 # Projection extraction from cfdb CRS
 
-
-class MapProjection:
-    """WPS intermediate file projection parameters."""
-
-    def __init__(self, projType, startLat, startLon, startI, startJ, deltaLat, deltaLon,
-                 dx=0.0, dy=0.0, truelat1=0.0, truelat2=0.0, xlonc=0.0):
-        self.projType = projType
-        self.startLat = startLat
-        self.startLon = startLon
-        self.startI = startI
-        self.startJ = startJ
-        self.deltaLat = deltaLat
-        self.deltaLon = deltaLon
-        self.dx = dx
-        self.dy = dy
-        self.truelat1 = truelat1
-        self.truelat2 = truelat2
-        self.xlonc = xlonc
 
 
 def _extract_projection(ds):
@@ -65,7 +47,7 @@ def _extract_projection(ds):
         dy_m = float(y[1] - y[0])
 
         return MapProjection(
-            projType=WPSUtils.Projections.LC,
+            projType=Projections.LC,
             startLat=sw_lat, startLon=sw_lon,
             startI=1.0, startJ=1.0,
             deltaLat=0.0, deltaLon=0.0,
@@ -81,7 +63,7 @@ def _extract_projection(ds):
         xlonc = float(cf_params.get('straight_vertical_longitude_from_pole', 0.0))
 
         return MapProjection(
-            projType=WPSUtils.Projections.PS,
+            projType=Projections.PS,
             startLat=sw_lat, startLon=sw_lon,
             startI=1.0, startJ=1.0,
             deltaLat=0.0, deltaLon=0.0,
@@ -96,7 +78,7 @@ def _extract_projection(ds):
         xlonc = float(cf_params.get('longitude_of_projection_origin', 0.0))
 
         return MapProjection(
-            projType=WPSUtils.Projections.MERC,
+            projType=Projections.MERC,
             startLat=sw_lat, startLon=sw_lon,
             startI=1.0, startJ=1.0,
             deltaLat=0.0, deltaLon=0.0,
@@ -109,7 +91,7 @@ def _extract_projection(ds):
         deltalon = float(x[1] - x[0])
 
         return MapProjection(
-            projType=WPSUtils.Projections.LATLON,
+            projType=Projections.LATLON,
             startLat=float(y[0]), startLon=float(x[0]),
             startI=1.0, startJ=1.0,
             deltaLat=deltalat, deltaLon=deltalon,
@@ -123,17 +105,8 @@ def _extract_projection(ds):
 # Slab writing
 
 
-def _write_slab(intfile, slab, xlvl, proj, WPSname, hdate, units, map_source, desc):
-    """Write a 2D field slab to a WPS intermediate file."""
-    missing_value = -1.0e30
-    data = np.squeeze(np.asarray(slab, dtype=np.float64))
-    masked = np.ma.array(data, mask=np.isnan(data))
-    intfile.write_next_met_field(
-        5, masked.shape[1], masked.shape[0], proj.projType, 0.0, xlvl,
-        proj.startLat, proj.startLon, proj.startI, proj.startJ,
-        proj.deltaLat, proj.deltaLon, proj.dx, proj.dy, proj.xlonc,
-        proj.truelat1, proj.truelat2, 6371.229, 0, WPSname,
-        hdate, units, map_source, desc, masked.filled(missing_value))
+
+# write_slab is imported from wrf_to_int
 
 
 ######################################################
@@ -256,7 +229,7 @@ def convert_cfdb_to_int(
             datestr = dt.strftime('%Y-%m-%d_%H')
 
             print(f'  Writing {output_prefix}:{datestr}')
-            intfile = WPSUtils.IntermediateFile(output_prefix, datestr)
+            intfile = IntermediateFile(output_prefix, datestr)
 
             # --- 3D pressure-level fields ---
             if has_pressure:
@@ -267,7 +240,7 @@ def convert_cfdb_to_int(
                     for k in range(len(pressure_levels)):
                         xlvl = float(pressure_levels[k])
                         slab = dv[t_idx, k, :, :]
-                        _write_slab(intfile, slab, xlvl, proj, wps_field, hdate, units, map_source, desc)
+                        write_slab(intfile, slab, xlvl, proj, wps_field, hdate, units, map_source, desc)
 
             # --- 2D surface fields ---
             for cfdb_name, wps_field, xlvl, units, desc in SURFACE_VARS:
@@ -278,7 +251,7 @@ def convert_cfdb_to_int(
                 if dv.ndims != 3:
                     continue
                 slab = dv[t_idx, :, :]
-                _write_slab(intfile, slab, xlvl, proj, wps_field, hdate, units, map_source, desc)
+                write_slab(intfile, slab, xlvl, proj, wps_field, hdate, units, map_source, desc)
 
             # --- Soil fields ---
             if has_depth:
@@ -293,11 +266,11 @@ def convert_cfdb_to_int(
 
                     if 'soil_moisture' in available_vars:
                         slab = ds['soil_moisture'][t_idx, d_idx, :, :]
-                        _write_slab(intfile, slab, 200100.0, proj, sm_name, hdate, 'm3 m-3', map_source, 'Soil moisture')
+                        write_slab(intfile, slab, 200100.0, proj, sm_name, hdate, 'm3 m-3', map_source, 'Soil moisture')
 
                     if 'soil_layer_temp' in available_vars:
                         slab = ds['soil_layer_temp'][t_idx, d_idx, :, :]
-                        _write_slab(intfile, slab, 200100.0, proj, st_name, hdate, 'K', map_source, 'Soil temperature')
+                        write_slab(intfile, slab, 200100.0, proj, st_name, hdate, 'K', map_source, 'Soil temperature')
 
             intfile.close()
 
