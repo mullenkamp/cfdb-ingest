@@ -71,8 +71,10 @@ nav:
         - Quick Start: getting-started/quickstart.md
     - User Guide:
         - WRF Ingestion: guide/wrf-ingestion.md
+        - ERA5 Ingestion: guide/era5-ingestion.md
         - WPS Export: guide/wps-export.md
     - Reference:
         - WRF Variables: reference/wrf-variables.md
+        - ERA5 Variables: reference/era5-variables.md
         - API: reference/cfdb_ingest.md
     - Development: development.md

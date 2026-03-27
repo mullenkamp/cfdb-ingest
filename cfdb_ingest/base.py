@@ -153,18 +153,8 @@ class H5Ingest:
         (e.g., 'latitude'/'longitude' instead of 'x'/'y').
         """
         creator = ds.create.coord
-        y_method = getattr(creator, self.y_coord_name, None)
-        x_method = getattr(creator, self.x_coord_name, None)
-
-        if y_method is not None:
-            y_method(data=filtered_y.astype('float64'))
-        else:
-            creator.generic(self.y_coord_name, data=filtered_y.astype('float64'), axis='y')
-
-        if x_method is not None:
-            x_method(data=filtered_x.astype('float64'))
-        else:
-            creator.generic(self.x_coord_name, data=filtered_x.astype('float64'), axis='x')
+        creator.generic(self.y_coord_name, data=filtered_y.astype('float64'), axis='y', step=True)
+        creator.generic(self.x_coord_name, data=filtered_x.astype('float64'), axis='x', step=True)
 
     # ------------------------------------------------------------------
     # Abstract methods — subclasses must implement
