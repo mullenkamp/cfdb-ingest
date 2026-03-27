@@ -28,18 +28,22 @@ class H5Ingest:
         One or more source HDF5/netCDF4 file paths.
     """
 
+    file_glob_pattern = '*'
+    """Glob pattern for finding source files in directories. Override in subclasses."""
+
     def __init__(self, input_paths: Union[str, pathlib.Path, List[Union[str, pathlib.Path]]]):
         if isinstance(input_paths, (str, pathlib.Path)):
             input_paths = [input_paths]
 
-        # Expand any directories in the list to their wrfout files
         expanded = []
         for p in input_paths:
             p = pathlib.Path(p)
             if p.is_dir():
-                found = sorted(p.glob('wrfout*'))
+                found = sorted(p.glob(self.file_glob_pattern))
                 if not found:
-                    raise FileNotFoundError(f'No wrfout files found in directory: {p}')
+                    raise FileNotFoundError(
+                        f'No files matching {self.file_glob_pattern!r} found in directory: {p}'
+                    )
                 expanded.extend(found)
             else:
                 expanded.append(p)
@@ -55,16 +59,25 @@ class H5Ingest:
         """
         Derive all metadata from the source files by calling subclass methods.
         """
+        self._init_source_metadata()
+        self._init_time()
+        self._init_variables()
+        self._compute_bbox_geographic()
+
+    def _init_source_metadata(self):
+        """
+        Extract CRS and spatial coordinates from source files.
+
+        Default implementation opens the first file and calls _parse_crs and
+        _parse_spatial_coords. Override for sources with non-standard layouts
+        (e.g., one variable per file).
+        """
         with h5py.File(self.input_paths[0], 'r') as h5:
             self.crs = self._parse_crs(h5)
             spatial = self._parse_spatial_coords(h5)
 
         self.x = spatial['x']
         self.y = spatial['y']
-
-        self._init_time()
-        self._init_variables()
-        self._compute_bbox_geographic()
 
     def _init_time(self):
         """
@@ -124,6 +137,24 @@ class H5Ingest:
         lons, lats = transformer.transform(corners_x, corners_y)
 
         self.bbox_geographic = (min(lons), min(lats), max(lons), max(lats))
+
+    # ------------------------------------------------------------------
+    # Overridable coordinate naming
+    # ------------------------------------------------------------------
+
+    x_coord_name = 'x'
+    y_coord_name = 'y'
+
+    def _create_spatial_coords(self, ds, filtered_x, filtered_y):
+        """
+        Create spatial coordinates on the cfdb dataset.
+
+        Override in subclasses to use different coordinate names
+        (e.g., 'latitude'/'longitude' instead of 'x'/'y').
+        """
+        creator = ds.create.coord
+        creator.generic(self.y_coord_name, data=filtered_y.astype('float64'), axis='y', step=True)
+        creator.generic(self.x_coord_name, data=filtered_x.astype('float64'), axis='x', step=True)
 
     # ------------------------------------------------------------------
     # Abstract methods — subclasses must implement
@@ -335,16 +366,11 @@ class H5Ingest:
         nx = len(filtered_x)
 
         # Classify variables into coordinate groups
-        level_vars = {}      # cfdb_name -> [(var_key, level_indices)]
-        surface_vars = {}    # cfdb_name -> [(var_key,)]
-        soil_vars = {}       # cfdb_name -> [(var_key, depth_indices)]
+        level_vars = {}      # cfdb_name -> [var_key, ...]
+        surface_vars = {}    # cfdb_name -> [var_key, ...]  (vars at a fixed height)
+        soil_vars = {}       # cfdb_name -> [var_key, ...]
 
         sorted_levels = np.array(sorted(target_levels), dtype='float64') if target_levels else None
-        level_to_idx = {float(v): i for i, v in enumerate(sorted_levels)} if sorted_levels is not None else {}
-
-        soil_to_idx = {}
-        if soil_depths is not None:
-            soil_to_idx = {float(v): i for i, v in enumerate(soil_depths)}
 
         for var_key in var_keys:
             info = self.variables[var_key]
@@ -359,35 +385,55 @@ class H5Ingest:
                 surface_vars.setdefault(cfdb_name, []).append(var_key)
 
         # Resolve cfdb_name conflicts between surface and level/soil groups.
-        # When a cfdb_name appears in both surface and level groups, suffix
-        # the surface variant with '_sfc' to avoid creating two data variables
-        # with the same name but different coordinates.
+        # When a cfdb_name appears in both groups, suffix the surface variant
+        # with its height to disambiguate (e.g. air_temperature_2m).
         conflicting = set(surface_vars) & (set(level_vars) | set(soil_vars))
         for name in conflicting:
-            new_name = name + '_sfc'
-            surface_vars[new_name] = surface_vars.pop(name)
+            var_key_list = surface_vars.pop(name)
+            h = float(self.variables[var_key_list[0]]['height'])
+            new_name = f'{name}_{int(h)}m'
+            surface_vars[new_name] = var_key_list
 
-        # Default chunk shapes per coordinate type
+        # Collect unique fixed heights needed for surface variables
+        fixed_heights = set()
+        for cfdb_name, var_key_list in surface_vars.items():
+            h = float(self.variables[var_key_list[0]]['height'])
+            fixed_heights.add(h)
+
+        # Default chunk shape
         chunk_4d = chunk_shape if chunk_shape is not None else (1, 1, ny, nx)
-        chunk_3d = (1, ny, nx)
+
+        has_multi_level = sorted_levels is not None and level_vars
 
         with cfdb.open_dataset(cfdb_path, 'n', dataset_type=dataset_type, **cfdb_kwargs) as ds:
             # Create coordinates
             ds.create.coord.time(data=filtered_times)
-            ds.create.coord.y(data=filtered_y.astype('float32'))
-            ds.create.coord.x(data=filtered_x.astype('float32'))
+            self._create_spatial_coords(ds, filtered_x, filtered_y)
 
-            if sorted_levels is not None and level_vars:
+            if has_multi_level:
                 if vertical_coord == 'pressure':
-                    ds.create.coord.generic('pressure', data=sorted_levels, axis='z')
+                    ds.create.coord.pressure(data=sorted_levels)
                 else:
                     ds.create.coord.height(data=sorted_levels)
 
             if soil_depths is not None and soil_vars:
-                ds.create.coord.generic('depth', data=soil_depths)
+                ds.create.coord.depth(data=soil_depths, axis=None)
+
+            # Create named height coordinates for fixed-height surface variables.
+            # Each distinct height gets its own length-1 coordinate (e.g. height_2m).
+            # If there's also a multi-level vertical coord, these get axis=None
+            # to avoid conflicting with the axis='Z' on pressure/height.
+            for h in sorted(fixed_heights):
+                coord_name = f'height_{int(h)}m'
+                axis = None if (has_multi_level or len(fixed_heights) > 1) else 'z'
+                ds.create.coord.generic(
+                    coord_name,
+                    data=np.array([h], dtype='float64'),
+                    axis=axis,
+                )
 
             # Set CRS
-            ds.create.crs.from_user_input(self.crs, x_coord='x', y_coord='y')
+            ds.create.crs.from_user_input(self.crs, x_coord=self.x_coord_name, y_coord=self.y_coord_name)
 
             # Set dataset attributes
             for key, value in self._get_dataset_attrs().items():
@@ -399,7 +445,7 @@ class H5Ingest:
             batch_items = []
 
             # Level-interpolated variables: (time, <vertical_coord>, y, x)
-            level_coord_names = ('time', vertical_coord, 'y', 'x')
+            level_coord_names = ('time', vertical_coord, self.y_coord_name, self.x_coord_name)
             for cfdb_name, var_key_list in level_vars.items():
                 data_var = self._create_cfdb_data_var(ds, cfdb_name, level_coord_names, chunk_4d)
                 for var_key in var_key_list:
@@ -409,17 +455,19 @@ class H5Ingest:
                     item = (var_key, data_var, level_indices)
                     batch_items.append(item)
 
-            # Surface variables: (time, y, x)
-            surface_coord_names = ('time', 'y', 'x')
+            # Surface variables: (time, height_Xm, y, x)
             for cfdb_name, var_key_list in surface_vars.items():
-                data_var = self._create_cfdb_data_var(ds, cfdb_name, surface_coord_names, chunk_3d)
+                h = float(self.variables[var_key_list[0]]['height'])
+                coord_name = f'height_{int(h)}m'
+                surface_coord_names = ('time', coord_name, self.y_coord_name, self.x_coord_name)
+                data_var = self._create_cfdb_data_var(ds, cfdb_name, surface_coord_names, chunk_4d)
                 for var_key in var_key_list:
                     info = self.variables[var_key]
                     transform = info.get('transform')
                     is_simple = transform is None and len(info['source_vars']) == 1
                     is_accumulation = transform == 'accumulation_increment'
 
-                    item = (var_key, data_var, None)  # None = no vertical indices
+                    item = (var_key, data_var, [0])  # index 0 of the length-1 height coord
                     if is_simple:
                         rechunkit_items.append(item)
                     elif is_accumulation:
@@ -428,7 +476,7 @@ class H5Ingest:
                         batch_items.append(item)
 
             # Soil variables: (time, depth, y, x)
-            soil_coord_names = ('time', 'depth', 'y', 'x')
+            soil_coord_names = ('time', 'depth', self.y_coord_name, self.x_coord_name)
             for cfdb_name, var_key_list in soil_vars.items():
                 data_var = self._create_cfdb_data_var(ds, cfdb_name, soil_coord_names, chunk_4d)
                 for var_key in var_key_list:
@@ -556,12 +604,11 @@ class H5Ingest:
         Populate a simple (no-transform, single source var) data variable using
         rechunkit for optimized HDF5 chunk reads.
 
-        vert_indices is None for surface (time, y, x) variables, or a list
-        with one element for 4D variables at a single vertical index.
+        vert_indices is a list of vertical indices. For surface variables with
+        a length-1 height coordinate, this is [0].
         """
         src_var = self.variables[var_key]['source_vars'][0]
         y_sl, x_sl = spatial_slice
-        is_surface = vert_indices is None
 
         # Pre-compute unique_time_idx -> output_time_idx mapping
         output_map = {}
@@ -600,20 +647,14 @@ class H5Ingest:
                         continue
 
                     t_out = output_map[u_idx]
-                    if is_surface:
-                        data_var[(t_out, slice(None), slice(None))] = data[0].astype('float32')
-                    else:
-                        data_var[(t_out, vert_indices[0], slice(None), slice(None))] = data[0].astype('float32')
+                    data_var[(t_out, vert_indices[0], slice(None), slice(None))] = data[0].astype('float32')
 
             raw_offset += n_file_times
 
     @staticmethod
     def _write_data_var(data_var, data, output_time_idx, vert_indices):
         """Write data to a data variable at the correct indices."""
-        if vert_indices is None:
-            # Surface: (time, y, x)
-            data_var[(output_time_idx, slice(None), slice(None))] = data
-        elif len(vert_indices) == 1:
+        if len(vert_indices) == 1:
             data_var[(output_time_idx, vert_indices[0], slice(None), slice(None))] = data
         else:
             for lev_i, v_idx in enumerate(vert_indices):
@@ -626,7 +667,7 @@ class H5Ingest:
         Used for transform variables (accumulation, wind, 3D temp) that need
         per-timestep logic. Handles accumulation cross-file caching.
 
-        vert_indices is None for surface (time, y, x) variables.
+        vert_indices is [0] for surface variables with a length-1 height coordinate.
         """
         raw_offset = 0
         output_time_idx = 0

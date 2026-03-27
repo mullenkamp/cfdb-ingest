@@ -90,6 +90,46 @@ def wrf(
 
 
 @app.command()
+def era5(
+    input_paths: Annotated[List[Path], typer.Argument(help="ERA5 NetCDF files or directory.")],
+    output_path: Annotated[Path, typer.Argument(help="Output cfdb path (file for combined, directory for split).")],
+    split: Annotated[bool, typer.Option("--split", help="Create one cfdb file per variable.")] = False,
+    variables: Annotated[Optional[str], typer.Option("--variables", "-v", help="Comma-separated variable names (mapping keys, source names, or cfdb names).")] = None,
+    start_date: Annotated[Optional[str], typer.Option("--start-date", "-s", help="Start date (ISO format).")] = None,
+    end_date: Annotated[Optional[str], typer.Option("--end-date", "-e", help="End date (ISO format).")] = None,
+    bbox: Annotated[Optional[str], typer.Option("--bbox", "-b", help="Bounding box: min_lon,min_lat,max_lon,max_lat")] = None,
+    target_levels: Annotated[Optional[str], typer.Option("--target-levels", "-l", help="Comma-separated pressure levels in Pa. Auto-detected from files if omitted.")] = None,
+    chunk_shape: Annotated[Optional[str], typer.Option("--chunk-shape", "-c", help="Output chunk shape as time,z,y,x (e.g. 1,1,50,50).")] = None,
+    compression: Annotated[Optional[str], typer.Option(help="Compression: zstd or lz4.")] = None,
+):
+    """Convert ERA5 NetCDF files to cfdb."""
+    from cfdb_ingest.era5 import Era5Ingest
+
+    ingest = Era5Ingest(input_paths)
+
+    bbox_tuple = tuple(float(x) for x in bbox.split(",")) if bbox else None
+    levels = [float(x) for x in target_levels.split(",")] if target_levels else None
+    chunks = tuple(int(x) for x in chunk_shape.split(",")) if chunk_shape else None
+    var_list = [v.strip() for v in variables.split(",")] if variables else None
+
+    cfdb_kwargs = {}
+    if compression is not None:
+        cfdb_kwargs["compression"] = compression
+
+    ingest.convert(
+        cfdb_path=output_path,
+        variables=var_list,
+        start_date=start_date,
+        end_date=end_date,
+        bbox=bbox_tuple,
+        target_levels=levels,
+        split=split,
+        chunk_shape=chunks,
+        **cfdb_kwargs,
+    )
+
+
+@app.command()
 def cfdb_to_int(
     cfdb_path: Annotated[Path, typer.Argument(help="Input cfdb dataset path.")],
     start_date: Annotated[datetime, typer.Option(

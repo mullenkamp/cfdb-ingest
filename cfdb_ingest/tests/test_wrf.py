@@ -286,7 +286,7 @@ class TestConvert2D:
         assert np.nanmax(wd) <= 360.0
 
     def test_multiple_surface_vars(self, wrf_single, cfdb_out):
-        """Convert several surface vars at once; stored as (time, y, x) without height coord."""
+        """Convert several surface vars at once; stored as (time, height_Xm, y, x)."""
         import cfdb
         wrf_single.convert(
             cfdb_path=cfdb_out,
@@ -298,13 +298,13 @@ class TestConvert2D:
             var_names = [v.name for v in ds.data_vars]
             assert len(var_names) == 5
 
-            # Surface-only conversion has no height coordinate
-            assert 'height' not in ds.coord_names
+            # Surface vars have named height coordinates
+            assert 'height_0m' in ds.coord_names
+            assert 'height_2m' in ds.coord_names
 
-            # Each variable is (time, y, x)
+            # Each variable is (time, height_Xm, y, x)
             for dv in ds.data_vars:
-                assert dv.ndims == 3
-                assert dv.coord_names == ('time', 'y', 'x')
+                assert dv.ndims == 4
 
 
 # ======================================================================
@@ -550,10 +550,10 @@ class TestConvert3D:
         )
         with cfdb.open_dataset(cfdb_out, 'r') as ds:
             var_names = sorted(v.name for v in ds.data_vars)
-            # T2 gets suffixed to avoid conflict: air_temp_sfc
+            # T2 gets suffixed with height to avoid conflict: air_temperature_2m
             assert len(var_names) == 2
             assert 'air_temperature' in var_names
-            assert 'air_temp_sfc' in var_names
+            assert 'air_temp_2m' in var_names
 
             # 3D variable on height coordinate
             t3d = ds['air_temperature']
@@ -563,10 +563,10 @@ class TestConvert3D:
             height = np.array(ds['height'][:])
             np.testing.assert_array_equal(height, [100.0, 500.0])
 
-            # Surface variable without height coordinate
-            t2 = ds['air_temp_sfc']
-            assert t2.ndims == 3
-            assert t2.coord_names == ('time', 'y', 'x')
+            # Surface variable with named height coordinate
+            t2 = ds['air_temp_2m']
+            assert t2.ndims == 4
+            assert t2.coord_names == ('time', 'height_2m', 'y', 'x')
 
             # Temperature values should be physically reasonable
             t3d_data = np.squeeze(np.array(t3d[0]))
@@ -574,7 +574,7 @@ class TestConvert3D:
                 assert np.nanmean(t3d_data[lev]) > 200.0
                 assert np.nanmean(t3d_data[lev]) < 330.0
 
-            t2_data = np.array(t2[0])
+            t2_data = np.squeeze(np.array(t2[0]))
             assert np.nanmean(t2_data) > 200.0
             assert np.nanmean(t2_data) < 330.0
 
@@ -597,7 +597,7 @@ class TestCfdbOutput:
             assert ds.crs is not None
 
     def test_chunk_shape(self, wrf_single, cfdb_out):
-        """Surface data var chunk shape should be (1, ny, nx)."""
+        """Surface data var chunk shape should be (1, 1, ny, nx)."""
         import cfdb
         wrf_single.convert(
             cfdb_path=cfdb_out,
@@ -610,8 +610,9 @@ class TestCfdbOutput:
             dv = ds['air_temperature']
             cs = dv.chunk_shape
             assert cs[0] == 1  # one timestep per chunk
-            assert cs[1] > 1   # spatial y
-            assert cs[2] > 1   # spatial x
+            assert cs[1] == 1  # one height value per chunk
+            assert cs[2] > 1   # spatial y
+            assert cs[3] > 1   # spatial x
 
     def test_custom_chunk_shape(self, wrf_single, cfdb_out):
         """Custom chunk_shape for 4D should be applied to level-interpolated vars."""
@@ -738,15 +739,15 @@ class TestConvert3DWind:
             var_names = sorted(v.name for v in ds.data_vars)
             assert len(var_names) == 2
             assert 'wind_speed' in var_names
-            assert 'wind_speed_sfc' in var_names
+            assert 'wind_speed_10m' in var_names
 
             # 3D on height
             ws3d = ds['wind_speed']
             assert ws3d.coord_names == ('time', 'height', 'y', 'x')
 
-            # Surface without height
-            ws_sfc = ds['wind_speed_sfc']
-            assert ws_sfc.coord_names == ('time', 'y', 'x')
+            # Surface with named height coordinate
+            ws_sfc = ds['wind_speed_10m']
+            assert ws_sfc.coord_names == ('time', 'height_10m', 'y', 'x')
 
     def test_wind_direction_3d_range(self, wrf_single, cfdb_out):
         """3D wind direction should be in [0, 360)."""
@@ -827,10 +828,10 @@ class TestConvertWindComponents:
             var_names = sorted(v.name for v in ds.data_vars)
             assert len(var_names) == 2
             assert 'u_wind' in var_names
-            assert 'u_wind_sfc' in var_names
+            assert 'u_wind_10m' in var_names
 
             assert ds['u_wind'].coord_names == ('time', 'height', 'y', 'x')
-            assert ds['u_wind_sfc'].coord_names == ('time', 'y', 'x')
+            assert ds['u_wind_10m'].coord_names == ('time', 'height_10m', 'y', 'x')
 
 
 # ======================================================================
@@ -887,10 +888,10 @@ class TestConvert3DQ:
             var_names = sorted(v.name for v in ds.data_vars)
             assert len(var_names) == 2
             assert 'specific_humidity' in var_names
-            assert 'specific_humidity_sfc' in var_names
+            assert 'specific_humidity_2m' in var_names
 
             assert ds['specific_humidity'].coord_names == ('time', 'height', 'y', 'x')
-            assert ds['specific_humidity_sfc'].coord_names == ('time', 'y', 'x')
+            assert ds['specific_humidity_2m'].coord_names == ('time', 'height_2m', 'y', 'x')
 
 
 # ======================================================================
@@ -1039,10 +1040,10 @@ class TestConvertPressureLevels:
         with cfdb.open_dataset(cfdb_out, 'r') as ds:
             var_names = sorted(v.name for v in ds.data_vars)
             assert 'air_temperature' in var_names
-            assert 'air_temp_sfc' in var_names
+            assert 'air_temp_2m' in var_names
 
             assert ds['air_temperature'].coord_names == ('time', 'pressure', 'y', 'x')
-            assert ds['air_temp_sfc'].coord_names == ('time', 'y', 'x')
+            assert ds['air_temp_2m'].coord_names == ('time', 'height_2m', 'y', 'x')
 
 
 # ======================================================================

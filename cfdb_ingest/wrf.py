@@ -289,6 +289,25 @@ WRF_VARIABLE_MAPPING = {
         'transform': None,
         'height': 0.0,
     },
+    # --- Column-integrated variables (3D → 2D) ---
+    'PWAT': {
+        'cfdb_name': 'pwat',
+        'source_vars': ['QVAPOR', 'P', 'PB'],
+        'transform': 'precipitable_water',
+        'height': 0.0,
+    },
+    'VIMF_U': {
+        'cfdb_name': 'vimf_u',
+        'source_vars': ['QVAPOR', 'U', 'V', 'P', 'PB'],
+        'transform': 'vimf_u',
+        'height': 0.0,
+    },
+    'VIMF_V': {
+        'cfdb_name': 'vimf_v',
+        'source_vars': ['QVAPOR', 'U', 'V', 'P', 'PB'],
+        'transform': 'vimf_v',
+        'height': 0.0,
+    },
     # --- Soil variables ---
     'SMOIS': {
         'cfdb_name': 'soil_moisture',
@@ -367,7 +386,9 @@ class WrfIngest(H5Ingest):
         One or more wrfout file paths.
     """
 
-    def _init_metadata(self):
+    file_glob_pattern = 'wrfout*'
+
+    def _init_source_metadata(self):
         """
         Override to also load wind rotation fields and WRF source attributes.
         """
@@ -394,10 +415,6 @@ class WrfIngest(H5Ingest):
         self.y = spatial['y']
         self._dx = float(self.x[1] - self.x[0])
         self._dy = float(self.y[1] - self.y[0])
-
-        self._init_time()
-        self._init_variables()
-        self._compute_bbox_geographic()
 
     def _parse_crs(self, h5):
         """
@@ -634,6 +651,15 @@ class WrfIngest(H5Ingest):
 
         elif transform == 'soil_3d':
             return self._read_soil_3d(h5, var_key, time_idx, spatial_slice)
+
+        elif transform == 'precipitable_water':
+            return self._read_precipitable_water(h5, time_idx, spatial_slice)
+
+        elif transform == 'vimf_u':
+            return self._read_vimf_u(h5, time_idx, spatial_slice)
+
+        elif transform == 'vimf_v':
+            return self._read_vimf_v(h5, time_idx, spatial_slice)
 
         raise ValueError(f'Unknown transform: {transform!r}')
 
@@ -1051,6 +1077,92 @@ class WrfIngest(H5Ingest):
         src = info['source_vars'][0]
         y_sl, x_sl = spatial_slice
         return h5[src][time_idx, :, y_sl, x_sl].astype('float32')
+
+    def _compute_column_qvapor_dp(self, h5, time_idx, spatial_slice):
+        """
+        Read QVAPOR and compute pressure layer thickness on eta levels.
+
+        Cached in ``_ts_cache`` so PWAT and VIMF can share the same read.
+
+        Returns
+        -------
+        qvapor : np.ndarray
+            Water vapor mixing ratio, shape (nz, ny, nx).
+        dp : np.ndarray
+            Pressure thickness of each layer, shape (nz, ny, nx).
+        """
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 'column_qvapor_dp' in cache:
+            return cache['column_qvapor_dp']
+
+        y_sl, x_sl = spatial_slice
+        qvapor = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
+        p = h5['P'][time_idx, :, y_sl, x_sl].astype('float64')
+        pb = h5['PB'][time_idx, :, y_sl, x_sl].astype('float64')
+        pressure = p + pb  # Full pressure on eta levels (nz, ny, nx)
+
+        # Compute pressure thickness of each layer using layer midpoints.
+        # dp[k] = |p[k-1] - p[k+1]| / 2 for interior levels,
+        # half-layers at boundaries.
+        dp = np.empty_like(pressure)
+        dp[0] = pressure[0] - pressure[1]
+        dp[-1] = pressure[-2] - pressure[-1]
+        dp[1:-1] = (pressure[:-2] - pressure[2:]) / 2.0
+
+        # Ensure positive dp (pressure decreases with height in WRF)
+        dp = np.abs(dp)
+
+        result = (qvapor, dp)
+        if cache is not None:
+            cache['column_qvapor_dp'] = result
+        return result
+
+    def _read_precipitable_water(self, h5, time_idx, spatial_slice):
+        """
+        Compute total precipitable water by vertically integrating QVAPOR.
+
+        PWAT = (1/g) * sum(q * dp)  over all eta levels.
+
+        Returns
+        -------
+        np.ndarray
+            Precipitable water in kg/m2, shape (ny, nx).
+        """
+        qvapor, dp = self._compute_column_qvapor_dp(h5, time_idx, spatial_slice)
+        pwat = np.sum(qvapor * dp, axis=0) / 9.80665
+        return pwat.astype('float32')
+
+    def _read_vimf_u(self, h5, time_idx, spatial_slice):
+        """
+        Compute eastward vertically integrated moisture flux.
+
+        VIMF_u = (1/g) * sum(q * u * dp)  over all eta levels.
+
+        Returns
+        -------
+        np.ndarray
+            Eastward VIMF in kg/m/s, shape (ny, nx).
+        """
+        qvapor, dp = self._compute_column_qvapor_dp(h5, time_idx, spatial_slice)
+        u_earth, _ = self._read_rotated_wind_3d(h5, time_idx, spatial_slice)
+        vimf_u = np.sum(qvapor * u_earth * dp, axis=0) / 9.80665
+        return vimf_u.astype('float32')
+
+    def _read_vimf_v(self, h5, time_idx, spatial_slice):
+        """
+        Compute northward vertically integrated moisture flux.
+
+        VIMF_v = (1/g) * sum(q * v * dp)  over all eta levels.
+
+        Returns
+        -------
+        np.ndarray
+            Northward VIMF in kg/m/s, shape (ny, nx).
+        """
+        qvapor, dp = self._compute_column_qvapor_dp(h5, time_idx, spatial_slice)
+        _, v_earth = self._read_rotated_wind_3d(h5, time_idx, spatial_slice)
+        vimf_v = np.sum(qvapor * v_earth * dp, axis=0) / 9.80665
+        return vimf_v.astype('float32')
 
     def _setup_populate(self, var_key, target_levels):
         """Set up level-interpolation regrid function for 3D variables."""

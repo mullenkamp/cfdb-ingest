@@ -1,6 +1,8 @@
 # Quick Start
 
-## Python API
+## WRF
+
+### Python API
 
 ```python
 from cfdb_ingest import WrfIngest
@@ -15,7 +17,7 @@ wrf.convert(
 )
 ```
 
-## CLI
+### CLI
 
 ```bash
 cfdb-ingest wrf wrfout_d01_2023-02-12_00:00:00.nc output.cfdb \
@@ -24,7 +26,7 @@ cfdb-ingest wrf wrfout_d01_2023-02-12_00:00:00.nc output.cfdb \
     -e 2023-02-12T18:00
 ```
 
-## WPS Export
+### WPS Export
 
 To prepare data for WPS/metgrid, use the `--preset wps` flag which auto-selects all required variables and pressure levels:
 
@@ -37,4 +39,34 @@ cfdb-ingest wrf /path/to/wrfout/ output.cfdb --preset wps \
 cfdb-to-int output.cfdb -s 2023-02-10 -e 2023-02-10_06
 ```
 
-See the [WRF Ingestion](../guide/wrf-ingestion.md) and [WPS Export](../guide/wps-export.md) guides for full details.
+## ERA5
+
+### Python API
+
+```python
+from cfdb_ingest import Era5Ingest
+
+era5 = Era5Ingest('/path/to/era5/*.nc')
+
+era5.convert(
+    cfdb_path='era5.cfdb',
+    variables=['SP', 'VAR_2T', 'T', 'U', 'V'],
+    start_date='2020-01-01',
+    end_date='2020-01-31',
+)
+```
+
+### CLI
+
+```bash
+# Combined: multiple variables in one cfdb
+cfdb-ingest era5 /path/to/era5/*.nc output.cfdb \
+    -v SP,VAR_2T,T,U,V \
+    -s 2020-01-01 -e 2020-01-31
+
+# Split: one cfdb file per variable
+cfdb-ingest era5 /path/to/era5/*.nc /output/dir/ --split \
+    -v SP,T
+```
+
+See the [WRF Ingestion](../guide/wrf-ingestion.md), [ERA5 Ingestion](../guide/era5-ingestion.md), and [WPS Export](../guide/wps-export.md) guides for full details.

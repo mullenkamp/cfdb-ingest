@@ -73,9 +73,9 @@ wrf.convert(
 
 ### Surface and 3D variables
 
-Surface variables are stored as `(time, y, x)` without a vertical dimension. 3D level-interpolated variables are stored as `(time, height, y, x)` or `(time, pressure, y, x)`.
+Surface variables are stored as `(time, height_Xm, y, x)` with a named height coordinate indicating their measurement height. 3D level-interpolated variables are stored as `(time, height, y, x)` or `(time, pressure, y, x)`.
 
-When converting both surface and 3D variants of the same variable (e.g., `T2` and `T` both map to `air_temp`), they are stored as separate cfdb variables. The surface variant gets a `_sfc` suffix:
+When converting both surface and 3D variants of the same variable (e.g., `T2` and `T` both map to `air_temp`), they are stored as separate cfdb variables. The surface variant is suffixed with its height:
 
 ```python
 wrf.convert(
@@ -83,7 +83,7 @@ wrf.convert(
     variables=['T2', 'T'],
     target_levels=[100.0, 500.0],
 )
-# Creates: air_temperature (time, height, y, x) and air_temp_sfc (time, y, x)
+# Creates: air_temperature (time, height, y, x) and air_temp_2m (time, height_2m, y, x)
 ```
 
 ### Soil variables
@@ -99,7 +99,7 @@ wrf.convert(
 
 ### Custom chunk shape
 
-The output chunk shape defaults to `(1, 1, ny, nx)` for 4D variables and `(1, ny, nx)` for surface variables. Override for 4D variables:
+All variables are stored as 4D. The output chunk shape defaults to `(1, 1, ny, nx)`. Override:
 
 ```python
 wrf.convert(

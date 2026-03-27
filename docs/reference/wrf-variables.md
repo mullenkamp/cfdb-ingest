@@ -4,15 +4,15 @@
 
 Variables are stored with coordinates appropriate to their type:
 
-- **Surface variables**: `(time, y, x)` -- no vertical dimension
+- **Surface variables**: `(time, height_Xm, y, x)` -- named height coordinate (e.g. `height_0m`, `height_2m`, `height_10m`)
 - **Level-interpolated variables**: `(time, height, y, x)` or `(time, pressure, y, x)`
 - **Soil variables**: `(time, depth, y, x)`
 
-When a surface variable shares a cfdb name with a 3D level-interpolated variable (e.g., `T2` and `T` both map to `air_temp`), the surface variant is automatically suffixed with `_sfc` (e.g., `air_temp_sfc`) to avoid conflicts.
+When a surface variable shares a cfdb name with a 3D level-interpolated variable (e.g., `T2` and `T` both map to `air_temp`), the surface variant is suffixed with its height (e.g., `air_temp_2m`) to avoid conflicts.
 
 ## Surface variables
 
-Fixed height above ground, stored as `(time, y, x)`:
+Fixed height above ground, stored as `(time, height_Xm, y, x)`:
 
 | Key | cfdb Name | Height | Source Vars | Transform |
 |-----|-----------|--------|-------------|-----------|
