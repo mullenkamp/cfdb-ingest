@@ -386,7 +386,9 @@ class WrfIngest(H5Ingest):
         One or more wrfout file paths.
     """
 
-    def _init_metadata(self):
+    file_glob_pattern = 'wrfout*'
+
+    def _init_source_metadata(self):
         """
         Override to also load wind rotation fields and WRF source attributes.
         """
@@ -413,10 +415,6 @@ class WrfIngest(H5Ingest):
         self.y = spatial['y']
         self._dx = float(self.x[1] - self.x[0])
         self._dy = float(self.y[1] - self.y[0])
-
-        self._init_time()
-        self._init_variables()
-        self._compute_bbox_geographic()
 
     def _parse_crs(self, h5):
         """
