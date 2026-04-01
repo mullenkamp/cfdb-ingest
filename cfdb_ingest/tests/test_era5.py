@@ -308,6 +308,31 @@ class TestConvertPressureLevels:
             for dv in ds.data_vars:
                 assert 'pressure' in dv.coord_names
 
+    def test_convert_vimf(self, cfdb_out):
+        """VIMF should be correctly computed from Q, U, V."""
+        ingest = Era5Ingest(PL_DIR)
+        # VIMF requires Q, U, V
+        ingest.convert(
+            cfdb_path=cfdb_out,
+            variables=['VIMF_U', 'VIMF_V'],
+            start_date='2020-01-01T00:00',
+            end_date='2020-01-01T00:00',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            assert 'vimf_u' in ds.data_var_names
+            assert 'vimf_v' in ds.data_var_names
+            
+            vimf_u = ds['vimf_u']
+            # VIMF is 2D (time, height_0m, latitude, longitude)
+            assert vimf_u.ndims == 4
+            assert 'height_0m' in vimf_u.coord_names
+            assert 'pressure' not in vimf_u.coord_names
+            
+            # Check for non-zero data
+            data = vimf_u[:].data[0]
+            assert not np.all(data == 0)
+            assert np.all(np.isfinite(data))
+
 
 # ======================================================================
 # Conversion — Combined surface + pressure levels
@@ -534,14 +559,19 @@ class TestVariableMapping:
         assert 'levels' in heights
 
     def test_all_source_vars_are_single(self):
-        """ERA5 vars should have exactly one source var (one var per file)."""
+        """ERA5 vars should have exactly one source var (one var per file), except VIMF."""
         for key, info in ERA5_VARIABLE_MAPPING.items():
-            assert len(info['source_vars']) == 1, f'{key} has multiple source vars'
+            if key.startswith('VIMF_'):
+                assert len(info['source_vars']) == 2
+            else:
+                assert len(info['source_vars']) == 1, f'{key} has multiple source vars'
 
     def test_no_transforms_except_geopotential(self):
-        """Only Z_PL and Z_INV should have transforms."""
+        """Only Z and VIMF should have transforms."""
         for key, info in ERA5_VARIABLE_MAPPING.items():
             if key in ('Z_PL', 'Z_INV'):
                 assert info['transform'] == 'geopotential_to_height'
+            elif key.startswith('VIMF_'):
+                assert info['transform'].startswith('compute_vimf_')
             else:
                 assert info['transform'] is None, f'{key} has unexpected transform'

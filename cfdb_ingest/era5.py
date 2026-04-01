@@ -588,6 +588,18 @@ ERA5_VARIABLE_MAPPING = {
         'transform': None,
         'height': 'levels',
     },
+    'VIMF_U': {
+        'cfdb_name': 'vimf_u',
+        'source_vars': ['Q', 'U'],
+        'transform': 'compute_vimf_u',
+        'height': 0.0,
+    },
+    'VIMF_V': {
+        'cfdb_name': 'vimf_v',
+        'source_vars': ['Q', 'V'],
+        'transform': 'compute_vimf_v',
+        'height': 0.0,
+    },
 }
 
 
@@ -748,6 +760,12 @@ class Era5Ingest(H5Ingest):
                             var_times.append((path, self._parse_time(h5)))
                     self._var_time_map['Z_INV'] = var_times
 
+        # Handle VIMF (requires Q, U, V)
+        if all(v in self._var_file_map for v in ['Q', 'U']):
+            available['VIMF_U'] = mapping['VIMF_U']
+        if all(v in self._var_file_map for v in ['Q', 'V']):
+            available['VIMF_V'] = mapping['VIMF_V']
+
         self.variables = available
 
     def _parse_crs(self, h5):
@@ -816,8 +834,72 @@ class Era5Ingest(H5Ingest):
 
         if transform == 'geopotential_to_height':
             raw = raw / _G
+        elif transform == 'compute_vimf_u':
+            return self._read_vimf(time_idx, spatial_slice, direction='u')
+        elif transform == 'compute_vimf_v':
+            return self._read_vimf(time_idx, spatial_slice, direction='v')
 
         return raw
+
+    def _read_vimf(self, time_idx, spatial_slice, direction='u'):
+        """
+        Compute VIMF (Vertically Integrated Moisture Flux).
+        
+        VIMF = (1/g) * Integral(q * v) dp from surface to top.
+        """
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 'vimf_pressure' in cache:
+            levels = cache['vimf_pressure']
+        else:
+            levels = self._get_pressure_levels()
+            if cache is not None:
+                cache['vimf_pressure'] = levels
+
+        dp = np.diff(levels)
+        n_levels = len(levels)
+
+        # Get q, u/v
+        q = self._get_cached_source_var('Q', time_idx, spatial_slice)
+        v = self._get_cached_source_var(direction.upper(), time_idx, spatial_slice)
+
+        # Trapezoidal integration: (q*v)_avg * dp
+        qv = q * v
+        # Sum ( (qv[k] + qv[k+1])/2 * dp[k] )
+        vimf = np.sum((qv[:-1] + qv[1:]) / 2.0 * dp[:, np.newaxis, np.newaxis], axis=0)
+        return (vimf / _G).astype('float32')
+
+    def _get_pressure_levels(self):
+        """Read pressure levels (in Pa) from the first available PL file."""
+        for src_var in ['Q', 'U', 'V', 'T', 'Z']:
+            if src_var in self._var_file_map:
+                path = self._var_file_map[src_var][0]
+                with h5py.File(path, 'r') as h5:
+                    if 'level' in h5:
+                        return np.array(h5['level'][:], dtype='float64') * 100.0
+        raise ValueError("No pressure levels found in source files.")
+
+    def _get_cached_source_var(self, src_var, time_idx, spatial_slice):
+        """Read and cache a source variable for the current timestep."""
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and src_var in cache:
+            return cache[src_var]
+
+        # Find file and local index for this time
+        t = self.times[time_idx]
+        found = False
+        for path, file_times in self._var_time_map[src_var]:
+            if t in file_times:
+                local_t = np.where(file_times == t)[0][0]
+                with h5py.File(path, 'r') as h5:
+                    y_sl, x_sl = spatial_slice
+                    data = h5[src_var][local_t, :, y_sl, x_sl].astype('float64')
+                    # Reverse latitude if needed
+                    if self._lat_reversed:
+                        data = data[:, ::-1, :]
+                    if cache is not None:
+                        cache[src_var] = data
+                    return data
+        raise ValueError(f"Time {t} not found for source variable {src_var}")
 
     def _get_dataset_attrs(self):
         """Add ERA5-specific attributes."""
