@@ -389,6 +389,27 @@ class TestConvertCombined:
             assert 'height_0m' in ds.coord_names
             assert 'pressure' in ds.coord_names
 
+    def test_mixed_2d_3d_with_target_levels(self, cfdb_out):
+        """Test complex mix of surface, levels, and explicit target levels."""
+        ingest = Era5Ingest([SFC_DIR, PL_DIR])
+        # Subset of levels in the test data
+        target_levels = [50000.0, 85000.0]
+        ingest.convert(
+            cfdb_path=cfdb_out,
+            variables=['VAR_2T', 'T', 'U'],
+            target_levels=target_levels,
+            start_date='2020-01-01T00:00',
+            end_date='2020-01-01T00:00',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            # 2T is 2D, T and U are 3D with 2 levels
+            assert ds['air_temperature'].shape[1] == 2  # Pressure levels
+            assert ds['air_temperature_2m'].shape[1] == 1  # height_2m
+            
+            # Verify data integrity (ensure no reshaping errors)
+            assert np.all(np.isfinite(ds['air_temperature'][:].data))
+            assert np.all(np.isfinite(ds['air_temperature_2m'][:].data))
+
 
 # ======================================================================
 # Conversion — Invariant
@@ -418,6 +439,24 @@ class TestConvertInvariant:
         )
         with cfdb.open_dataset(cfdb_out, 'r') as ds:
             assert 'land_sea_mask' in ds.data_var_names
+
+    def test_z_pl_and_z_inv_collision(self, cfdb_out):
+        """Verify Z_PL and Z_INV can coexist without file lookup collisions."""
+        ingest = Era5Ingest([PL_DIR, INV_DIR])
+        ingest.convert(
+            cfdb_path=cfdb_out,
+            variables=['Z_PL', 'Z_INV'],
+            target_levels=[50000.0, 85000.0],
+            start_date='2020-01-01T00:00',
+            end_date='2020-01-01T00:00',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            assert 'geopotential_height' in ds.data_var_names
+            assert 'terrain_height' in ds.data_var_names
+
+            # Z_PL uses pressure coord, Z_INV uses height_0m
+            assert 'pressure' in ds['geopotential_height'].coord_names
+            assert 'height_0m' in ds['terrain_height'].coord_names
 
 
 # ======================================================================

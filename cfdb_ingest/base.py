@@ -459,8 +459,13 @@ class H5Ingest:
                     level_indices = list(range(len(sorted_levels)))
                     info = self.variables[var_key]
                     transform = info.get('transform')
+                    is_simple = transform is None and len(info['source_vars']) == 1
+                    
                     item = (var_key, data_var, level_indices)
-                    batch_items.append(item)
+                    if is_simple:
+                        rechunkit_items.append(item)
+                    else:
+                        batch_items.append(item)
 
             # Surface variables: (time, height_Xm, y, x)
             for cfdb_name, var_key_list in surface_vars.items():
@@ -488,8 +493,15 @@ class H5Ingest:
                 data_var = self._create_cfdb_data_var(ds, cfdb_name, soil_coord_names, chunk_4d)
                 for var_key in var_key_list:
                     depth_indices = list(range(len(soil_depths)))
+                    info = self.variables[var_key]
+                    transform = info.get('transform')
+                    is_simple = transform is None and len(info['source_vars']) == 1
+                    
                     item = (var_key, data_var, depth_indices)
-                    batch_items.append(item)
+                    if is_simple:
+                        rechunkit_items.append(item)
+                    else:
+                        batch_items.append(item)
 
             # Process each group with its optimal strategy
             for var_key, data_var, vert_indices in rechunkit_items:
@@ -668,7 +680,7 @@ class H5Ingest:
                             continue
 
                         t_out = output_map[u_idx]
-                        data_var[(t_out, vert_indices[0], slice(None), slice(None))] = data[i].astype('float32')
+                        self._write_data_var(data_var, data[i], t_out, vert_indices)
 
             raw_offset += n_file_times
 
@@ -676,10 +688,46 @@ class H5Ingest:
     def _write_data_var(data_var, data, output_time_idx, vert_indices):
         """Write data to a data variable at the correct indices."""
         if len(vert_indices) == 1:
-            data_var[(output_time_idx, vert_indices[0], slice(None), slice(None))] = data
+            # Add time and z dimensions for cfdb (1, 1, ny, nx)
+            data_var[(output_time_idx, vert_indices[0], slice(None), slice(None))] = data[np.newaxis, np.newaxis, ...]
         else:
+            # Add time and z dimensions for each level (1, 1, ny, nx)
             for lev_i, v_idx in enumerate(vert_indices):
-                data_var[(output_time_idx, v_idx, slice(None), slice(None))] = data[lev_i]
+                data_var[(output_time_idx, v_idx, slice(None), slice(None))] = data[lev_i][np.newaxis, np.newaxis, ...]
+
+    def _multi_rechunker(self, sources, shape, dtype, source_chunks, target_chunks, max_mem, sel):
+        """
+        Generic synchronized multivariable rechunker.
+        
+        Parameters
+        ----------
+        sources : dict
+            {label: callable} source functions for rechunkit.
+        shape, dtype, source_chunks, target_chunks, max_mem, sel : 
+            Arguments passed to rechunkit.rechunker. max_mem is the total budget.
+            
+        Yields
+        ------
+        slices : tuple
+            The output write slices.
+        data_blocks : dict
+            {label: ndarray} synchronized data blocks.
+        """
+        import rechunkit
+        
+        per_var_mem = max_mem // len(sources)
+        labels = sorted(list(sources.keys()))
+        
+        generators = [
+            rechunkit.rechunker(sources[label], shape, dtype, source_chunks, target_chunks, per_var_mem, sel=sel)
+            for label in labels
+        ]
+        
+        for outputs in zip(*generators):
+            # All slices should be identical due to rechunkit determinism
+            write_slices = outputs[0][0]
+            data_blocks = {label: out[1] for label, out in zip(labels, outputs)}
+            yield write_slices, data_blocks
 
     def _populate_per_timestep(self, data_var, var_key, time_mask, spatial_slice, vert_indices, max_mem, is_accumulation):
         """

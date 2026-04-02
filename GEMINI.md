@@ -7,8 +7,9 @@
 ## Architecture
 
 *   **Core Logic:** Located in `cfdb_ingest/`.
-    *   `base.py`: Contains `H5Ingest`, an abstract base class for file management, spatial/temporal filtering, and `cfdb` writing.
+    *   `base.py`: Contains `H5Ingest`, an abstract base class for file management, spatial/temporal filtering, and `cfdb` writing. Includes `_multi_rechunker` for synchronized multi-variable processing.
     *   `wrf.py`: Implements `WrfIngest` (subclass of `H5Ingest`) for processing WRF output files (handling CRS, wind rotation, interpolation).
+    *   `era5.py`: Implements `Era5Ingest` for processing ERA5 products. Supports native VIMF calculation and synchronized rechunking across multiple source files.
     *   `cli.py`: The command-line interface entry point using `typer`.
 *   **Dependencies:** `cfdb`, `h5py`, `numpy`, `pyproj`, `geointerp`, `rechunkit`, `typer`.
 *   **Build System:** `hatchling` (backend), managed by `uv`.
@@ -84,3 +85,10 @@ To add a new variable mapping (e.g., for WRF):
     *   Add the variable name to `@create_data_var_methods` in `cfdb/creation.py`.
 
 Refer to `CLAUDE.md` for more detailed architectural guidelines.
+
+## Implementation Learnings & Constraints
+
+*   **Synchronized Rechunking:** When computing derived variables from multiple source files (like ERA5 VIMF), use the `_multi_rechunker` helper. It leverages `rechunkit`'s deterministic yielding to process data in large, synchronized temporal blocks, avoiding redundant reads of shared variables (e.g., reading `Q` once for both `VIMF_U` and `VIMF_V`).
+*   **HDF5 Chunk Caching:** For per-timestep transformation loops, inject `max_mem` into the `h5py.File(..., rdcc_nbytes=max_mem)` constructor. This enables the C-level HDF5 chunk cache, preventing severe performance degradation from chunk thrashing when multiple variables share the same underlying disk chunks.
+*   **cfdb Indexing:** `cfdb` data variables use unit-length slices for integer indexing. When writing 2D data to a specific time/level, always ensure the data is reshaped to 4D `(1, 1, ny, nx)` to match the expected unit-slice shape: `dv[(t, z, slice(None), slice(None))] = data[np.newaxis, np.newaxis, ...]`.
+*   **ERA5 Disambiguation:** ERA5 products often use the same internal variable names (e.g., `'Z'` for both geopotential and terrain height). Always use the mapping keys (`'Z_PL'`, `'Z_INV'`) to lookup file entries and times, rather than raw source names, to avoid file-lookup collisions in combined datasets.
