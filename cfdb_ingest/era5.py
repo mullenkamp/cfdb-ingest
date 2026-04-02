@@ -588,6 +588,18 @@ ERA5_VARIABLE_MAPPING = {
         'transform': None,
         'height': 'levels',
     },
+    'VIMF_U': {
+        'cfdb_name': 'vimf_u',
+        'source_vars': ['Q', 'U'],
+        'transform': 'compute_vimf_u',
+        'height': 0.0,
+    },
+    'VIMF_V': {
+        'cfdb_name': 'vimf_v',
+        'source_vars': ['Q', 'V'],
+        'transform': 'compute_vimf_v',
+        'height': 0.0,
+    },
 }
 
 
@@ -622,13 +634,20 @@ class Era5Ingest(H5Ingest):
         Scan all input files to detect variables, build file index, and extract
         spatial coordinates. ERA5 files each contain one variable.
         """
-        # Scan files to build variable -> file mapping
-        self._var_file_map = {}  # nc_var_name -> [path, ...]
-        for path in self.input_paths:
+        import concurrent.futures
+
+        def _get_nc_var(path):
             with h5py.File(path, 'r') as h5:
-                nc_var = _detect_nc_var(h5)
-                if nc_var is not None:
-                    self._var_file_map.setdefault(nc_var, []).append(path)
+                return _detect_nc_var(h5)
+
+        self._var_file_map = {}  # nc_var_name -> [path, ...]
+        
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            nc_vars = list(executor.map(_get_nc_var, self.input_paths))
+
+        for path, nc_var in zip(self.input_paths, nc_vars):
+            if nc_var is not None:
+                self._var_file_map.setdefault(nc_var, []).append(path)
 
         # Sort file lists for consistent ordering
         for nc_var in self._var_file_map:
@@ -650,19 +669,27 @@ class Era5Ingest(H5Ingest):
         concatenated. Files for different variables may have different
         time ranges (sfc=monthly, pl=daily), so we build a union of all times.
         """
+        import concurrent.futures
+
+        def _get_times(path):
+            with h5py.File(path, 'r') as h5:
+                return self._parse_time(h5)
+
         all_times_list = []
         self._var_time_map = {}  # nc_var -> [(path, times_array), ...]
 
         for nc_var, paths in self._var_file_map.items():
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                times_list = list(executor.map(_get_times, paths))
+            
             var_times = []
-            for path in paths:
-                with h5py.File(path, 'r') as h5:
-                    times = self._parse_time(h5)
-                    var_times.append((path, times))
-                    all_times_list.append(times)
+            for path, times in zip(paths, times_list):
+                var_times.append((path, times))
+                all_times_list.append(times)
+            
             self._var_time_map[nc_var] = var_times
 
-        combined = np.concatenate(all_times_list)
+        combined = np.concatenate(all_times_list) if all_times_list else np.array([], dtype='datetime64[m]')
         self.times = np.unique(combined)
 
         # Build global time -> index lookup
@@ -733,6 +760,12 @@ class Era5Ingest(H5Ingest):
                             var_times.append((path, self._parse_time(h5)))
                     self._var_time_map['Z_INV'] = var_times
 
+        # Handle VIMF (requires Q, U, V)
+        if all(v in self._var_file_map for v in ['Q', 'U']):
+            available['VIMF_U'] = mapping['VIMF_U']
+        if all(v in self._var_file_map for v in ['Q', 'V']):
+            available['VIMF_V'] = mapping['VIMF_V']
+
         self.variables = available
 
     def _parse_crs(self, h5):
@@ -801,8 +834,72 @@ class Era5Ingest(H5Ingest):
 
         if transform == 'geopotential_to_height':
             raw = raw / _G
+        elif transform == 'compute_vimf_u':
+            return self._read_vimf(time_idx, spatial_slice, direction='u')
+        elif transform == 'compute_vimf_v':
+            return self._read_vimf(time_idx, spatial_slice, direction='v')
 
         return raw
+
+    def _read_vimf(self, time_idx, spatial_slice, direction='u'):
+        """
+        Compute VIMF (Vertically Integrated Moisture Flux).
+        
+        VIMF = (1/g) * Integral(q * v) dp from surface to top.
+        """
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 'vimf_pressure' in cache:
+            levels = cache['vimf_pressure']
+        else:
+            levels = self._get_pressure_levels()
+            if cache is not None:
+                cache['vimf_pressure'] = levels
+
+        dp = np.diff(levels)
+        n_levels = len(levels)
+
+        # Get q, u/v
+        q = self._get_cached_source_var('Q', time_idx, spatial_slice)
+        v = self._get_cached_source_var(direction.upper(), time_idx, spatial_slice)
+
+        # Trapezoidal integration: (q*v)_avg * dp
+        qv = q * v
+        # Sum ( (qv[k] + qv[k+1])/2 * dp[k] )
+        vimf = np.sum((qv[:-1] + qv[1:]) / 2.0 * dp[:, np.newaxis, np.newaxis], axis=0)
+        return (vimf / _G).astype('float32')
+
+    def _get_pressure_levels(self):
+        """Read pressure levels (in Pa) from the first available PL file."""
+        for src_var in ['Q', 'U', 'V', 'T', 'Z']:
+            if src_var in self._var_file_map:
+                path = self._var_file_map[src_var][0]
+                with h5py.File(path, 'r') as h5:
+                    if 'level' in h5:
+                        return np.array(h5['level'][:], dtype='float64') * 100.0
+        raise ValueError("No pressure levels found in source files.")
+
+    def _get_cached_source_var(self, src_var, time_idx, spatial_slice):
+        """Read and cache a source variable for the current timestep."""
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and src_var in cache:
+            return cache[src_var]
+
+        # Find file and local index for this time
+        t = self.times[time_idx]
+        found = False
+        for path, file_times in self._var_time_map[src_var]:
+            if t in file_times:
+                local_t = np.where(file_times == t)[0][0]
+                with h5py.File(path, 'r') as h5:
+                    y_sl, x_sl = spatial_slice
+                    data = h5[src_var][local_t, :, y_sl, x_sl].astype('float64')
+                    # Reverse latitude if needed
+                    if self._lat_reversed:
+                        data = data[:, ::-1, :]
+                    if cache is not None:
+                        cache[src_var] = data
+                    return data
+        raise ValueError(f"Time {t} not found for source variable {src_var}")
 
     def _get_dataset_attrs(self):
         """Add ERA5-specific attributes."""
@@ -953,40 +1050,105 @@ class Era5Ingest(H5Ingest):
     def _populate_with_rechunkit(self, data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices):
         """
         Override rechunkit populate for ERA5's one-var-per-file structure.
-
-        Instead of iterating over self._file_time_map (which is WRF-oriented),
-        we iterate over the files for this specific variable.
         """
         info = self.variables[var_key]
+        src_var = info['source_vars'][0]
         y_sl, x_sl = spatial_slice
 
         entries = self._get_var_time_entries(var_key)
         if not entries:
             return
 
+        # Precompute output time mapping
+        output_map = {}
+        out_idx = 0
+        for global_t in range(len(time_mask)):
+            if time_mask[global_t]:
+                output_map[global_t] = out_idx
+                out_idx += 1
+
         for path, file_times in entries:
-            with h5py.File(path, 'r') as h5:
-                for local_t in range(len(file_times)):
-                    t = file_times[local_t]
-                    if t not in self._time_to_idx:
-                        continue
+            # Find time bounds for this file to restrict rechunkit reads
+            file_mask = []
+            for local_t in range(len(file_times)):
+                t = file_times[local_t]
+                if t in self._time_to_idx:
                     global_t = self._time_to_idx[t]
-                    if not time_mask[global_t]:
-                        continue
+                    if time_mask[global_t]:
+                        file_mask.append((local_t, global_t))
 
-                    out_t = int(np.sum(time_mask[:global_t]))
+            if not file_mask:
+                continue
 
-                    data = self._read_variable(h5, var_key, local_t, spatial_slice)
-                    self._write_data_var(data_var, data, out_t, vert_indices)
+            t_start = file_mask[0][0]
+            t_stop = file_mask[-1][0] + 1
 
-    def _populate_per_timestep(self, data_var, var_key, time_mask, spatial_slice, vert_indices, is_accumulation):
-        """Override per-timestep populate for ERA5's multi-file structure."""
+            # Map local_t to global_t for this file
+            local_to_global = {local_t: global_t for local_t, global_t in file_mask}
+
+            with h5py.File(path, 'r', rdcc_nbytes=max_mem) as h5:
+                h5_var = h5[src_var]
+                # ERA5 files are usually chunked by (time, lat, lon) or (time, level, lat, lon)
+                # rechunkit helps when we read small spatial slices across many times
+                source_chunks = h5_var.chunks or rechunkit.guess_chunk_shape(
+                    h5_var.shape, h5_var.dtype.itemsize, max_mem
+                )
+
+                y_start, y_stop, _ = y_sl.indices(h5_var.shape[1] if h5_var.ndim == 3 else h5_var.shape[2])
+                x_start, x_stop, _ = x_sl.indices(h5_var.shape[2] if h5_var.ndim == 3 else h5_var.shape[3])
+                ny = y_stop - y_start
+                nx = x_stop - x_start
+
+                sel_time = slice(t_start, t_stop)
+                sel_y = slice(y_start, y_stop)
+                sel_x = slice(x_start, x_stop)
+
+                if h5_var.ndim == 3:
+                    sel = (sel_time, sel_y, sel_x)
+                    target_chunks = (1, ny, nx)
+                else:
+                    nz = h5_var.shape[1]
+                    sel = (sel_time, slice(0, nz), sel_y, sel_x)
+                    target_chunks = (1, nz, ny, nx)
+
+                for write_slices, data in rechunkit.rechunker(
+                    h5_var.__getitem__, h5_var.shape, h5_var.dtype,
+                    source_chunks, target_chunks, max_mem, sel=sel,
+                ):
+                    for i, chunk_t in enumerate(range(write_slices[0].start, write_slices[0].stop)):
+                        local_t = t_start + chunk_t
+                        if local_t not in local_to_global:
+                            continue
+                        global_t = local_to_global[local_t]
+                        out_t = output_map[global_t]
+
+                        raw = data[i].astype('float32')
+                        if self._lat_reversed:
+                            if h5_var.ndim == 4:
+                                raw = raw[:, ::-1, :]
+                            else:
+                                raw = raw[::-1, :]
+
+                        if info.get('transform') == 'geopotential_to_height':
+                            raw = raw / _G
+
+                        self._write_data_var(data_var, raw, out_t, vert_indices)
+
+    def _populate_per_timestep(self, data_var, var_key, time_mask, spatial_slice, vert_indices, max_mem, is_accumulation):
+        """Standard per-timestep populate. Used for simple variables when rechunkit is disabled."""
         entries = self._get_var_time_entries(var_key)
         if not entries:
             return
 
+        output_map = {}
+        out_idx = 0
+        for global_t in range(len(time_mask)):
+            if time_mask[global_t]:
+                output_map[global_t] = out_idx
+                out_idx += 1
+
         for path, file_times in entries:
-            with h5py.File(path, 'r') as h5:
+            with h5py.File(path, 'r', rdcc_nbytes=max_mem) as h5:
                 for local_t in range(len(file_times)):
                     t = file_times[local_t]
                     if t not in self._time_to_idx:
@@ -994,18 +1156,139 @@ class Era5Ingest(H5Ingest):
                     global_t = self._time_to_idx[t]
                     if not time_mask[global_t]:
                         continue
-
-                    out_t = int(np.sum(time_mask[:global_t]))
-
+                    out_t = output_map[global_t]
                     data = self._read_variable(h5, var_key, local_t, spatial_slice)
                     self._write_data_var(data_var, data, out_t, vert_indices)
 
-    def _populate_batch_per_timestep(self, batch_items, time_mask, spatial_slice):
+    def _get_synced_file_entries(self, var_keys):
         """
-        Override batch populate for ERA5's multi-file structure.
+        Identify synchronized file groups for multiple variable keys.
+        
+        Yields (i_entry, file_paths_dict, file_times)
+        """
+        # All variables in a synced group (e.g. VIMF) must share the same temporal structure.
+        # We use the first key as the reference.
+        first_key = var_keys[0]
+        entries = self._get_var_time_entries(first_key)
+        
+        for i_entry, (_, file_times) in enumerate(entries):
+            file_paths = {
+                vk: self._get_var_time_entries(vk)[i_entry][0] for vk in var_keys
+            }
+            yield i_entry, file_paths, file_times
 
-        Since ERA5 has one variable per file, there's no benefit to batching
-        across variables (each opens a different file). Process individually.
+    def _populate_multi_with_rechunkit(self, batch_items, time_mask, spatial_slice, max_mem):
         """
-        for var_key, data_var, vert_indices in batch_items:
-            self._populate_per_timestep(data_var, var_key, time_mask, spatial_slice, vert_indices, is_accumulation=False)
+        Optimized multi-variable rechunking for ERA5.
+        """
+        if not batch_items:
+            return
+
+        # Map variable keys to their source variable names for the rechunker
+        # (e.g. VIMF_U needs Q and U)
+        var_to_src = {}
+        all_required_srcs = set()
+        for var_key, _, _ in batch_items:
+            srcs = self.variables[var_key]['source_vars']
+            var_to_src[var_key] = srcs
+            all_required_srcs.update(srcs)
+
+        # Precompute output time mapping
+        output_map = {u_idx: out_t for u_idx, out_t in zip(np.where(time_mask)[0], range(np.sum(time_mask)))}
+        y_sl, x_sl = spatial_slice
+        levels = self._get_pressure_levels()
+        dp = np.diff(levels)
+
+        # For VIMF, we know Q, U, V are in PL files which are synced.
+        # We use 'Q' as the representative to find synced file entries.
+        # (A more robust version would check product types, but this works for VIMF).
+        for _, file_paths, file_times in self._get_synced_file_entries(list(all_required_srcs)):
+            # Filter times for this file
+            file_mask = [
+                (lt, self._time_to_idx[t]) for lt, t in enumerate(file_times) 
+                if t in self._time_to_idx and time_mask[self._time_to_idx[t]]
+            ]
+            if not file_mask: continue
+
+            t_start, t_stop = file_mask[0][0], file_mask[-1][0] + 1
+            local_to_global = dict(file_mask)
+
+            # Metadata and selection from the first file
+            first_path = list(file_paths.values())[0]
+            first_src = list(file_paths.keys())[0]
+            with h5py.File(first_path, 'r') as h5:
+                h5_var = h5[first_src]
+                nz, ny_full, nx_full = h5_var.shape[1:]
+                y_start, y_stop, _ = y_sl.indices(ny_full)
+                x_start, x_stop, _ = x_sl.indices(nx_full)
+                sel = (slice(t_start, t_stop), slice(0, nz), slice(y_start, y_stop), slice(x_start, x_stop))
+                source_chunks = h5_var.chunks or (1, nz, y_stop-y_start, x_stop-x_start)
+                target_chunks = (min(120, t_stop-t_start), nz, y_stop-y_start, x_stop-x_start)
+                shape, dtype = h5_var.shape, h5_var.dtype
+
+            # Define sources for the multi-rechunker
+            sources = {
+                sv: lambda slices, p=path, v=sv: h5py.File(p, 'r', rdcc_nbytes=max_mem)[v][slices].astype('float64')
+                for sv, path in file_paths.items()
+            }
+
+            for write_slice, data_blocks in self._multi_rechunker(
+                sources, shape, dtype, source_chunks, target_chunks, max_mem, sel
+            ):
+                chunk_t_len = write_slice[0].stop - write_slice[0].start
+                
+                for var_key, data_var, vert_indices in batch_items:
+                    if var_key.startswith('VIMF_'):
+                        q, v = data_blocks['Q'], data_blocks[var_key[-1]]
+                        if self._lat_reversed: q, v = q[:, :, ::-1, :], v[:, :, ::-1, :]
+                        
+                        vimf = np.sum((q[:, :-1, ...] * v[:, :-1, ...] + q[:, 1:, ...] * v[:, 1:, ...]) / 2.0 * dp[np.newaxis, :, np.newaxis, np.newaxis], axis=1)
+                        vimf = (vimf / _G).astype('float32')
+                        
+                        for i in range(chunk_t_len):
+                            local_t = t_start + write_slice[0].start + i
+                            if local_t in local_to_global:
+                                self._write_data_var(data_var, vimf[i], output_map[local_to_global[local_t]], vert_indices)
+                    else:
+                        # Fallback for simple variables
+                        src_v = self.variables[var_key]['source_vars'][0]
+                        raw = data_blocks[src_v].astype('float32')
+                        if self._lat_reversed: raw = raw[:, :, ::-1, :]
+                        for i in range(chunk_t_len):
+                            local_t = t_start + write_slice[0].start + i
+                            if local_t in local_to_global:
+                                self._write_data_var(data_var, raw[i], output_map[local_to_global[local_t]], vert_indices)
+
+    def _populate_batch_per_timestep(self, batch_items, time_mask, spatial_slice, max_mem):
+        """
+        Optimized batch populate for ERA5.
+        """
+        if not batch_items:
+            return
+
+        vimf_items = [item for item in batch_items if item[0].startswith('VIMF_')]
+        remaining_items = [item for item in batch_items if not item[0].startswith('VIMF_')]
+
+        if vimf_items:
+            self._populate_multi_with_rechunkit(vimf_items, time_mask, spatial_slice, max_mem)
+
+        if not remaining_items:
+            return
+
+        output_map = {u_idx: out_t for u_idx, out_t in zip(np.where(time_mask)[0], range(np.sum(time_mask)))}
+        requested_times = sorted(output_map.keys())
+
+        for global_t in requested_times:
+            self._ts_cache = {}
+            for var_key, data_var, vert_indices in remaining_items:
+                out_t = output_map[global_t]
+                t = self.times[global_t]
+                # Use disambiguated entries to avoid Z_PL/Z_INV collisions
+                for path, file_times in self._get_var_time_entries(var_key):
+                    if t in file_times:
+                        local_t = np.where(file_times == t)[0][0]
+                        with h5py.File(path, 'r', rdcc_nbytes=max_mem) as h5:
+                            data = self._read_variable(h5, var_key, local_t, spatial_slice)
+                            self._write_data_var(data_var, data, out_t, vert_indices)
+                        break
+            self._ts_cache = None

@@ -760,6 +760,57 @@ class WrfIngest(H5Ingest):
         depths = np.cumsum(dzs)
         return depths
 
+    def _get_qvapor(self, h5, time_idx, spatial_slice):
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 'qvapor' in cache:
+            return cache['qvapor']
+        y_sl, x_sl = spatial_slice
+        result = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
+        if cache is not None:
+            cache['qvapor'] = result
+        return result
+
+    def _compute_theta(self, h5, time_idx, spatial_slice):
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 'theta' in cache:
+            return cache['theta']
+        y_sl, x_sl = spatial_slice
+        t_pert = h5['T'][time_idx, :, y_sl, x_sl].astype('float64')
+        result = t_pert + 300.0
+        if cache is not None:
+            cache['theta'] = result
+        return result
+
+    def _get_t2(self, h5, time_idx, spatial_slice):
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 't2' in cache:
+            return cache['t2']
+        y_sl, x_sl = spatial_slice
+        result = h5['T2'][time_idx, y_sl, x_sl].astype('float64')
+        if cache is not None:
+            cache['t2'] = result
+        return result
+
+    def _get_q2(self, h5, time_idx, spatial_slice):
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 'q2' in cache:
+            return cache['q2']
+        y_sl, x_sl = spatial_slice
+        result = h5['Q2'][time_idx, y_sl, x_sl].astype('float64')
+        if cache is not None:
+            cache['q2'] = result
+        return result
+
+    def _get_psfc(self, h5, time_idx, spatial_slice):
+        cache = getattr(self, '_ts_cache', None)
+        if cache is not None and 'psfc' in cache:
+            return cache['psfc']
+        y_sl, x_sl = spatial_slice
+        result = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
+        if cache is not None:
+            cache['psfc'] = result
+        return result
+
     def _read_rotated_wind_3d(self, h5, time_idx, spatial_slice):
         """
         Read 3D U/V, unstagger, and rotate to earth-relative.
@@ -816,16 +867,8 @@ class WrfIngest(H5Ingest):
         np.ndarray
             Temperature on target height levels, shape (n_levels, ny, nx).
         """
-        y_sl, x_sl = spatial_slice
-
-        # Read 3D fields for this timestep
-        t_pert = h5['T'][time_idx, :, y_sl, x_sl].astype('float64')
-        p = h5['P'][time_idx, :, y_sl, x_sl].astype('float64')
-        pb = h5['PB'][time_idx, :, y_sl, x_sl].astype('float64')
-
-        # Convert perturbation potential temp to actual temperature
-        theta = t_pert + 300.0
-        pressure = p + pb
+        theta = self._compute_theta(h5, time_idx, spatial_slice)
+        pressure = self._compute_pressure(h5, time_idx, spatial_slice)
         t_actual = theta * (pressure / 100000.0) ** 0.2854
 
         source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
@@ -869,31 +912,27 @@ class WrfIngest(H5Ingest):
 
     def _read_specific_humidity_2d(self, h5, time_idx, spatial_slice):
         """Convert 2m mixing ratio (Q2) to specific humidity."""
-        y_sl, x_sl = spatial_slice
-        mixing_ratio = h5['Q2'][time_idx, y_sl, x_sl].astype('float64')
+        mixing_ratio = self._get_q2(h5, time_idx, spatial_slice)
         return (mixing_ratio / (1.0 + mixing_ratio)).astype('float32')
 
     def _read_mixing_ratio_3d(self, h5, time_idx, spatial_slice):
         """Read 3D mixing ratio and interpolate to target height levels."""
-        y_sl, x_sl = spatial_slice
-        mixing_ratio = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
+        mixing_ratio = self._get_qvapor(h5, time_idx, spatial_slice)
         source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
         return self._regrid_func(mixing_ratio, source_levels).astype('float32')
 
     def _read_specific_humidity_3d(self, h5, time_idx, spatial_slice):
         """Convert mixing ratio to specific humidity and interpolate to target height levels."""
-        y_sl, x_sl = spatial_slice
-        mixing_ratio = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
+        mixing_ratio = self._get_qvapor(h5, time_idx, spatial_slice)
         specific_humidity = mixing_ratio / (1.0 + mixing_ratio)
         source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
         return self._regrid_func(specific_humidity, source_levels).astype('float32')
 
     def _read_relative_humidity_2d(self, h5, time_idx, spatial_slice):
         """Compute 2m relative humidity from T2, Q2, and PSFC."""
-        y_sl, x_sl = spatial_slice
-        t2 = h5['T2'][time_idx, y_sl, x_sl].astype('float64')
-        q2 = h5['Q2'][time_idx, y_sl, x_sl].astype('float64')
-        psfc = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
+        t2 = self._get_t2(h5, time_idx, spatial_slice)
+        q2 = self._get_q2(h5, time_idx, spatial_slice)
+        psfc = self._get_psfc(h5, time_idx, spatial_slice)
 
         # Saturation vapor pressure (Bolton 1980) [Pa]
         es = 611.2 * np.exp(17.67 * (t2 - 273.15) / (t2 - 273.15 + 243.5))
@@ -904,14 +943,10 @@ class WrfIngest(H5Ingest):
 
     def _read_relative_humidity_3d(self, h5, time_idx, spatial_slice):
         """Compute 3D relative humidity and interpolate to target height levels."""
-        y_sl, x_sl = spatial_slice
-        t_pert = h5['T'][time_idx, :, y_sl, x_sl].astype('float64')
-        p = h5['P'][time_idx, :, y_sl, x_sl].astype('float64')
-        pb = h5['PB'][time_idx, :, y_sl, x_sl].astype('float64')
-        q = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
+        theta = self._compute_theta(h5, time_idx, spatial_slice)
+        pressure = self._compute_pressure(h5, time_idx, spatial_slice)
+        q = self._get_qvapor(h5, time_idx, spatial_slice)
 
-        theta = t_pert + 300.0
-        pressure = p + pb
         t_actual = theta * (pressure / 100000.0) ** 0.2854
 
         es = 611.2 * np.exp(17.67 * (t_actual - 273.15) / (t_actual - 273.15 + 243.5))
@@ -923,9 +958,8 @@ class WrfIngest(H5Ingest):
 
     def _read_dew_point_2d(self, h5, time_idx, spatial_slice):
         """Compute 2m dew point temperature from Q2 and PSFC."""
-        y_sl, x_sl = spatial_slice
-        q2 = h5['Q2'][time_idx, y_sl, x_sl].astype('float64')
-        psfc = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
+        q2 = self._get_q2(h5, time_idx, spatial_slice)
+        psfc = self._get_psfc(h5, time_idx, spatial_slice)
 
         # Actual vapor pressure from mixing ratio [Pa]
         e = q2 * psfc / (0.622 + q2)
@@ -938,11 +972,8 @@ class WrfIngest(H5Ingest):
 
     def _read_dew_point_3d(self, h5, time_idx, spatial_slice):
         """Compute 3D dew point temperature and interpolate to target height levels."""
-        y_sl, x_sl = spatial_slice
-        q = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
-        p = h5['P'][time_idx, :, y_sl, x_sl].astype('float64')
-        pb = h5['PB'][time_idx, :, y_sl, x_sl].astype('float64')
-        pressure = p + pb
+        q = self._get_qvapor(h5, time_idx, spatial_slice)
+        pressure = self._compute_pressure(h5, time_idx, spatial_slice)
 
         e = q * pressure / (0.622 + q)
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -954,9 +985,9 @@ class WrfIngest(H5Ingest):
 
     def _read_sea_level_pressure(self, h5, time_idx, spatial_slice):
         """Compute sea level pressure using hypsometric reduction."""
+        psfc = self._get_psfc(h5, time_idx, spatial_slice)
+        t2 = self._get_t2(h5, time_idx, spatial_slice)
         y_sl, x_sl = spatial_slice
-        psfc = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
-        t2 = h5['T2'][time_idx, y_sl, x_sl].astype('float64')
         hgt = h5['HGT'][time_idx, y_sl, x_sl].astype('float64')
 
         # Standard hypsometric reduction to sea level
@@ -970,26 +1001,22 @@ class WrfIngest(H5Ingest):
 
     def _read_potential_temperature_2d(self, h5, time_idx, spatial_slice):
         """Compute 2m potential temperature from T2 and PSFC."""
-        y_sl, x_sl = spatial_slice
-        t2 = h5['T2'][time_idx, y_sl, x_sl].astype('float64')
-        psfc = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
+        t2 = self._get_t2(h5, time_idx, spatial_slice)
+        psfc = self._get_psfc(h5, time_idx, spatial_slice)
         theta = t2 * (100000.0 / psfc) ** 0.2854
         return theta.astype('float32')
 
     def _read_potential_temperature_3d(self, h5, time_idx, spatial_slice):
         """Read WRF potential temperature (T + 300) and interpolate to target height levels."""
-        y_sl, x_sl = spatial_slice
-        t_pert = h5['T'][time_idx, :, y_sl, x_sl].astype('float64')
-        theta = t_pert + 300.0
+        theta = self._compute_theta(h5, time_idx, spatial_slice)
         source_levels = self._get_source_levels(h5, time_idx, spatial_slice)
         return self._regrid_func(theta, source_levels).astype('float32')
 
     def _read_equivalent_potential_temperature_2d(self, h5, time_idx, spatial_slice):
         """Compute 2m equivalent potential temperature using Bolton (1980)."""
-        y_sl, x_sl = spatial_slice
-        t2 = h5['T2'][time_idx, y_sl, x_sl].astype('float64')
-        q2 = h5['Q2'][time_idx, y_sl, x_sl].astype('float64')
-        psfc = h5['PSFC'][time_idx, y_sl, x_sl].astype('float64')
+        t2 = self._get_t2(h5, time_idx, spatial_slice)
+        q2 = self._get_q2(h5, time_idx, spatial_slice)
+        psfc = self._get_psfc(h5, time_idx, spatial_slice)
 
         # Vapor pressure and dew point for LCL temperature
         # NaN is expected where moisture is zero (e <= 0)
@@ -1008,14 +1035,10 @@ class WrfIngest(H5Ingest):
 
     def _read_equivalent_potential_temperature_3d(self, h5, time_idx, spatial_slice):
         """Compute 3D equivalent potential temperature (Bolton 1980) and interpolate to target levels."""
-        y_sl, x_sl = spatial_slice
-        t_pert = h5['T'][time_idx, :, y_sl, x_sl].astype('float64')
-        p = h5['P'][time_idx, :, y_sl, x_sl].astype('float64')
-        pb = h5['PB'][time_idx, :, y_sl, x_sl].astype('float64')
-        q = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
+        theta = self._compute_theta(h5, time_idx, spatial_slice)
+        pressure = self._compute_pressure(h5, time_idx, spatial_slice)
+        q = self._get_qvapor(h5, time_idx, spatial_slice)
 
-        theta = t_pert + 300.0
-        pressure = p + pb
         t_actual = theta * (pressure / 100000.0) ** 0.2854
 
         # Vapor pressure and dew point for LCL temperature
@@ -1095,11 +1118,8 @@ class WrfIngest(H5Ingest):
         if cache is not None and 'column_qvapor_dp' in cache:
             return cache['column_qvapor_dp']
 
-        y_sl, x_sl = spatial_slice
-        qvapor = h5['QVAPOR'][time_idx, :, y_sl, x_sl].astype('float64')
-        p = h5['P'][time_idx, :, y_sl, x_sl].astype('float64')
-        pb = h5['PB'][time_idx, :, y_sl, x_sl].astype('float64')
-        pressure = p + pb  # Full pressure on eta levels (nz, ny, nx)
+        qvapor = self._get_qvapor(h5, time_idx, spatial_slice)
+        pressure = self._compute_pressure(h5, time_idx, spatial_slice)
 
         # Compute pressure thickness of each layer using layer midpoints.
         # dp[k] = |p[k-1] - p[k+1]| / 2 for interior levels,

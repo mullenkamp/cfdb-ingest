@@ -87,13 +87,20 @@ class H5Ingest:
         timestep index to its position in the deduplicated self.times array,
         or -1 for duplicates that should be skipped.
         """
+        import concurrent.futures
+
+        def _get_times(path):
+            with h5py.File(path, 'r') as h5:
+                return self._parse_time(h5)
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            times_list = list(executor.map(_get_times, self.input_paths))
+
         file_time_map = []
         all_times = []
         global_idx = 0
 
-        for path in self.input_paths:
-            with h5py.File(path, 'r') as h5:
-                times = self._parse_time(h5)
+        for path, times in zip(self.input_paths, times_list):
             file_time_map.append((path, times, global_idx))
             all_times.append(times)
             global_idx += len(times)
@@ -452,8 +459,13 @@ class H5Ingest:
                     level_indices = list(range(len(sorted_levels)))
                     info = self.variables[var_key]
                     transform = info.get('transform')
+                    is_simple = transform is None and len(info['source_vars']) == 1
+                    
                     item = (var_key, data_var, level_indices)
-                    batch_items.append(item)
+                    if is_simple:
+                        rechunkit_items.append(item)
+                    else:
+                        batch_items.append(item)
 
             # Surface variables: (time, height_Xm, y, x)
             for cfdb_name, var_key_list in surface_vars.items():
@@ -481,8 +493,15 @@ class H5Ingest:
                 data_var = self._create_cfdb_data_var(ds, cfdb_name, soil_coord_names, chunk_4d)
                 for var_key in var_key_list:
                     depth_indices = list(range(len(soil_depths)))
+                    info = self.variables[var_key]
+                    transform = info.get('transform')
+                    is_simple = transform is None and len(info['source_vars']) == 1
+                    
                     item = (var_key, data_var, depth_indices)
-                    batch_items.append(item)
+                    if is_simple:
+                        rechunkit_items.append(item)
+                    else:
+                        batch_items.append(item)
 
             # Process each group with its optimal strategy
             for var_key, data_var, vert_indices in rechunkit_items:
@@ -492,12 +511,12 @@ class H5Ingest:
             for var_key, data_var, vert_indices in accumulation_items:
                 self._setup_populate(var_key, target_levels)
                 self._prev_accum_total = None
-                self._populate_per_timestep(data_var, var_key, time_mask, spatial_slice, vert_indices, is_accumulation=True)
+                self._populate_per_timestep(data_var, var_key, time_mask, spatial_slice, vert_indices, max_mem, is_accumulation=True)
 
             if batch_items:
                 for var_key, _, _ in batch_items:
                     self._setup_populate(var_key, target_levels)
-                self._populate_batch_per_timestep(batch_items, time_mask, spatial_slice)
+                self._populate_batch_per_timestep(batch_items, time_mask, spatial_slice, max_mem)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -622,6 +641,19 @@ class H5Ingest:
         for path, file_times, _ in self._file_time_map:
             n_file_times = len(file_times)
 
+            file_mask = []
+            for local_t in range(n_file_times):
+                u_idx = self._raw_to_unique[raw_offset + local_t]
+                if u_idx != -1 and u_idx in output_map:
+                    file_mask.append(local_t)
+
+            if not file_mask:
+                raw_offset += n_file_times
+                continue
+
+            t_start = file_mask[0]
+            t_stop = file_mask[-1] + 1
+
             with h5py.File(path, 'r') as h5:
                 h5_var = h5[src_var]
                 source_chunks = h5_var.chunks or rechunkit.guess_chunk_shape(
@@ -633,7 +665,7 @@ class H5Ingest:
                 x_start, x_stop, _ = x_sl.indices(h5_var.shape[2])
                 ny = y_stop - y_start
                 nx = x_stop - x_start
-                sel = (slice(0, n_file_times), slice(y_start, y_stop), slice(x_start, x_stop))
+                sel = (slice(t_start, t_stop), slice(y_start, y_stop), slice(x_start, x_stop))
 
                 target_chunks = (1, ny, nx)
 
@@ -641,13 +673,14 @@ class H5Ingest:
                     h5_var.__getitem__, h5_var.shape, h5_var.dtype,
                     source_chunks, target_chunks, max_mem, sel=sel,
                 ):
-                    local_t = write_slices[0].start
-                    u_idx = self._raw_to_unique[raw_offset + local_t]
-                    if u_idx == -1 or u_idx not in output_map:
-                        continue
+                    for i, chunk_t in enumerate(range(write_slices[0].start, write_slices[0].stop)):
+                        local_t = t_start + chunk_t
+                        u_idx = self._raw_to_unique[raw_offset + local_t]
+                        if u_idx == -1 or u_idx not in output_map:
+                            continue
 
-                    t_out = output_map[u_idx]
-                    data_var[(t_out, vert_indices[0], slice(None), slice(None))] = data[0].astype('float32')
+                        t_out = output_map[u_idx]
+                        self._write_data_var(data_var, data[i], t_out, vert_indices)
 
             raw_offset += n_file_times
 
@@ -655,12 +688,48 @@ class H5Ingest:
     def _write_data_var(data_var, data, output_time_idx, vert_indices):
         """Write data to a data variable at the correct indices."""
         if len(vert_indices) == 1:
-            data_var[(output_time_idx, vert_indices[0], slice(None), slice(None))] = data
+            # Add time and z dimensions for cfdb (1, 1, ny, nx)
+            data_var[(output_time_idx, vert_indices[0], slice(None), slice(None))] = data[np.newaxis, np.newaxis, ...]
         else:
+            # Add time and z dimensions for each level (1, 1, ny, nx)
             for lev_i, v_idx in enumerate(vert_indices):
-                data_var[(output_time_idx, v_idx, slice(None), slice(None))] = data[lev_i]
+                data_var[(output_time_idx, v_idx, slice(None), slice(None))] = data[lev_i][np.newaxis, np.newaxis, ...]
 
-    def _populate_per_timestep(self, data_var, var_key, time_mask, spatial_slice, vert_indices, is_accumulation):
+    def _multi_rechunker(self, sources, shape, dtype, source_chunks, target_chunks, max_mem, sel):
+        """
+        Generic synchronized multivariable rechunker.
+        
+        Parameters
+        ----------
+        sources : dict
+            {label: callable} source functions for rechunkit.
+        shape, dtype, source_chunks, target_chunks, max_mem, sel : 
+            Arguments passed to rechunkit.rechunker. max_mem is the total budget.
+            
+        Yields
+        ------
+        slices : tuple
+            The output write slices.
+        data_blocks : dict
+            {label: ndarray} synchronized data blocks.
+        """
+        import rechunkit
+        
+        per_var_mem = max_mem // len(sources)
+        labels = sorted(list(sources.keys()))
+        
+        generators = [
+            rechunkit.rechunker(sources[label], shape, dtype, source_chunks, target_chunks, per_var_mem, sel=sel)
+            for label in labels
+        ]
+        
+        for outputs in zip(*generators):
+            # All slices should be identical due to rechunkit determinism
+            write_slices = outputs[0][0]
+            data_blocks = {label: out[1] for label, out in zip(labels, outputs)}
+            yield write_slices, data_blocks
+
+    def _populate_per_timestep(self, data_var, var_key, time_mask, spatial_slice, vert_indices, max_mem, is_accumulation):
         """
         Populate a data variable using per-timestep iteration.
 
@@ -672,10 +741,15 @@ class H5Ingest:
         raw_offset = 0
         output_time_idx = 0
 
+        # We calculate the required max memory for the HDF5 chunk cache to prevent chunk-thrashing.
+        # This implicitly acts as our "block read" by letting the C-library manage the block buffer
+        # optimally across multiple source variables without breaking axis-dependent transform logic.
+        chunk_cache_mem = max_mem if 'max_mem' in locals() else 2**27
+
         for path, file_times, _ in self._file_time_map:
             n_file_times = len(file_times)
 
-            with h5py.File(path, 'r') as h5:
+            with h5py.File(path, 'r', rdcc_nbytes=chunk_cache_mem) as h5:
                 for local_t in range(n_file_times):
                     u_idx = self._raw_to_unique[raw_offset + local_t]
                     if u_idx == -1 or not time_mask[u_idx]:
@@ -698,7 +772,7 @@ class H5Ingest:
 
             raw_offset += n_file_times
 
-    def _populate_batch_per_timestep(self, batch_items, time_mask, spatial_slice):
+    def _populate_batch_per_timestep(self, batch_items, time_mask, spatial_slice, max_mem):
         """
         Populate multiple transform variables with timestep-outer, variable-inner
         loop order, enabling per-timestep caching of shared intermediates
@@ -707,10 +781,13 @@ class H5Ingest:
         raw_offset = 0
         output_time_idx = 0
 
+        # Delegate block caching to HDF5 C-level chunk cache to prevent chunk thrashing
+        chunk_cache_mem = max_mem if 'max_mem' in locals() else 2**27
+
         for path, file_times, _ in self._file_time_map:
             n_file_times = len(file_times)
 
-            with h5py.File(path, 'r') as h5:
+            with h5py.File(path, 'r', rdcc_nbytes=chunk_cache_mem) as h5:
                 for local_t in range(n_file_times):
                     u_idx = self._raw_to_unique[raw_offset + local_t]
                     if u_idx == -1 or not time_mask[u_idx]:

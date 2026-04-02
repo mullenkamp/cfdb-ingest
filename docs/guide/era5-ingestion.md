@@ -131,6 +131,32 @@ The `Z` variable in ERA5 is geopotential (m2 s-2), not geopotential height (m). 
 - Pressure level Z (`Z_PL`) is converted to `geopotential_height` by dividing by g (9.80665)
 - Invariant Z (`Z_INV`) is converted to `terrain_height` by dividing by g
 
+## VIMF Computation
+
+Vertically Integrated Moisture Flux (VIMF) can be computed natively during ingestion from specific humidity (`Q`) and wind components (`U`, `V`).
+
+VIMF is computed using a vectorized trapezoidal integration across all available pressure levels:
+
+$$ VIMF = \frac{1}{g} \int q \vec{v} dp $$
+
+### Usage
+
+Include `VIMF_U` and `VIMF_V` in your variables list. Ensure that the source files for `Q`, `U`, and `V` are included in the input paths.
+
+```python
+era5.convert(
+    cfdb_path='era5_vimf.cfdb',
+    variables=['VIMF_U', 'VIMF_V'],
+    start_date='2020-01-01',
+)
+```
+
+```bash
+cfdb-ingest era5 /path/to/pl/*.nc output.cfdb -v VIMF_U,VIMF_V
+```
+
+The resulting variables will be named `vimf_u` and `vimf_v` in the cfdb dataset, with a vertical coordinate of `height_0m`.
+
 ## CLI
 
 ### Basic usage

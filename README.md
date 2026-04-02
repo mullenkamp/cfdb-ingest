@@ -30,12 +30,22 @@ Key features:
 - **Automatic variable mapping** -- source variable names are translated to CF-standard names with proper metadata via [cfdb-vars](https://github.com/mullenkamp/cfdb-vars)
 - **Named height coordinates** -- surface variables at specific heights (0m, 2m, 10m, 100m) get their own named coordinates (e.g. `height_2m`), allowing them to coexist with pressure-level variables without ambiguity
 - **Wind rotation** (WRF) -- grid-relative wind components are rotated to earth-relative
+- **VIMF computation** (ERA5) -- native calculation of vertically integrated moisture flux from Q, U, and V
 - **3D level interpolation** (WRF) -- eta-level variables are interpolated to user-specified height or pressure levels
 - **Auto pressure level detection** (ERA5) -- pressure levels are read directly from source files
 - **Split or combined output** (ERA5) -- create one cfdb per variable or combine into a single dataset
 - **WPS intermediate file export** -- convert cfdb datasets to WPS intermediate format for metgrid.exe
 - **Spatial and temporal filtering** -- subset by bounding box and/or date range
 - **Multi-file support** -- seamlessly spans multiple input files
+
+## Performance
+
+cfdb-ingest is designed for high-performance processing of large meteorological datasets:
+
+- **Vectorized rechunking** -- utilizes [rechunkit](https://github.com/mullenkamp/rechunkit) for optimized HDF5 reads, even when extracting small spatial subsets across many timesteps.
+- **Parallel initialization** -- multi-threaded file scanning and metadata extraction for fast startup.
+- **HDF5 Chunk Caching** -- intelligent management of the HDF5 chunk cache to prevent redundant I/O during per-timestep transformations.
+- **Synchronized multi-variable rechunking** -- synchronized iteration for derived variables (like VIMF) to eliminate redundant reads of shared source variables.
 
 ## Installation
 
