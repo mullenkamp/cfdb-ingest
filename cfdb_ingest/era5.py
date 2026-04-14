@@ -7,6 +7,7 @@ a single variable. Supports both surface and pressure level products.
 import pathlib
 from typing import Union, List, Tuple, Dict, Optional
 import concurrent.futures
+from contextlib import ExitStack
 import cfdb
 import h5py
 import numpy as np
@@ -1290,36 +1291,41 @@ class Era5Ingest(H5Ingest):
             y_write = slice(y_off, y_off + ny) if self._heterogeneous_grids else None
             x_write = slice(x_off, x_off + nx) if self._heterogeneous_grids else None
 
-            sources = {
-                sv: lambda slices, p=path, v=sv: h5py.File(p, 'r', rdcc_nbytes=max_mem)[v][slices].astype('float64')
-                for sv, path in file_paths.items()
-            }
+            with ExitStack() as stack:
+                h5_files = {
+                    sv: stack.enter_context(h5py.File(path, 'r', rdcc_nbytes=max_mem))
+                    for sv, path in file_paths.items()
+                }
+                sources = {
+                    sv: lambda slices, h5_file=h5_files[sv], v=sv: h5_file[v][slices].astype('float64')
+                    for sv in file_paths.keys()
+                }
 
-            for write_slice, data_blocks in self._multi_rechunker(
-                sources, shape, dtype, source_chunks, target_chunks, max_mem, sel
-            ):
-                chunk_t_len = write_slice[0].stop - write_slice[0].start
+                for write_slice, data_blocks in self._multi_rechunker(
+                    sources, shape, dtype, source_chunks, target_chunks, max_mem, sel
+                ):
+                    chunk_t_len = write_slice[0].stop - write_slice[0].start
 
-                for var_key, data_var, vert_indices in batch_items:
-                    if var_key.startswith('VIMF_'):
-                        q, v = data_blocks['Q'], data_blocks[var_key[-1]]
-                        if self._lat_reversed: q, v = q[:, :, ::-1, :], v[:, :, ::-1, :]
+                    for var_key, data_var, vert_indices in batch_items:
+                        if var_key.startswith('VIMF_'):
+                            q, v = data_blocks['Q'], data_blocks[var_key[-1]]
+                            if self._lat_reversed: q, v = q[:, :, ::-1, :], v[:, :, ::-1, :]
 
-                        vimf = np.sum((q[:, :-1, ...] * v[:, :-1, ...] + q[:, 1:, ...] * v[:, 1:, ...]) / 2.0 * dp[np.newaxis, :, np.newaxis, np.newaxis], axis=1)
-                        vimf = (vimf / _G).astype('float32')
+                            vimf = np.sum((q[:, :-1, ...] * v[:, :-1, ...] + q[:, 1:, ...] * v[:, 1:, ...]) / 2.0 * dp[np.newaxis, :, np.newaxis, np.newaxis], axis=1)
+                            vimf = (vimf / _G).astype('float32')
 
-                        for i in range(chunk_t_len):
-                            local_t = t_start + write_slice[0].start + i
-                            if local_t in local_to_global:
-                                self._write_data_var(data_var, vimf[i], output_map[local_to_global[local_t]], vert_indices, y_write, x_write)
-                    else:
-                        src_v = self.variables[var_key]['source_vars'][0]
-                        raw = data_blocks[src_v].astype('float32')
-                        if self._lat_reversed: raw = raw[:, :, ::-1, :]
-                        for i in range(chunk_t_len):
-                            local_t = t_start + write_slice[0].start + i
-                            if local_t in local_to_global:
-                                self._write_data_var(data_var, raw[i], output_map[local_to_global[local_t]], vert_indices, y_write, x_write)
+                            for i in range(chunk_t_len):
+                                local_t = t_start + write_slice[0].start + i
+                                if local_t in local_to_global:
+                                    self._write_data_var(data_var, vimf[i], output_map[local_to_global[local_t]], vert_indices, y_write, x_write)
+                        else:
+                            src_v = self.variables[var_key]['source_vars'][0]
+                            raw = data_blocks[src_v].astype('float32')
+                            if self._lat_reversed: raw = raw[:, :, ::-1, :]
+                            for i in range(chunk_t_len):
+                                local_t = t_start + write_slice[0].start + i
+                                if local_t in local_to_global:
+                                    self._write_data_var(data_var, raw[i], output_map[local_to_global[local_t]], vert_indices, y_write, x_write)
 
     def _populate_batch_per_timestep(self, batch_items, time_mask, spatial_slice, max_mem,
                                      filtered_y=None, filtered_x=None):
