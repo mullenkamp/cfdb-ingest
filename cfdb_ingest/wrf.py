@@ -419,6 +419,7 @@ class WrfIngest(H5Ingest):
 
         self.x = spatial['x']
         self.y = spatial['y']
+        self._heterogeneous_grids = False
         self._dx = float(self.x[1] - self.x[0])
         self._dy = float(self.y[1] - self.y[0])
 

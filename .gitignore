@@ -118,3 +118,5 @@ data/*
 # Test config files
 /cfdb-ingest/tests/*.toml
 /cfdb-ingest/tests/*.yml
+
+logs/*
