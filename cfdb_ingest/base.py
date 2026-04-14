@@ -4,12 +4,13 @@ Base class for HDF5/netCDF4 ingestion to cfdb via h5py.
 import datetime
 import pathlib
 from typing import Union, List, Tuple, Dict, Optional
-
+import concurrent.futures
 import h5py
 import numpy as np
 import pyproj
 import rechunkit
 import cfdb
+import cfdb_ingest
 
 
 class H5Ingest:
@@ -71,13 +72,26 @@ class H5Ingest:
         Default implementation opens the first file and calls _parse_crs and
         _parse_spatial_coords. Override for sources with non-standard layouts
         (e.g., one variable per file).
+
+        When input files have different spatial extents, self.x and self.y
+        are set to the union grid and self._heterogeneous_grids is set True.
         """
         with h5py.File(self.input_paths[0], 'r') as h5:
             self.crs = self._parse_crs(h5)
-            spatial = self._parse_spatial_coords(h5)
+            spatial_first = self._parse_spatial_coords(h5)
 
-        self.x = spatial['x']
-        self.y = spatial['y']
+        self.x = spatial_first['x']
+        self.y = spatial_first['y']
+        self._heterogeneous_grids = False
+
+        if len(self.input_paths) > 1:
+            with h5py.File(self.input_paths[-1], 'r') as h5:
+                spatial_last = self._parse_spatial_coords(h5)
+            if not (np.array_equal(self.y, spatial_last['y']) and
+                    np.array_equal(self.x, spatial_last['x'])):
+                self.y = np.union1d(self.y, spatial_last['y'])
+                self.x = np.union1d(self.x, spatial_last['x'])
+                self._heterogeneous_grids = True
 
     def _init_time(self):
         """
@@ -87,7 +101,6 @@ class H5Ingest:
         timestep index to its position in the deduplicated self.times array,
         or -1 for duplicates that should be skipped.
         """
-        import concurrent.futures
 
         def _get_times(path):
             with h5py.File(path, 'r') as h5:
@@ -228,7 +241,6 @@ class H5Ingest:
         Subclasses should override and call super() to add source-specific
         attributes (e.g., model version, physics parameters).
         """
-        import cfdb_ingest
 
         filenames = ', '.join(p.name for p in self.input_paths)
         now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -414,7 +426,7 @@ class H5Ingest:
 
         with cfdb.open_dataset(cfdb_path, 'n', dataset_type=dataset_type, **cfdb_kwargs) as ds:
             # Create coordinates
-            ds.create.coord.time(data=filtered_times)
+            ds.create.coord.time(data=filtered_times, step=True)
             self._create_spatial_coords(ds, filtered_x, filtered_y)
 
             if has_multi_level:
@@ -506,17 +518,20 @@ class H5Ingest:
             # Process each group with its optimal strategy
             for var_key, data_var, vert_indices in rechunkit_items:
                 self._setup_populate(var_key, target_levels)
-                self._populate_with_rechunkit(data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices)
+                self._populate_with_rechunkit(data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices,
+                                              filtered_y=filtered_y, filtered_x=filtered_x)
 
             for var_key, data_var, vert_indices in accumulation_items:
                 self._setup_populate(var_key, target_levels)
                 self._prev_accum_total = None
-                self._populate_per_timestep(data_var, var_key, time_mask, spatial_slice, vert_indices, max_mem, is_accumulation=True)
+                self._populate_per_timestep(data_var, var_key, time_mask, spatial_slice, vert_indices, max_mem, is_accumulation=True,
+                                            filtered_y=filtered_y, filtered_x=filtered_x)
 
             if batch_items:
                 for var_key, _, _ in batch_items:
                     self._setup_populate(var_key, target_levels)
-                self._populate_batch_per_timestep(batch_items, time_mask, spatial_slice, max_mem)
+                self._populate_batch_per_timestep(batch_items, time_mask, spatial_slice, max_mem,
+                                                  filtered_y=filtered_y, filtered_x=filtered_x)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -576,6 +591,47 @@ class H5Ingest:
 
         return x_slice, y_slice, self.x[x_slice], self.y[y_slice]
 
+    def _get_file_spatial_mapping(self, h5, target_y, target_x):
+        """
+        Compute per-file spatial slice and target offset for heterogeneous grids.
+
+        The returned slices index into the file's parsed (ascending) coordinate
+        arrays, matching how _bbox_to_indices works. Subclasses that reverse
+        axes (e.g., ERA5 lat) must convert to raw HDF5 indices themselves.
+
+        Returns
+        -------
+        file_y_slice, file_x_slice : slice
+            Slices into the file's parsed (ascending) spatial arrays.
+        y_offset, x_offset : int
+            Starting index in the target (cfdb) grid where this file's data goes.
+        """
+        file_spatial = self._parse_spatial_coords(h5)
+        file_y, file_x = file_spatial['y'], file_spatial['x']
+
+        # Overlap between file grid and target grid (round to avoid float mismatch)
+        target_y_r = np.round(target_y, 8)
+        target_x_r = np.round(target_x, 8)
+        file_y_r = np.round(file_y, 8)
+        file_x_r = np.round(file_x, 8)
+
+        y_mask = np.isin(file_y_r, target_y_r)
+        x_mask = np.isin(file_x_r, target_x_r)
+
+        y_idx = np.where(y_mask)[0]
+        x_idx = np.where(x_mask)[0]
+
+        if len(y_idx) == 0 or len(x_idx) == 0:
+            return None, None, 0, 0
+
+        file_y_slice = slice(int(y_idx[0]), int(y_idx[-1]) + 1)
+        file_x_slice = slice(int(x_idx[0]), int(x_idx[-1]) + 1)
+
+        y_offset = int(np.searchsorted(target_y_r, file_y_r[y_idx[0]]))
+        x_offset = int(np.searchsorted(target_x_r, file_x_r[x_idx[0]]))
+
+        return file_y_slice, file_x_slice, y_offset, x_offset
+
     def _create_cfdb_data_var(self, ds, cfdb_name, coord_names, chunk_shape):
         """
         Create a cfdb data variable using the template method for cfdb_name.
@@ -618,7 +674,8 @@ class H5Ingest:
 
         return result.astype('float32')
 
-    def _populate_with_rechunkit(self, data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices):
+    def _populate_with_rechunkit(self, data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices,
+                                 filtered_y=None, filtered_x=None):
         """
         Populate a simple (no-transform, single source var) data variable using
         rechunkit for optimized HDF5 chunk reads.
@@ -655,19 +712,33 @@ class H5Ingest:
             t_stop = file_mask[-1] + 1
 
             with h5py.File(path, 'r') as h5:
+                # Per-file spatial mapping when grids differ
+                if self._heterogeneous_grids and filtered_y is not None:
+                    fy_sl, fx_sl, y_off, x_off = self._get_file_spatial_mapping(
+                        h5, filtered_y, filtered_x)
+                    if fy_sl is None:
+                        raw_offset += n_file_times
+                        continue
+                else:
+                    fy_sl, fx_sl = y_sl, x_sl
+                    y_off, x_off = 0, 0
+
                 h5_var = h5[src_var]
                 source_chunks = h5_var.chunks or rechunkit.guess_chunk_shape(
                     h5_var.shape, h5_var.dtype.itemsize, max_mem
                 )
 
                 # Build explicit sel (rechunkit requires non-None start/stop)
-                y_start, y_stop, _ = y_sl.indices(h5_var.shape[1])
-                x_start, x_stop, _ = x_sl.indices(h5_var.shape[2])
+                y_start, y_stop, _ = fy_sl.indices(h5_var.shape[1])
+                x_start, x_stop, _ = fx_sl.indices(h5_var.shape[2])
                 ny = y_stop - y_start
                 nx = x_stop - x_start
                 sel = (slice(t_start, t_stop), slice(y_start, y_stop), slice(x_start, x_stop))
 
                 target_chunks = (1, ny, nx)
+
+                y_write = slice(y_off, y_off + ny) if y_off > 0 or self._heterogeneous_grids else None
+                x_write = slice(x_off, x_off + nx) if x_off > 0 or self._heterogeneous_grids else None
 
                 for write_slices, data in rechunkit.rechunker(
                     h5_var.__getitem__, h5_var.shape, h5_var.dtype,
@@ -680,20 +751,20 @@ class H5Ingest:
                             continue
 
                         t_out = output_map[u_idx]
-                        self._write_data_var(data_var, data[i], t_out, vert_indices)
+                        self._write_data_var(data_var, data[i], t_out, vert_indices, y_write, x_write)
 
             raw_offset += n_file_times
 
     @staticmethod
-    def _write_data_var(data_var, data, output_time_idx, vert_indices):
+    def _write_data_var(data_var, data, output_time_idx, vert_indices, y_write=None, x_write=None):
         """Write data to a data variable at the correct indices."""
+        ys = y_write if y_write is not None else slice(None)
+        xs = x_write if x_write is not None else slice(None)
         if len(vert_indices) == 1:
-            # Add time and z dimensions for cfdb (1, 1, ny, nx)
-            data_var[(output_time_idx, vert_indices[0], slice(None), slice(None))] = data[np.newaxis, np.newaxis, ...]
+            data_var[(output_time_idx, vert_indices[0], ys, xs)] = data[np.newaxis, np.newaxis, ...]
         else:
-            # Add time and z dimensions for each level (1, 1, ny, nx)
             for lev_i, v_idx in enumerate(vert_indices):
-                data_var[(output_time_idx, v_idx, slice(None), slice(None))] = data[lev_i][np.newaxis, np.newaxis, ...]
+                data_var[(output_time_idx, v_idx, ys, xs)] = data[lev_i][np.newaxis, np.newaxis, ...]
 
     def _multi_rechunker(self, sources, shape, dtype, source_chunks, target_chunks, max_mem, sel):
         """
@@ -713,8 +784,7 @@ class H5Ingest:
         data_blocks : dict
             {label: ndarray} synchronized data blocks.
         """
-        import rechunkit
-        
+
         per_var_mem = max_mem // len(sources)
         labels = sorted(list(sources.keys()))
         
@@ -729,7 +799,8 @@ class H5Ingest:
             data_blocks = {label: out[1] for label, out in zip(labels, outputs)}
             yield write_slices, data_blocks
 
-    def _populate_per_timestep(self, data_var, var_key, time_mask, spatial_slice, vert_indices, max_mem, is_accumulation):
+    def _populate_per_timestep(self, data_var, var_key, time_mask, spatial_slice, vert_indices, max_mem, is_accumulation,
+                               filtered_y=None, filtered_x=None):
         """
         Populate a data variable using per-timestep iteration.
 
@@ -750,20 +821,36 @@ class H5Ingest:
             n_file_times = len(file_times)
 
             with h5py.File(path, 'r', rdcc_nbytes=chunk_cache_mem) as h5:
+                # Per-file spatial mapping
+                if self._heterogeneous_grids and filtered_y is not None:
+                    fy_sl, fx_sl, y_off, x_off = self._get_file_spatial_mapping(
+                        h5, filtered_y, filtered_x)
+                    if fy_sl is None:
+                        raw_offset += n_file_times
+                        continue
+                    file_spatial_slice = (fy_sl, fx_sl)
+                    ny = fy_sl.stop - fy_sl.start
+                    nx = fx_sl.stop - fx_sl.start
+                    y_write = slice(y_off, y_off + ny)
+                    x_write = slice(x_off, x_off + nx)
+                else:
+                    file_spatial_slice = spatial_slice
+                    y_write, x_write = None, None
+
                 for local_t in range(n_file_times):
                     u_idx = self._raw_to_unique[raw_offset + local_t]
                     if u_idx == -1 or not time_mask[u_idx]:
                         continue
 
-                    data = self._read_variable(h5, var_key, local_t, spatial_slice)
-                    self._write_data_var(data_var, data, output_time_idx, vert_indices)
+                    data = self._read_variable(h5, var_key, local_t, file_spatial_slice)
+                    self._write_data_var(data_var, data, output_time_idx, vert_indices, y_write, x_write)
 
                     output_time_idx += 1
 
                 # Cache last accumulated total for cross-file boundary
                 if is_accumulation:
                     info = self.variables[var_key]
-                    y_sl, x_sl = spatial_slice
+                    y_sl, x_sl = file_spatial_slice
                     total = sum(
                         h5[sv][n_file_times - 1, y_sl, x_sl].astype('float64')
                         for sv in info['source_vars']
@@ -772,7 +859,8 @@ class H5Ingest:
 
             raw_offset += n_file_times
 
-    def _populate_batch_per_timestep(self, batch_items, time_mask, spatial_slice, max_mem):
+    def _populate_batch_per_timestep(self, batch_items, time_mask, spatial_slice, max_mem,
+                                     filtered_y=None, filtered_x=None):
         """
         Populate multiple transform variables with timestep-outer, variable-inner
         loop order, enabling per-timestep caching of shared intermediates
@@ -788,6 +876,22 @@ class H5Ingest:
             n_file_times = len(file_times)
 
             with h5py.File(path, 'r', rdcc_nbytes=chunk_cache_mem) as h5:
+                # Per-file spatial mapping
+                if self._heterogeneous_grids and filtered_y is not None:
+                    fy_sl, fx_sl, y_off, x_off = self._get_file_spatial_mapping(
+                        h5, filtered_y, filtered_x)
+                    if fy_sl is None:
+                        raw_offset += n_file_times
+                        continue
+                    file_spatial_slice = (fy_sl, fx_sl)
+                    ny = fy_sl.stop - fy_sl.start
+                    nx = fx_sl.stop - fx_sl.start
+                    y_write = slice(y_off, y_off + ny)
+                    x_write = slice(x_off, x_off + nx)
+                else:
+                    file_spatial_slice = spatial_slice
+                    y_write, x_write = None, None
+
                 for local_t in range(n_file_times):
                     u_idx = self._raw_to_unique[raw_offset + local_t]
                     if u_idx == -1 or not time_mask[u_idx]:
@@ -796,8 +900,8 @@ class H5Ingest:
                     self._ts_cache = {}
 
                     for var_key, data_var, vert_indices in batch_items:
-                        data = self._read_variable(h5, var_key, local_t, spatial_slice)
-                        self._write_data_var(data_var, data, output_time_idx, vert_indices)
+                        data = self._read_variable(h5, var_key, local_t, file_spatial_slice)
+                        self._write_data_var(data_var, data, output_time_idx, vert_indices, y_write, x_write)
 
                     self._ts_cache = None
 

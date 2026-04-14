@@ -296,6 +296,12 @@ WRF_VARIABLE_MAPPING = {
         'transform': 'precipitable_water',
         'height': 0.0,
     },
+    'PWAT_TR': {
+        'cfdb_name': 'pwat_tr',
+        'source_vars': ['qv_tr', 'P', 'PB'],
+        'transform': 'precipitable_water_tracer',
+        'height': 0.0,
+    },
     'VIMF_U': {
         'cfdb_name': 'vimf_u',
         'source_vars': ['QVAPOR', 'U', 'V', 'P', 'PB'],
@@ -654,6 +660,9 @@ class WrfIngest(H5Ingest):
 
         elif transform == 'precipitable_water':
             return self._read_precipitable_water(h5, time_idx, spatial_slice)
+
+        elif transform == 'precipitable_water_tracer':
+            return self._read_precipitable_water_tracer(h5, time_idx, spatial_slice)
 
         elif transform == 'vimf_u':
             return self._read_vimf_u(h5, time_idx, spatial_slice)
@@ -1151,6 +1160,23 @@ class WrfIngest(H5Ingest):
         qvapor, dp = self._compute_column_qvapor_dp(h5, time_idx, spatial_slice)
         pwat = np.sum(qvapor * dp, axis=0) / 9.80665
         return pwat.astype('float32')
+
+    def _read_precipitable_water_tracer(self, h5, time_idx, spatial_slice):
+        """
+        Compute tracer precipitable water by vertically integrating qv_tr.
+
+        PWAT_TR = (1/g) * sum(qv_tr * dp)  over all eta levels.
+
+        Returns
+        -------
+        np.ndarray
+            Tracer precipitable water in kg/m2, shape (ny, nx).
+        """
+        _, dp = self._compute_column_qvapor_dp(h5, time_idx, spatial_slice)
+        y_sl, x_sl = spatial_slice
+        qv_tr = h5['qv_tr'][time_idx, :, y_sl, x_sl].astype('float64')
+        pwat_tr = np.sum(qv_tr * dp, axis=0) / 9.80665
+        return pwat_tr.astype('float32')
 
     def _read_vimf_u(self, h5, time_idx, spatial_slice):
         """
