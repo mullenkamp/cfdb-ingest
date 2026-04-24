@@ -308,6 +308,179 @@ class TestConvert2D:
 
 
 # ======================================================================
+# Bucket-aware accumulation (bucket_mm > 0 reconstruction)
+# ======================================================================
+
+
+def _make_bucketed_wrfout(src_path, dst_path, bucket_mm, i_rainnc_field, i_rainc_field):
+    """
+    Copy an existing wrfout test file and inject synthetic I_RAINNC, I_RAINC
+    bucket counters plus a BUCKET_MM global attribute, so we can test
+    bucket-reconstruction logic without having to run WRF with bucket_mm>0.
+
+    i_rainnc_field and i_rainc_field are 2D arrays (south_north, west_east)
+    that broadcast to every time step (i.e. static bucket count).
+    """
+    import shutil
+    shutil.copy(src_path, dst_path)
+    with h5py.File(dst_path, 'r+') as h5:
+        h5.attrs['BUCKET_MM'] = np.float32(bucket_mm)
+        n_t = h5['RAINNC'].shape[0]
+        ny, nx = i_rainnc_field.shape
+        i_rainnc = np.broadcast_to(i_rainnc_field, (n_t, ny, nx)).astype('int32')
+        i_rainc = np.broadcast_to(i_rainc_field, (n_t, ny, nx)).astype('int32')
+        h5.create_dataset('I_RAINNC', data=i_rainnc, dtype='int32')
+        h5.create_dataset('I_RAINC', data=i_rainc, dtype='int32')
+
+
+class TestBucketAwareAccumulation:
+    def test_plain_sum_when_bucket_disabled(self, wrf_single, wrf_file_1):
+        """BUCKET_MM <= 0 on the file → plain source_vars sum, no reconstruction."""
+        with h5py.File(wrf_file_1, 'r') as h5:
+            got = wrf_single._accumulation_source_sum(
+                h5, ['RAINNC', 'RAINC'], 5, (slice(None), slice(None))
+            )
+            expected = (h5['RAINNC'][5].astype('float64')
+                        + h5['RAINC'][5].astype('float64'))
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-12)
+
+    def test_bucket_reconstruction_adds_counter_term(self, wrf_file_1, tmp_path):
+        """BUCKET_MM > 0 + I_<name> present → total = <name> + BUCKET_MM * I_<name>."""
+        from cfdb_ingest.wrf import WrfIngest
+
+        with h5py.File(wrf_file_1, 'r') as h5:
+            ny, nx = h5['RAINNC'].shape[1:]
+        # Distinct counts so we can verify the arithmetic cleanly.
+        i_rainnc_field = np.full((ny, nx), 3, dtype='int32')
+        i_rainc_field = np.full((ny, nx), 2, dtype='int32')
+        bucket_mm = 100.0
+        dst = tmp_path / 'wrfout_bucket.nc'
+        _make_bucketed_wrfout(wrf_file_1, dst, bucket_mm, i_rainnc_field, i_rainc_field)
+
+        ingest = WrfIngest(dst)
+        with h5py.File(dst, 'r') as h5:
+            got = ingest._accumulation_source_sum(
+                h5, ['RAINNC', 'RAINC'], 5, (slice(None), slice(None))
+            )
+            expected = (h5['RAINNC'][5].astype('float64')
+                        + bucket_mm * i_rainnc_field
+                        + h5['RAINC'][5].astype('float64')
+                        + bucket_mm * i_rainc_field)
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-10)
+
+    def test_missing_companion_falls_back_to_plain(self, wrf_file_1, tmp_path):
+        """BUCKET_MM > 0 but no I_<name> for a source var → that term is plain."""
+        import shutil
+        dst = tmp_path / 'wrfout_bucket_partial.nc'
+        shutil.copy(wrf_file_1, dst)
+        with h5py.File(dst, 'r+') as h5:
+            h5.attrs['BUCKET_MM'] = np.float32(50.0)
+            ny, nx = h5['RAINNC'].shape[1:]
+            n_t = h5['RAINNC'].shape[0]
+            # only I_RAINNC, no I_RAINC
+            h5.create_dataset(
+                'I_RAINNC',
+                data=np.full((n_t, ny, nx), 4, dtype='int32'),
+                dtype='int32',
+            )
+
+        from cfdb_ingest.wrf import WrfIngest
+        ingest = WrfIngest(dst)
+        with h5py.File(dst, 'r') as h5:
+            got = ingest._accumulation_source_sum(
+                h5, ['RAINNC', 'RAINC'], 3, (slice(None), slice(None))
+            )
+            expected = (h5['RAINNC'][3].astype('float64') + 50.0 * 4
+                        + h5['RAINC'][3].astype('float64'))
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-10)
+
+    def test_rain_tr_mapping_registered(self):
+        """Ensure WRF_VARIABLE_MAPPING has a RAIN_TR entry for tracer precip."""
+        from cfdb_ingest.wrf import WRF_VARIABLE_MAPPING
+        assert 'RAIN_TR' in WRF_VARIABLE_MAPPING
+        entry = WRF_VARIABLE_MAPPING['RAIN_TR']
+        assert entry['cfdb_name'] == 'precip_tr'
+        assert entry['source_vars'] == ['TR_RAINNC', 'TR_RAINC']
+        assert entry['transform'] == 'accumulation_increment'
+
+    def test_bucket_applies_to_tracer_source_vars(self, wrf_file_1, tmp_path):
+        """The bucket-aware helper works for TR_* source_vars with I_TR_* companions.
+
+        The base test file has no TR_* vars; synthesize a minimal scenario:
+        add TR_RAINNC, TR_RAINC, I_TR_RAINNC, I_TR_RAINC to a copy, and
+        confirm the helper reconstructs TR_<name> + bucket_mm * I_TR_<name>.
+        """
+        import shutil
+        dst = tmp_path / 'wrfout_tr_bucket.nc'
+        shutil.copy(wrf_file_1, dst)
+        bucket_mm = 25.0
+        with h5py.File(dst, 'r+') as h5:
+            h5.attrs['BUCKET_MM'] = np.float32(bucket_mm)
+            n_t, ny, nx = h5['RAINNC'].shape
+            # Plausible TR_* values: a fraction of RAINNC, plus a bucket count.
+            tr_rainnc_raw = (0.3 * h5['RAINNC'][:]).astype('float32')
+            tr_rainc_raw = (0.3 * h5['RAINC'][:]).astype('float32')
+            h5.create_dataset('TR_RAINNC', data=tr_rainnc_raw, dtype='float32')
+            h5.create_dataset('TR_RAINC', data=tr_rainc_raw, dtype='float32')
+            h5.create_dataset('I_TR_RAINNC',
+                              data=np.full((n_t, ny, nx), 5, dtype='int32'),
+                              dtype='int32')
+            h5.create_dataset('I_TR_RAINC',
+                              data=np.full((n_t, ny, nx), 2, dtype='int32'),
+                              dtype='int32')
+
+        from cfdb_ingest.wrf import WrfIngest
+        ingest = WrfIngest(dst)
+        with h5py.File(dst, 'r') as h5:
+            got = ingest._accumulation_source_sum(
+                h5, ['TR_RAINNC', 'TR_RAINC'], 4, (slice(None), slice(None))
+            )
+            expected = (h5['TR_RAINNC'][4].astype('float64') + bucket_mm * 5
+                        + h5['TR_RAINC'][4].astype('float64') + bucket_mm * 2)
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-10)
+
+    def test_increment_remains_correct_across_wrap(self, wrf_file_1, tmp_path):
+        """
+        Simulate a bucket wrap between two timesteps: at t=3 the counter is 2,
+        at t=4 the counter is 3. The increment computation must use reconstructed
+        totals, otherwise it produces a huge negative spike.
+        """
+        import shutil
+        dst = tmp_path / 'wrfout_wrap.nc'
+        shutil.copy(wrf_file_1, dst)
+        bucket_mm = 10.0
+        with h5py.File(dst, 'r+') as h5:
+            h5.attrs['BUCKET_MM'] = np.float32(bucket_mm)
+            n_t, ny, nx = h5['RAINNC'].shape
+            # Counter is 2 for t <= 3, 3 for t >= 4 (simulated wrap at t=4).
+            i_rainnc = np.zeros((n_t, ny, nx), dtype='int32')
+            i_rainnc[:4] = 2
+            i_rainnc[4:] = 3
+            i_rainc = np.zeros((n_t, ny, nx), dtype='int32')
+            h5.create_dataset('I_RAINNC', data=i_rainnc, dtype='int32')
+            h5.create_dataset('I_RAINC', data=i_rainc, dtype='int32')
+
+        from cfdb_ingest.wrf import WrfIngest
+        ingest = WrfIngest(dst)
+        with h5py.File(dst, 'r') as h5:
+            # Manual reference using reconstruction:
+            total_4 = (h5['RAINNC'][4].astype('float64') + bucket_mm * i_rainnc[4]
+                       + h5['RAINC'][4].astype('float64'))
+            total_3 = (h5['RAINNC'][3].astype('float64') + bucket_mm * i_rainnc[3]
+                       + h5['RAINC'][3].astype('float64'))
+            expected = total_4 - total_3
+
+            ingest._prev_accum_total = None
+            got = ingest._read_accumulation_increment(
+                h5, 'RAIN', 4, (slice(None), slice(None))
+            )
+        np.testing.assert_allclose(got, expected, atol=1e-3)
+        # Sanity: the plain (broken) increment would be wildly negative because
+        # RAINNC at t=4 has wrapped — confirm our fix avoided that.
+        assert np.all(got >= -1.0)
+
+
+# ======================================================================
 # Conversion — Filtering
 # ======================================================================
 

@@ -651,6 +651,17 @@ class H5Ingest:
         """Hook called before populating a data variable. Override as needed."""
         pass
 
+    def _accumulation_source_sum(self, h5, source_vars, time_idx, spatial_slice):
+        """
+        Sum source_vars at a given timestep.
+
+        Hook for subclasses to apply source-specific corrections (e.g., WRF
+        reconstructs wrapped accumulators from bucket counters when
+        ``BUCKET_MM > 0``). Base implementation is the plain sum.
+        """
+        y_sl, x_sl = spatial_slice
+        return sum(h5[sv][time_idx, y_sl, x_sl].astype('float64') for sv in source_vars)
+
     def _read_accumulation_increment(self, h5, var_key, time_idx, spatial_slice):
         """
         Compute increment from accumulated source variables.
@@ -660,12 +671,12 @@ class H5Ingest:
         Returns NaN for the very first overall timestep.
         """
         info = self.variables[var_key]
-        y_sl, x_sl = spatial_slice
+        source_vars = info['source_vars']
 
-        total = sum(h5[sv][time_idx, y_sl, x_sl].astype('float64') for sv in info['source_vars'])
+        total = self._accumulation_source_sum(h5, source_vars, time_idx, spatial_slice)
 
         if time_idx > 0:
-            prev = sum(h5[sv][time_idx - 1, y_sl, x_sl].astype('float64') for sv in info['source_vars'])
+            prev = self._accumulation_source_sum(h5, source_vars, time_idx - 1, spatial_slice)
             result = total - prev
         elif self._prev_accum_total is not None:
             result = total - self._prev_accum_total
@@ -850,10 +861,8 @@ class H5Ingest:
                 # Cache last accumulated total for cross-file boundary
                 if is_accumulation:
                     info = self.variables[var_key]
-                    y_sl, x_sl = file_spatial_slice
-                    total = sum(
-                        h5[sv][n_file_times - 1, y_sl, x_sl].astype('float64')
-                        for sv in info['source_vars']
+                    total = self._accumulation_source_sum(
+                        h5, info['source_vars'], n_file_times - 1, file_spatial_slice
                     )
                     self._prev_accum_total = total.astype('float32')
 

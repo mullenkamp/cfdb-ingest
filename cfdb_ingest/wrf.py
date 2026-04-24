@@ -302,6 +302,12 @@ WRF_VARIABLE_MAPPING = {
         'transform': 'precipitable_water_tracer',
         'height': 0.0,
     },
+    'RAIN_TR': {
+        'cfdb_name': 'precip_tr',
+        'source_vars': ['TR_RAINNC', 'TR_RAINC'],
+        'transform': 'accumulation_increment',
+        'height': 0.0,
+    },
     'VIMF_U': {
         'cfdb_name': 'vimf_u',
         'source_vars': ['QVAPOR', 'U', 'V', 'P', 'PB'],
@@ -557,6 +563,36 @@ class WrfIngest(H5Ingest):
         attrs['source'] = self._source_title
         attrs.update(self._wrf_params)
         return attrs
+
+    def _accumulation_source_sum(self, h5, source_vars, time_idx, spatial_slice):
+        """
+        Sum source_vars with WRF bucket-counter reconstruction.
+
+        When BUCKET_MM > 0 is set on the wrfout file, WRF wraps accumulator
+        variables like RAINC/RAINNC periodically and stores the overflow
+        count in companion integer variables (I_RAINC/I_RAINNC). The true
+        cumulative total is ``<var> + BUCKET_MM * I_<var>``.
+
+        This override adds the bucket term for any source var that has a
+        companion ``I_<name>`` in the file. Backward compatible: when the
+        bucket is disabled (BUCKET_MM <= 0) or no I_<name> exists, behaves
+        identically to the base implementation.
+        """
+        y_sl, x_sl = spatial_slice
+
+        bucket_mm_attr = h5.attrs.get('BUCKET_MM', -1.0)
+        bucket_mm = float(np.asarray(bucket_mm_attr).item())
+        use_bucket = bucket_mm > 0.0
+
+        total = None
+        for sv in source_vars:
+            part = h5[sv][time_idx, y_sl, x_sl].astype('float64')
+            if use_bucket:
+                i_name = 'I_' + sv
+                if i_name in h5:
+                    part = part + bucket_mm * h5[i_name][time_idx, y_sl, x_sl].astype('float64')
+            total = part if total is None else total + part
+        return total
 
     def _read_variable(self, h5, var_key, time_idx, spatial_slice):
         """
