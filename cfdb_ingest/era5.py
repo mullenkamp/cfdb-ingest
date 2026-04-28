@@ -1058,9 +1058,13 @@ class Era5Ingest(H5Ingest):
         return self._var_time_map.get(src_var, [])
 
     def _populate_with_rechunkit(self, data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices,
-                                 filtered_y=None, filtered_x=None):
+                                 chunk_4d=None, filtered_y=None, filtered_x=None):
         """
         Override rechunkit populate for ERA5's one-var-per-file structure.
+
+        ``chunk_4d`` is accepted for signature compatibility with the base
+        method but not yet honoured here -- ERA5 uses its own per-call
+        ``target_chunks`` derived from the file's vertical extent.
         """
         info = self.variables[var_key]
         src_var = info['source_vars'][0]
