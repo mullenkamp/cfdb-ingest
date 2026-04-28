@@ -1247,6 +1247,137 @@ class WrfIngest(H5Ingest):
         vimf_v = np.sum(qvapor * v_earth * dp, axis=0) / 9.80665
         return vimf_v.astype('float32')
 
+    # ------------------------------------------------------------------
+    # Block-mode (time-batched) transforms.
+    # Each takes ``sources`` = {src_name: ndarray of shape (N, ny, nx)} and
+    # returns an ndarray of shape (N, ny, nx). They share a per-block
+    # ``block_cache`` dict for intermediates that span multiple variables
+    # (e.g. earth-relative wind for both wind_speed and wind_direction).
+    # ------------------------------------------------------------------
+
+    _BLOCK_TRANSFORMS = {
+        'mixing_ratio_to_specific_humidity_2d': '_block_specific_humidity_2d',
+        'relative_humidity_2d': '_block_relative_humidity_2d',
+        'dew_point_2d': '_block_dew_point_2d',
+        'potential_temperature_2d': '_block_potential_temperature_2d',
+        'equivalent_potential_temperature_2d': '_block_equivalent_potential_temperature_2d',
+        'wind_speed': '_block_wind_speed',
+        'wind_direction': '_block_wind_direction',
+        'u_wind': '_block_u_wind',
+        'v_wind': '_block_v_wind',
+        'vorticity': '_block_vorticity',
+        'sea_level_pressure': '_block_sea_level_pressure',
+        'land_sea_mask': '_block_land_sea_mask',
+        'precip_sum': '_block_precip_sum',
+    }
+
+    def _get_block_transform(self, transform_name):
+        """Return a bound block-transform method for ``transform_name``, or None."""
+        method = self._BLOCK_TRANSFORMS.get(transform_name)
+        return getattr(self, method) if method is not None else None
+
+    def _block_rotated_wind_2d(self, sources, y_sl, x_sl, block_cache):
+        """
+        Earth-relative U/V wind from grid-relative U10/V10. Shape (N, ny, nx).
+        Cached per block so wind_speed/wind_direction/u_wind/v_wind/vorticity share work.
+        """
+        if 'wind_2d' in block_cache:
+            return block_cache['wind_2d']
+        u_grid = sources['U10'].astype('float64')
+        v_grid = sources['V10'].astype('float64')
+        if self._cosalpha is not None:
+            cosa = self._cosalpha[y_sl, x_sl]
+            sina = self._sinalpha[y_sl, x_sl]
+            u_earth = u_grid * cosa + v_grid * sina
+            v_earth = -u_grid * sina + v_grid * cosa
+        else:
+            u_earth, v_earth = u_grid, v_grid
+        result = (u_earth, v_earth)
+        block_cache['wind_2d'] = result
+        return result
+
+    def _block_specific_humidity_2d(self, sources, y_sl, x_sl, block_cache):
+        q = sources['Q2'].astype('float64')
+        return (q / (1.0 + q)).astype('float32')
+
+    def _block_relative_humidity_2d(self, sources, y_sl, x_sl, block_cache):
+        t2 = sources['T2'].astype('float64')
+        q2 = sources['Q2'].astype('float64')
+        psfc = sources['PSFC'].astype('float64')
+        es = 611.2 * np.exp(17.67 * (t2 - 273.15) / (t2 - 273.15 + 243.5))
+        e = q2 * psfc / (0.622 + q2)
+        rh = np.clip(e / es, 0.0, 1.0)
+        return rh.astype('float32')
+
+    def _block_dew_point_2d(self, sources, y_sl, x_sl, block_cache):
+        q2 = sources['Q2'].astype('float64')
+        psfc = sources['PSFC'].astype('float64')
+        e = q2 * psfc / (0.622 + q2)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ln_ratio = np.log(e / 611.2)
+            td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+        return td.astype('float32')
+
+    def _block_potential_temperature_2d(self, sources, y_sl, x_sl, block_cache):
+        t2 = sources['T2'].astype('float64')
+        psfc = sources['PSFC'].astype('float64')
+        return (t2 * (100000.0 / psfc) ** 0.2854).astype('float32')
+
+    def _block_equivalent_potential_temperature_2d(self, sources, y_sl, x_sl, block_cache):
+        t2 = sources['T2'].astype('float64')
+        q2 = sources['Q2'].astype('float64')
+        psfc = sources['PSFC'].astype('float64')
+        e = q2 * psfc / (0.622 + q2)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ln_ratio = np.log(e / 611.2)
+            td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+            tl = 1.0 / (1.0 / (td - 56.0) + np.log(t2 / td) / 800.0) + 56.0
+            theta_e = t2 * (100000.0 / psfc) ** (0.2854 * (1.0 - 0.28 * q2)) \
+                * np.exp(q2 * (1.0 + 0.81 * q2) * (3376.0 / tl - 2.54))
+        return theta_e.astype('float32')
+
+    def _block_wind_speed(self, sources, y_sl, x_sl, block_cache):
+        u, v = self._block_rotated_wind_2d(sources, y_sl, x_sl, block_cache)
+        return np.sqrt(u**2 + v**2).astype('float32')
+
+    def _block_wind_direction(self, sources, y_sl, x_sl, block_cache):
+        u, v = self._block_rotated_wind_2d(sources, y_sl, x_sl, block_cache)
+        return ((270.0 - np.degrees(np.arctan2(v, u))) % 360.0).astype('float32')
+
+    def _block_u_wind(self, sources, y_sl, x_sl, block_cache):
+        u, _ = self._block_rotated_wind_2d(sources, y_sl, x_sl, block_cache)
+        return u.astype('float32')
+
+    def _block_v_wind(self, sources, y_sl, x_sl, block_cache):
+        _, v = self._block_rotated_wind_2d(sources, y_sl, x_sl, block_cache)
+        return v.astype('float32')
+
+    def _block_vorticity(self, sources, y_sl, x_sl, block_cache):
+        u, v = self._block_rotated_wind_2d(sources, y_sl, x_sl, block_cache)
+        # u, v shape: (N, ny, nx). y is axis=1, x is axis=2.
+        dvdx = np.gradient(v, self._dx, axis=2)
+        dudy = np.gradient(u, self._dy, axis=1)
+        return (dvdx - dudy).astype('float32')
+
+    def _block_sea_level_pressure(self, sources, y_sl, x_sl, block_cache):
+        psfc = sources['PSFC'].astype('float64')
+        t2 = sources['T2'].astype('float64')
+        hgt = sources['HGT'].astype('float64')
+        gamma = 0.0065
+        g = 9.81
+        rd = 287.05
+        t_mean = t2 + gamma * hgt / 2.0
+        return (psfc * np.exp(g * hgt / (rd * t_mean))).astype('float32')
+
+    def _block_land_sea_mask(self, sources, y_sl, x_sl, block_cache):
+        xland = sources['XLAND'].astype('float64')
+        return np.where(xland < 1.5, 1.0, 0.0).astype('float32')
+
+    def _block_precip_sum(self, sources, y_sl, x_sl, block_cache):
+        # Sum the pre-computed hourly precipitation source vars (e.g. PREC_ACC_C + PREC_ACC_NC).
+        total = sum(arr.astype('float64') for arr in sources.values())
+        return total.astype('float32')
+
     def _setup_populate(self, var_key, target_levels):
         """Set up level-interpolation regrid function for 3D variables."""
         info = self.variables[var_key]
