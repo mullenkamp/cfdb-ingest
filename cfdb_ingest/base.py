@@ -524,6 +524,7 @@ class H5Ingest:
                 for var_key, _, _ in batch_items:
                     self._setup_populate(var_key, target_levels)
                 self._populate_batch_per_timestep(batch_items, time_mask, spatial_slice, max_mem,
+                                                  chunk_4d=chunk_4d,
                                                   filtered_y=filtered_y, filtered_x=filtered_x)
 
     # ------------------------------------------------------------------
@@ -778,7 +779,7 @@ class H5Ingest:
         Write a rechunkit-yielded block to ``data_var``, coalescing into a single
         cfdb call when the block's timesteps map to a contiguous output range,
         and falling back to per-timestep writes when there are gaps (rare —
-        only happens at file overlaps).
+        only happens at file overlaps). Maps via ``_raw_to_unique`` (WRF-style).
         """
         n_block = write_slices[0].stop - write_slices[0].start
         t_outs = [None] * n_block
@@ -788,23 +789,33 @@ class H5Ingest:
             if u_idx == -1 or u_idx not in output_map:
                 continue
             t_outs[i] = output_map[u_idx]
+        self._write_block_from_t_outs(data_var, data, t_outs, vert_indices, y_write, x_write)
 
-        # Fast path: every timestep maps and they are output-contiguous.
+    def _write_block_from_t_outs(self, data_var, block, t_outs, vert_indices, y_write, x_write):
+        """
+        Write a block of data given a per-timestep mapping of output indices.
+
+        ``t_outs[i]`` is the output time index for ``block[i]``, or ``None`` to
+        skip that timestep. Fast-paths a single coalesced cfdb call when every
+        index is set and they form a contiguous run; falls back to per-timestep
+        writes otherwise.
+        """
+        n_block = len(t_outs)
+        if n_block == 0:
+            return
         if t_outs[0] is not None and all(
             t_outs[i] is not None and t_outs[i] == t_outs[0] + i
             for i in range(n_block)
         ):
             self._write_data_var_block(
-                data_var, data, slice(t_outs[0], t_outs[0] + n_block),
+                data_var, block, slice(t_outs[0], t_outs[0] + n_block),
                 vert_indices, y_write, x_write,
             )
             return
-
-        # Slow path: per-timestep, skipping unmapped slots.
         for i, t_out in enumerate(t_outs):
             if t_out is None:
                 continue
-            self._write_data_var(data_var, data[i], t_out, vert_indices, y_write, x_write)
+            self._write_data_var(data_var, block[i], t_out, vert_indices, y_write, x_write)
 
     @staticmethod
     def _write_data_var(data_var, data, output_time_idx, vert_indices, y_write=None, x_write=None):
@@ -1044,11 +1055,15 @@ class H5Ingest:
             raw_offset += n_file_times
 
     def _populate_batch_per_timestep(self, batch_items, time_mask, spatial_slice, max_mem,
-                                     filtered_y=None, filtered_x=None):
+                                     chunk_4d=None, filtered_y=None, filtered_x=None):
         """
         Populate multiple transform variables with timestep-outer, variable-inner
         loop order, enabling per-timestep caching of shared intermediates
         (e.g., geo_height, rotated winds).
+
+        ``chunk_4d`` is accepted for signature compatibility with subclasses that
+        forward it to a block-mode helper; the base implementation does not use
+        it (it always per-timestep reads + flushes one buffered block per file).
 
         Per-variable arrays are buffered within a single source file and flushed
         as coalesced block writes per variable so that multi-timestep cfdb chunks

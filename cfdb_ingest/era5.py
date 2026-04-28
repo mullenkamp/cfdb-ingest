@@ -1062,13 +1062,16 @@ class Era5Ingest(H5Ingest):
         """
         Override rechunkit populate for ERA5's one-var-per-file structure.
 
-        ``chunk_4d`` is accepted for signature compatibility with the base
-        method but not yet honoured here -- ERA5 uses its own per-call
-        ``target_chunks`` derived from the file's vertical extent.
+        Yielded rechunkit blocks are written as a single coalesced cfdb call
+        when the block's timesteps map to a contiguous output range; otherwise
+        falls back to per-timestep writes (rare). ``chunk_4d[0]`` controls the
+        time dim of ``target_chunks`` so blocks line up with the cfdb output
+        chunk shape.
         """
         info = self.variables[var_key]
         src_var = info['source_vars'][0]
         y_sl, x_sl = spatial_slice
+        target_t = chunk_4d[0] if chunk_4d is not None else 1
 
         entries = self._get_var_time_entries(var_key)
         if not entries:
@@ -1138,34 +1141,39 @@ class Era5Ingest(H5Ingest):
 
                 if h5_var.ndim == 3:
                     sel = (sel_time, sel_y, sel_x)
-                    target_chunks = (1, ny, nx)
+                    target_chunks = (target_t, ny, nx)
                 else:
                     nz = h5_var.shape[1]
                     sel = (sel_time, slice(0, nz), sel_y, sel_x)
-                    target_chunks = (1, nz, ny, nx)
+                    target_chunks = (target_t, nz, ny, nx)
+
+                lat_reversed = self._lat_reversed
+                lat_axis = 2 if h5_var.ndim == 4 else 1  # axis of y in (N, [nz,] ny, nx)
+                apply_geopotential = info.get('transform') == 'geopotential_to_height'
 
                 for write_slices, data in rechunkit.rechunker(
                     h5_var.__getitem__, h5_var.shape, h5_var.dtype,
                     source_chunks, target_chunks, max_mem, sel=sel,
                 ):
+                    n_block = write_slices[0].stop - write_slices[0].start
+                    t_outs = [None] * n_block
                     for i, chunk_t in enumerate(range(write_slices[0].start, write_slices[0].stop)):
                         local_t = t_start + chunk_t
-                        if local_t not in local_to_global:
-                            continue
-                        global_t = local_to_global[local_t]
-                        out_t = output_map[global_t]
+                        if local_t in local_to_global:
+                            t_outs[i] = output_map[local_to_global[local_t]]
 
-                        raw = data[i].astype('float32')
-                        if self._lat_reversed:
-                            if h5_var.ndim == 4:
-                                raw = raw[:, ::-1, :]
-                            else:
-                                raw = raw[::-1, :]
+                    block = data.astype('float32', copy=False)
+                    if lat_reversed:
+                        if lat_axis == 2:
+                            block = block[:, :, ::-1, :]
+                        else:
+                            block = block[:, ::-1, :]
+                    if apply_geopotential:
+                        block = block / _G
 
-                        if info.get('transform') == 'geopotential_to_height':
-                            raw = raw / _G
-
-                        self._write_data_var(data_var, raw, out_t, vert_indices, y_write, x_write)
+                    self._write_block_from_t_outs(
+                        data_var, block, t_outs, vert_indices, y_write, x_write,
+                    )
 
     def _populate_per_timestep(self, data_var, var_key, time_mask, spatial_slice, vert_indices, max_mem, is_accumulation,
                                filtered_y=None, filtered_x=None):
@@ -1233,9 +1241,14 @@ class Era5Ingest(H5Ingest):
             yield i_entry, file_paths, file_times
 
     def _populate_multi_with_rechunkit(self, batch_items, time_mask, spatial_slice, max_mem,
-                                       filtered_y=None, filtered_x=None):
+                                       chunk_4d=None, filtered_y=None, filtered_x=None):
         """
         Optimized multi-variable rechunking for ERA5.
+
+        ``chunk_4d[0]`` controls the time dim of ``target_chunks`` so yielded
+        blocks line up with the cfdb output chunk shape and writes can be
+        coalesced per block. Falls back to ``min(120, t_stop-t_start)`` when
+        ``chunk_4d`` is None to preserve historical behaviour.
         """
         if not batch_items:
             return
@@ -1289,7 +1302,8 @@ class Era5Ingest(H5Ingest):
                 nx = x_stop - x_start
                 sel = (slice(t_start, t_stop), slice(0, nz), slice(y_start, y_stop), slice(x_start, x_stop))
                 source_chunks = h5_var.chunks or (1, nz, ny, nx)
-                target_chunks = (min(120, t_stop-t_start), nz, ny, nx)
+                target_t = chunk_4d[0] if chunk_4d is not None else min(120, t_stop - t_start)
+                target_chunks = (target_t, nz, ny, nx)
                 shape, dtype = h5_var.shape, h5_var.dtype
 
             y_write = slice(y_off, y_off + ny) if self._heterogeneous_grids else None
@@ -1309,30 +1323,35 @@ class Era5Ingest(H5Ingest):
                     sources, shape, dtype, source_chunks, target_chunks, max_mem, sel
                 ):
                     chunk_t_len = write_slice[0].stop - write_slice[0].start
+                    t_outs = [None] * chunk_t_len
+                    for i in range(chunk_t_len):
+                        local_t = t_start + write_slice[0].start + i
+                        if local_t in local_to_global:
+                            t_outs[i] = output_map[local_to_global[local_t]]
 
                     for var_key, data_var, vert_indices in batch_items:
                         if var_key.startswith('VIMF_'):
                             q, v = data_blocks['Q'], data_blocks[var_key[-1]]
-                            if self._lat_reversed: q, v = q[:, :, ::-1, :], v[:, :, ::-1, :]
-
-                            vimf = np.sum((q[:, :-1, ...] * v[:, :-1, ...] + q[:, 1:, ...] * v[:, 1:, ...]) / 2.0 * dp[np.newaxis, :, np.newaxis, np.newaxis], axis=1)
-                            vimf = (vimf / _G).astype('float32')
-
-                            for i in range(chunk_t_len):
-                                local_t = t_start + write_slice[0].start + i
-                                if local_t in local_to_global:
-                                    self._write_data_var(data_var, vimf[i], output_map[local_to_global[local_t]], vert_indices, y_write, x_write)
+                            if self._lat_reversed:
+                                q, v = q[:, :, ::-1, :], v[:, :, ::-1, :]
+                            vimf = np.sum(
+                                (q[:, :-1, ...] * v[:, :-1, ...] + q[:, 1:, ...] * v[:, 1:, ...]) / 2.0
+                                * dp[np.newaxis, :, np.newaxis, np.newaxis],
+                                axis=1,
+                            )
+                            block = (vimf / _G).astype('float32')
                         else:
                             src_v = self.variables[var_key]['source_vars'][0]
-                            raw = data_blocks[src_v].astype('float32')
-                            if self._lat_reversed: raw = raw[:, :, ::-1, :]
-                            for i in range(chunk_t_len):
-                                local_t = t_start + write_slice[0].start + i
-                                if local_t in local_to_global:
-                                    self._write_data_var(data_var, raw[i], output_map[local_to_global[local_t]], vert_indices, y_write, x_write)
+                            block = data_blocks[src_v].astype('float32')
+                            if self._lat_reversed:
+                                block = block[:, :, ::-1, :]
+
+                        self._write_block_from_t_outs(
+                            data_var, block, t_outs, vert_indices, y_write, x_write,
+                        )
 
     def _populate_batch_per_timestep(self, batch_items, time_mask, spatial_slice, max_mem,
-                                     filtered_y=None, filtered_x=None):
+                                     chunk_4d=None, filtered_y=None, filtered_x=None):
         """
         Optimized batch populate for ERA5.
         """
@@ -1344,6 +1363,7 @@ class Era5Ingest(H5Ingest):
 
         if vimf_items:
             self._populate_multi_with_rechunkit(vimf_items, time_mask, spatial_slice, max_mem,
+                                                chunk_4d=chunk_4d,
                                                 filtered_y=filtered_y, filtered_x=filtered_x)
 
         if not remaining_items:
