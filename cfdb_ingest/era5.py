@@ -7,7 +7,6 @@ a single variable. Supports both surface and pressure level products.
 import pathlib
 from typing import Union, List, Tuple, Dict, Optional
 import concurrent.futures
-from contextlib import ExitStack
 import cfdb
 import h5py
 import numpy as np
@@ -1057,16 +1056,87 @@ class Era5Ingest(H5Ingest):
         src_var = self.variables[var_key]['source_vars'][0]
         return self._var_time_map.get(src_var, [])
 
-    def _populate_with_rechunkit(self, data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices,
-                                 chunk_4d=None, filtered_y=None, filtered_x=None):
-        """
-        Override rechunkit populate for ERA5's one-var-per-file structure.
+    def _files_for_var(self, var_key):
+        """ERA5: each variable lives in its own files, looked up by var key."""
+        return [path for (path, _) in self._get_var_time_entries(var_key)]
 
-        Yielded rechunkit blocks are written as a single coalesced cfdb call
-        when the block's timesteps map to a contiguous output range; otherwise
-        falls back to per-timestep writes (rare). ``chunk_4d[0]`` controls the
-        time dim of ``target_chunks`` so blocks line up with the cfdb output
-        chunk shape.
+    def _post_block_transform(self, block, var_key, source_ndim):
+        """
+        Apply ERA5-specific layout corrections to a rechunker-yielded block.
+
+        Currently just lat-reversal — for files where latitude is stored in
+        descending order, flip the y axis to match the ascending ``self.y``
+        coordinate the cfdb writer expects. Variable-level transforms (e.g.
+        ``geopotential_to_height``, VIMF) live in ``_BLOCK_TRANSFORMS`` and
+        run after this hook from the multi-rechunker path.
+        """
+        if self._lat_reversed:
+            # block shape: (N, ny, nx) for 3D source, (N, nz, ny, nx) for 4D source
+            if source_ndim == 4:
+                return block[:, :, ::-1, :]
+            return block[:, ::-1, :]
+        return block
+
+    # ------------------------------------------------------------------
+    # Block-mode (time-batched) transforms.
+    # Each takes ``sources`` = {src_name: ndarray of shape (N, ...)} (already
+    # post-block-transformed for layout — e.g. lat-flipped) and returns an
+    # ndarray of the cfdb-output shape. Registered in ``_BLOCK_TRANSFORMS``
+    # so the dispatcher in ``convert()`` routes the right items here.
+    # ------------------------------------------------------------------
+
+    _BLOCK_TRANSFORMS = {
+        'geopotential_to_height': '_block_geopotential_to_height',
+        'compute_vimf_u': '_block_vimf_u',
+        'compute_vimf_v': '_block_vimf_v',
+    }
+
+    def _get_block_transform(self, transform_name):
+        method = self._BLOCK_TRANSFORMS.get(transform_name)
+        return getattr(self, method) if method is not None else None
+
+    def _block_geopotential_to_height(self, sources, y_sl, x_sl, block_cache):
+        """Z (geopotential, m^2/s^2) -> geopotential height (m). Single source."""
+        z = next(iter(sources.values()))
+        return (z / _G).astype('float32')
+
+    def _block_vimf_u(self, sources, y_sl, x_sl, block_cache):
+        """
+        Eastward vertically integrated moisture flux from Q + U.
+        VIMF_u = (1/g) * Integral(q * u) dp over the pressure column.
+        """
+        return self._block_vimf(sources['Q'], sources['U'], block_cache)
+
+    def _block_vimf_v(self, sources, y_sl, x_sl, block_cache):
+        """Northward VIMF from Q + V."""
+        return self._block_vimf(sources['Q'], sources['V'], block_cache)
+
+    def _block_vimf(self, q, wind, block_cache):
+        """
+        Trapezoidal column integration of ``q * wind`` along the pressure axis.
+        Inputs shape ``(N, nz, ny, nx)``; output shape ``(N, ny, nx)``.
+        """
+        if 'vimf_dp' not in block_cache:
+            levels = self._get_pressure_levels()
+            block_cache['vimf_dp'] = np.diff(levels)
+        dp = block_cache['vimf_dp']
+        qv = q * wind
+        # Sum ((qv[k] + qv[k+1]) / 2) * dp[k] across the pressure axis (axis=1).
+        integrated = np.sum(
+            (qv[:, :-1, ...] + qv[:, 1:, ...]) / 2.0
+            * dp[np.newaxis, :, np.newaxis, np.newaxis],
+            axis=1,
+        )
+        return (integrated / _G).astype('float32')
+
+    def _populate_with_rechunkit_per_file(self, data_var, var_key, time_mask, spatial_slice,
+                                          max_mem, vert_indices, chunk_4d=None,
+                                          filtered_y=None, filtered_x=None):
+        """
+        Heterogeneous-grids fallback for ERA5. Per-file rechunkit iteration with
+        per-file spatial remapping. Inherits the partial-chunk write
+        amplification pattern of the pre-cross-file code; acceptable until the
+        cross-file path supports per-file spatial remapping (rare in practice).
         """
         info = self.variables[var_key]
         src_var = info['source_vars'][0]
@@ -1240,133 +1310,18 @@ class Era5Ingest(H5Ingest):
             }
             yield i_entry, file_paths, file_times
 
-    def _populate_multi_with_rechunkit(self, batch_items, time_mask, spatial_slice, max_mem,
-                                       chunk_4d=None, filtered_y=None, filtered_x=None):
-        """
-        Optimized multi-variable rechunking for ERA5.
-
-        ``chunk_4d[0]`` controls the time dim of ``target_chunks`` so yielded
-        blocks line up with the cfdb output chunk shape and writes can be
-        coalesced per block. Falls back to ``min(120, t_stop-t_start)`` when
-        ``chunk_4d`` is None to preserve historical behaviour.
-        """
-        if not batch_items:
-            return
-
-        var_to_src = {}
-        all_required_srcs = set()
-        for var_key, _, _ in batch_items:
-            srcs = self.variables[var_key]['source_vars']
-            var_to_src[var_key] = srcs
-            all_required_srcs.update(srcs)
-
-        output_map = {u_idx: out_t for u_idx, out_t in zip(np.where(time_mask)[0], range(np.sum(time_mask)))}
-        y_sl, x_sl = spatial_slice
-        levels = self._get_pressure_levels()
-        dp = np.diff(levels)
-
-        for _, file_paths, file_times in self._get_synced_file_entries(list(all_required_srcs)):
-            file_mask = [
-                (lt, self._time_to_idx[t]) for lt, t in enumerate(file_times)
-                if t in self._time_to_idx and time_mask[self._time_to_idx[t]]
-            ]
-            if not file_mask: continue
-
-            t_start, t_stop = file_mask[0][0], file_mask[-1][0] + 1
-            local_to_global = dict(file_mask)
-
-            first_path = list(file_paths.values())[0]
-            first_src = list(file_paths.keys())[0]
-            with h5py.File(first_path, 'r') as h5:
-                # Per-file spatial mapping
-                if self._heterogeneous_grids and filtered_y is not None:
-                    asc_y_sl, fx_sl, y_off, x_off = self._get_file_spatial_mapping(
-                        h5, filtered_y, filtered_x)
-                    if asc_y_sl is None:
-                        continue
-                    file_sp = self._parse_spatial_coords(h5)
-                    n_fy = len(file_sp['y'])
-                    if self._lat_reversed:
-                        fy_sl = slice(n_fy - asc_y_sl.stop, n_fy - asc_y_sl.start)
-                    else:
-                        fy_sl = asc_y_sl
-                else:
-                    fy_sl, fx_sl = y_sl, x_sl
-                    y_off, x_off = 0, 0
-
-                h5_var = h5[first_src]
-                nz, ny_full, nx_full = h5_var.shape[1:]
-                y_start, y_stop, _ = fy_sl.indices(ny_full)
-                x_start, x_stop, _ = fx_sl.indices(nx_full)
-                ny = y_stop - y_start
-                nx = x_stop - x_start
-                sel = (slice(t_start, t_stop), slice(0, nz), slice(y_start, y_stop), slice(x_start, x_stop))
-                source_chunks = h5_var.chunks or (1, nz, ny, nx)
-                target_t = chunk_4d[0] if chunk_4d is not None else min(120, t_stop - t_start)
-                target_chunks = (target_t, nz, ny, nx)
-                shape, dtype = h5_var.shape, h5_var.dtype
-
-            y_write = slice(y_off, y_off + ny) if self._heterogeneous_grids else None
-            x_write = slice(x_off, x_off + nx) if self._heterogeneous_grids else None
-
-            with ExitStack() as stack:
-                h5_files = {
-                    sv: stack.enter_context(h5py.File(path, 'r', rdcc_nbytes=max_mem))
-                    for sv, path in file_paths.items()
-                }
-                sources = {
-                    sv: lambda slices, h5_file=h5_files[sv], v=sv: h5_file[v][slices].astype('float64')
-                    for sv in file_paths.keys()
-                }
-
-                for write_slice, data_blocks in self._multi_rechunker(
-                    sources, shape, dtype, source_chunks, target_chunks, max_mem, sel
-                ):
-                    chunk_t_len = write_slice[0].stop - write_slice[0].start
-                    t_outs = [None] * chunk_t_len
-                    for i in range(chunk_t_len):
-                        local_t = t_start + write_slice[0].start + i
-                        if local_t in local_to_global:
-                            t_outs[i] = output_map[local_to_global[local_t]]
-
-                    for var_key, data_var, vert_indices in batch_items:
-                        if var_key.startswith('VIMF_'):
-                            q, v = data_blocks['Q'], data_blocks[var_key[-1]]
-                            if self._lat_reversed:
-                                q, v = q[:, :, ::-1, :], v[:, :, ::-1, :]
-                            vimf = np.sum(
-                                (q[:, :-1, ...] * v[:, :-1, ...] + q[:, 1:, ...] * v[:, 1:, ...]) / 2.0
-                                * dp[np.newaxis, :, np.newaxis, np.newaxis],
-                                axis=1,
-                            )
-                            block = (vimf / _G).astype('float32')
-                        else:
-                            src_v = self.variables[var_key]['source_vars'][0]
-                            block = data_blocks[src_v].astype('float32')
-                            if self._lat_reversed:
-                                block = block[:, :, ::-1, :]
-
-                        self._write_block_from_t_outs(
-                            data_var, block, t_outs, vert_indices, y_write, x_write,
-                        )
 
     def _populate_batch_per_timestep(self, batch_items, time_mask, spatial_slice, max_mem,
                                      chunk_4d=None, filtered_y=None, filtered_x=None):
         """
-        Optimized batch populate for ERA5.
+        Per-timestep populate for ERA5 variables that don't have block transforms.
+
+        VIMF and ``geopotential_to_height`` are now handled by the cross-file
+        multi-rechunker via ``_BLOCK_TRANSFORMS``; nothing in the standard ERA5
+        variable mapping should land here. Kept as a fallback so unknown future
+        transforms don't silently drop.
         """
         if not batch_items:
-            return
-
-        vimf_items = [item for item in batch_items if item[0].startswith('VIMF_')]
-        remaining_items = [item for item in batch_items if not item[0].startswith('VIMF_')]
-
-        if vimf_items:
-            self._populate_multi_with_rechunkit(vimf_items, time_mask, spatial_slice, max_mem,
-                                                chunk_4d=chunk_4d,
-                                                filtered_y=filtered_y, filtered_x=filtered_x)
-
-        if not remaining_items:
             return
 
         output_map = {u_idx: out_t for u_idx, out_t in zip(np.where(time_mask)[0], range(np.sum(time_mask)))}
@@ -1374,7 +1329,7 @@ class Era5Ingest(H5Ingest):
 
         for global_t in requested_times:
             self._ts_cache = {}
-            for var_key, data_var, vert_indices in remaining_items:
+            for var_key, data_var, vert_indices in batch_items:
                 out_t = output_map[global_t]
                 t = self.times[global_t]
                 for path, file_times in self._get_var_time_entries(var_key):

@@ -3,6 +3,7 @@ Base class for HDF5/netCDF4 ingestion to cfdb via h5py.
 """
 import datetime
 import pathlib
+from contextlib import ExitStack
 from typing import Union, List, Tuple, Dict, Optional
 import concurrent.futures
 import h5py
@@ -11,6 +12,83 @@ import pyproj
 import rechunkit
 import cfdb
 import cfdb_ingest
+
+
+class _ConcatTimeSource:
+    """
+    Adapter that presents N already-open HDF5 datasets as one virtual array
+    concatenated along the time axis (axis 0), exposing a callable interface
+    suitable for ``rechunkit.rechunker``.
+
+    All files must contain ``var_name`` with identical shape on axes 1+ and
+    identical dtype/chunk layout. ``file_lens[i]`` is the time-axis length of
+    file ``i``; the cumulative sum gives the global time index range each file
+    covers.
+    """
+
+    def __init__(self, h5_files: list, var_name: str, file_lens: list):
+        self._datasets = [h5[var_name] for h5 in h5_files]
+        self._cum = np.cumsum([0] + list(file_lens)).astype('int64')
+        first = self._datasets[0]
+        self.shape = (int(self._cum[-1]),) + tuple(first.shape[1:])
+        self.dtype = first.dtype
+        # Inherit source chunks from the first file. Caller supplies a fallback
+        # via guess_chunk_shape when this is None.
+        self.source_chunks = first.chunks
+
+    def __call__(self, slices):
+        t = slices[0]
+        rest = slices[1:]
+        parts = []
+        for i, ds in enumerate(self._datasets):
+            f0 = int(self._cum[i])
+            f1 = int(self._cum[i + 1])
+            if f1 <= t.start or f0 >= t.stop:
+                continue
+            local = (slice(max(0, t.start - f0), min(f1 - f0, t.stop - f0)),) + rest
+            parts.append(ds[local])
+        if not parts:
+            return np.empty((0,) + self.shape[1:], dtype=self.dtype)
+        return np.concatenate(parts, axis=0)
+
+
+class _ConcatTimeSourceUnstaggered(_ConcatTimeSource):
+    """
+    Variant of ``_ConcatTimeSource`` that exposes a virtual unstaggered view
+    of a source variable that is staggered on a single spatial axis (e.g.
+    WRF's U is staggered on the x axis, V on the y axis).
+
+    The exposed shape is the file shape with ``stagger_axis`` reduced by 1.
+    On read, the wrapper extends the slice on ``stagger_axis`` by 1 and applies
+    the trapezoidal-mean unstagger.
+    """
+
+    def __init__(self, h5_files: list, var_name: str, file_lens: list, stagger_axis: int):
+        super().__init__(h5_files, var_name, file_lens)
+        if stagger_axis <= 0 or stagger_axis >= len(self.shape):
+            raise ValueError(f'stagger_axis must be a spatial axis: got {stagger_axis}')
+        self._stagger_axis = stagger_axis
+        # Unstaggered shape is shape with stagger_axis - 1.
+        self.shape = (
+            self.shape[:stagger_axis]
+            + (self.shape[stagger_axis] - 1,)
+            + self.shape[stagger_axis + 1:]
+        )
+        # Source chunks aren't critical for correctness; let the caller fall
+        # back to ``rechunkit.guess_chunk_shape`` when None.
+        self.source_chunks = None
+
+    def __call__(self, slices):
+        # Extend the staggered axis slice by 1 to read the staggered range,
+        # then unstagger the result along that axis.
+        ax = self._stagger_axis
+        s = slices[ax]
+        extended = slice(s.start, s.stop + 1)
+        modified = slices[:ax] + (extended,) + slices[ax + 1:]
+        raw = super().__call__(modified)
+        lo = (slice(None),) * ax + (slice(None, -1),)
+        hi = (slice(None),) * ax + (slice(1, None),)
+        return (raw[lo] + raw[hi]) / 2.0
 
 
 class H5Ingest:
@@ -468,9 +546,15 @@ class H5Ingest:
                 transform = info.get('transform')
                 if transform == 'accumulation_increment':
                     accumulation_items.append(item)
-                elif transform is None and len(info['source_vars']) == 1:
+                elif len(info['source_vars']) == 1 and (
+                    transform is None or self._get_block_transform(transform) is not None
+                ):
+                    # Single source: simple rechunker handles both no-transform
+                    # and registered block-transform cases. The transform (if any)
+                    # is applied per yielded block inside _populate_with_rechunkit.
                     rechunkit_items.append(item)
                 elif self._get_block_transform(transform) is not None:
+                    # Multi-source with registered block transform.
                     multi_rechunkit_items.append(item)
                 else:
                     batch_items.append(item)
@@ -510,9 +594,8 @@ class H5Ingest:
 
             for var_key, data_var, vert_indices in accumulation_items:
                 self._setup_populate(var_key, target_levels)
-                self._prev_accum_total = None
-                self._populate_per_timestep(data_var, var_key, time_mask, spatial_slice, vert_indices, max_mem, is_accumulation=True,
-                                            filtered_y=filtered_y, filtered_x=filtered_x)
+                self._populate_with_accumulation(data_var, var_key, time_mask, spatial_slice, chunk_4d, max_mem, vert_indices,
+                                                  filtered_y=filtered_y, filtered_x=filtered_x)
 
             if multi_rechunkit_items:
                 for var_key, _, _ in multi_rechunkit_items:
@@ -637,6 +720,34 @@ class H5Ingest:
         """
         return None
 
+    def _files_for_var(self, var_key):
+        """
+        Return a time-ordered list of source file paths contributing to
+        ``var_key``. Default: every input file (correct for WRF, where each
+        wrfout file contains every variable). Subclasses with one-var-per-file
+        layouts (e.g. ERA5) override this.
+        """
+        return list(self.input_paths)
+
+    def _make_source(self, src_name, h5_files, file_lens):
+        """
+        Build a virtual rechunker source for ``src_name`` over ``h5_files``.
+
+        Default returns a plain ``_ConcatTimeSource``. Subclasses override to
+        wrap staggered source variables (e.g. WRF U is x-staggered, V is
+        y-staggered) so the rechunker sees the unstaggered shape.
+        """
+        return _ConcatTimeSource(h5_files, src_name, file_lens)
+
+    def _post_block_transform(self, block, var_key, source_ndim):
+        """
+        Apply source-format-specific transforms to a rechunker-yielded block
+        before it is written to cfdb. Default: identity. ERA5 overrides for
+        latitude reversal and ``geopotential_to_height``. Phase-2 work will
+        unify this with the ``_BLOCK_TRANSFORMS`` registry.
+        """
+        return block
+
     def _create_cfdb_data_var(self, ds, cfdb_name, coord_names, chunk_shape):
         """
         Create a cfdb data variable using the template method for cfdb_name.
@@ -694,19 +805,132 @@ class H5Ingest:
                                  chunk_4d=None, filtered_y=None, filtered_x=None):
         """
         Populate a simple (no-transform, single source var) data variable using
-        rechunkit for optimized HDF5 chunk reads.
+        a single rechunkit call across all input files.
 
-        vert_indices is a list of vertical indices. For surface variables with
-        a length-1 height coordinate, this is [0].
+        Opens every file contributing to ``var_key`` at once via ``ExitStack``
+        and presents them to ``rechunkit.rechunker`` as one virtual time-major
+        array (``_ConcatTimeSource``). Rechunker accumulates source reads
+        until it has a full ``target_chunks`` block to yield, so each cfdb
+        chunk is written exactly once regardless of source file granularity.
 
-        chunk_4d, when provided, sets the time dim of rechunkit's target_chunks
-        so yielded blocks line up with the cfdb output chunk shape and writes
-        can be coalesced across multiple timesteps.
+        ``chunk_4d``, when provided, sets the time dim of rechunkit's
+        ``target_chunks`` so blocks align with the cfdb output chunk shape.
+
+        Heterogeneous-grid runs fall back to the per-file path until the
+        cross-file path supports per-file spatial remapping.
+        """
+        if self._heterogeneous_grids:
+            return self._populate_with_rechunkit_per_file(
+                data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices,
+                chunk_4d=chunk_4d, filtered_y=filtered_y, filtered_x=filtered_x,
+            )
+
+        src_var = self.variables[var_key]['source_vars'][0]
+        target_t = chunk_4d[0] if chunk_4d is not None else 1
+        paths = self._files_for_var(var_key)
+        if not paths:
+            return
+
+        # output_map: unique_time_idx -> output_time_idx (compacted by time_mask)
+        output_map = {}
+        out_idx = 0
+        for u_idx in range(len(time_mask)):
+            if time_mask[u_idx]:
+                output_map[u_idx] = out_idx
+                out_idx += 1
+
+        # raw_to_unique: maps each raw global time index (concatenated across
+        # files) to a unique time index, or -1 for duplicates from overlapping
+        # files. Reuses ``self._raw_to_unique`` when paths match input_paths.
+        raw_to_unique = self._get_raw_to_unique(paths)
+
+        with ExitStack() as stack:
+            h5_files = [stack.enter_context(h5py.File(p, 'r')) for p in paths]
+            file_lens = [int(h5[src_var].shape[0]) for h5 in h5_files]
+            source = self._make_source(src_var, h5_files, file_lens)
+            source_chunks = source.source_chunks or rechunkit.guess_chunk_shape(
+                source.shape, source.dtype.itemsize, max_mem,
+            )
+
+            y_sl, x_sl = spatial_slice
+            spatial_axes = source.shape[1:]
+            if len(spatial_axes) == 2:
+                y_start, y_stop, _ = y_sl.indices(spatial_axes[0])
+                x_start, x_stop, _ = x_sl.indices(spatial_axes[1])
+                sel = (slice(0, source.shape[0]),
+                       slice(y_start, y_stop), slice(x_start, x_stop))
+                target_chunks = (target_t, y_stop - y_start, x_stop - x_start)
+            elif len(spatial_axes) == 3:
+                # 4D source: (T, Z, Y, X)
+                nz = spatial_axes[0]
+                y_start, y_stop, _ = y_sl.indices(spatial_axes[1])
+                x_start, x_stop, _ = x_sl.indices(spatial_axes[2])
+                sel = (slice(0, source.shape[0]), slice(0, nz),
+                       slice(y_start, y_stop), slice(x_start, x_stop))
+                target_chunks = (target_t, nz, y_stop - y_start, x_stop - x_start)
+            else:
+                raise ValueError(f'Unsupported source ndim {len(source.shape)} for {var_key!r}')
+
+            # Optional block transform for single-source-with-transform vars
+            # (e.g. ERA5 ``geopotential_to_height``). Applied per yielded block,
+            # after layout corrections from ``_post_block_transform``.
+            transform_name = self.variables[var_key].get('transform')
+            block_fn = self._get_block_transform(transform_name)
+
+            for write_slices, data in rechunkit.rechunker(
+                source, source.shape, source.dtype,
+                source_chunks, target_chunks, max_mem, sel=sel,
+            ):
+                block = self._post_block_transform(data, src_var, len(source.shape))
+                if block_fn is not None:
+                    block = block_fn({src_var: block}, y_sl, x_sl, {})
+                n_block = write_slices[0].stop - write_slices[0].start
+                t_outs = [None] * n_block
+                for i in range(n_block):
+                    raw = write_slices[0].start + i
+                    u = int(raw_to_unique[raw])
+                    if u != -1 and u in output_map:
+                        t_outs[i] = output_map[u]
+                self._write_block_from_t_outs(
+                    data_var, block, t_outs, vert_indices, None, None,
+                )
+
+    def _get_raw_to_unique(self, paths):
+        """
+        Map raw global time indices (concatenated across ``paths``) to unique
+        time indices in ``self.times``, or -1 for duplicates from overlapping
+        files. Reuses ``self._raw_to_unique`` when ``paths == self.input_paths``;
+        otherwise rebuilds for the given paths (cheap — only Times reads).
+        """
+        if hasattr(self, '_raw_to_unique') and list(paths) == list(self.input_paths):
+            return self._raw_to_unique
+
+        all_times = []
+        for path in paths:
+            with h5py.File(path, 'r') as h5:
+                all_times.append(self._parse_time(h5))
+        combined = np.concatenate(all_times)
+        time_to_unique = {t: i for i, t in enumerate(self.times)}
+        result = np.full(len(combined), -1, dtype='int64')
+        seen = set()
+        for raw_i, t in enumerate(combined):
+            u = time_to_unique.get(t, -1)
+            if u == -1 or u in seen:
+                continue
+            seen.add(u)
+            result[raw_i] = u
+        return result
+
+    def _populate_with_rechunkit_per_file(self, data_var, var_key, time_mask, spatial_slice,
+                                          max_mem, vert_indices, chunk_4d=None,
+                                          filtered_y=None, filtered_x=None):
+        """
+        Legacy per-file rechunkit populate. Retained for the heterogeneous-grid
+        case until the cross-file path supports per-file spatial remapping.
         """
         src_var = self.variables[var_key]['source_vars'][0]
         y_sl, x_sl = spatial_slice
 
-        # Pre-compute unique_time_idx -> output_time_idx mapping
         output_map = {}
         out_idx = 0
         for u_idx in range(len(time_mask)):
@@ -734,7 +958,6 @@ class H5Ingest:
             t_stop = file_mask[-1] + 1
 
             with h5py.File(path, 'r') as h5:
-                # Per-file spatial mapping when grids differ
                 if self._heterogeneous_grids and filtered_y is not None:
                     fy_sl, fx_sl, y_off, x_off = self._get_file_spatial_mapping(
                         h5, filtered_y, filtered_x)
@@ -750,13 +973,11 @@ class H5Ingest:
                     h5_var.shape, h5_var.dtype.itemsize, max_mem
                 )
 
-                # Build explicit sel (rechunkit requires non-None start/stop)
                 y_start, y_stop, _ = fy_sl.indices(h5_var.shape[1])
                 x_start, x_stop, _ = fx_sl.indices(h5_var.shape[2])
                 ny = y_stop - y_start
                 nx = x_stop - x_start
                 sel = (slice(t_start, t_stop), slice(y_start, y_stop), slice(x_start, x_stop))
-
                 target_chunks = (target_t, ny, nx)
 
                 y_write = slice(y_off, y_off + ny) if y_off > 0 or self._heterogeneous_grids else None
@@ -881,27 +1102,97 @@ class H5Ingest:
     def _populate_with_multi_rechunker(self, items, time_mask, spatial_slice, chunk_4d, max_mem,
                                        filtered_y=None, filtered_x=None):
         """
-        Populate one or more transform variables using rechunkit-batched reads
-        across the union of source variables, applying a block-mode transform
-        per item and writing each output as a coalesced multi-timestep slab.
+        Populate one or more transform variables using a single
+        ``_multi_rechunker`` call across all input files.
+
+        Opens every file contributing to the union of source variables at once
+        via ``ExitStack``, presents each source variable's files as a
+        ``_ConcatTimeSource``, and feeds them to ``_multi_rechunker``. Each
+        cfdb chunk is written exactly once.
 
         Each item in ``items`` is ``(var_key, data_var, vert_indices)``. Every
         ``var_key`` must have a registered block transform (see
         ``_get_block_transform``); single-source no-transform items go through
         ``_populate_with_rechunkit`` instead.
 
-        Assumes all source variables across all items share the same shape,
-        dtype, and HDF5 chunk layout — true for WRF 2D surface fields.
+        Assumes all source variables share the same shape, dtype, and HDF5
+        chunk layout (true for WRF 2D surface fields and ERA5 pressure-level
+        VIMF sources). Heterogeneous-grid runs fall back to the per-file path.
         """
         if not items:
             return
+        if self._heterogeneous_grids:
+            return self._populate_with_multi_rechunker_per_file(
+                items, time_mask, spatial_slice, chunk_4d, max_mem,
+                filtered_y=filtered_y, filtered_x=filtered_x,
+            )
 
-        # Union of source variable names across all items.
+        # Group items by their (source-paths, spatial-shape) signature so each
+        # multi_rechunker call sees a consistent shape across sources. Items
+        # whose source vars all share the same spatial shape and resolve to the
+        # same files can co-batch — e.g. all WRF 2D-surface transforms together,
+        # all 3D-source column-integrated together. ERA5's Z_PL/Z_INV split into
+        # separate groups because their 'Z' source resolves to different files.
+        groups = self._group_items_for_multi_rechunker(items)
+        for group in groups:
+            self._populate_with_multi_rechunker_group(
+                group, time_mask, spatial_slice, chunk_4d, max_mem,
+                filtered_y=filtered_y, filtered_x=filtered_x,
+            )
+
+    def _group_items_for_multi_rechunker(self, items):
+        """
+        Partition items into groups whose source vars share spatial shape, so
+        each group reads its union of sources in a single ``_multi_rechunker``
+        call. Items with overlapping but distinct source-var sets (e.g. WRF
+        PWAT / PWAT_TR / VIMF_U / VIMF_V — all 3D) batch together so common
+        sources (QVAPOR, P, PB) are read once instead of once per item.
+
+        Per-source-var path consistency is implicit: WRF has every variable in
+        every input file, and ERA5 routes its ambiguous-source items
+        (Z_PL/Z_INV both with source 'Z') through the single-source path.
+        """
+        shape_cache = {}
+
+        def _src_spatial(sv):
+            if sv in shape_cache:
+                return shape_cache[sv]
+            paths = self._files_for_var(sv)
+            with h5py.File(paths[0], 'r') as h5:
+                src = self._make_source(sv, [h5], [int(h5[sv].shape[0])])
+                shape_cache[sv] = src.shape[1:]
+            return shape_cache[sv]
+
+        groups = {}
+        for item in items:
+            var_key, _, _ = item
+            info = self.variables[var_key]
+            spatials = {_src_spatial(sv) for sv in info['source_vars']}
+            if len(spatials) != 1:
+                raise ValueError(
+                    f'{var_key!r}: source variables have inconsistent spatial shapes {spatials}'
+                )
+            key = next(iter(spatials))
+            groups.setdefault(key, []).append(item)
+        return list(groups.values())
+
+    def _populate_with_multi_rechunker_group(self, items, time_mask, spatial_slice,
+                                              chunk_4d, max_mem,
+                                              filtered_y=None, filtered_x=None):
+        """Run a single ``_multi_rechunker`` call for a shape-compatible group."""
+        # Union of source variable names across all items in this group.
         all_sources = set()
         for var_key, _, _ in items:
             for src in self.variables[var_key]['source_vars']:
                 all_sources.add(src)
         all_sources = sorted(all_sources)
+
+        # Per-source-var paths via the same hook used for the single-source
+        # path. WRF: every wrfout has every var → all paths. ERA5: var-specific.
+        paths_per_src = {sv: self._files_for_var(sv) for sv in all_sources}
+        for sv, paths in paths_per_src.items():
+            if not paths:
+                raise ValueError(f'No source files found for {sv!r}')
 
         # Pre-compute unique_time_idx -> output_time_idx mapping.
         output_map = {}
@@ -914,6 +1205,134 @@ class H5Ingest:
         target_t = chunk_4d[0] if chunk_4d is not None else 1
 
         # Resolve block transform callables once per item.
+        item_transforms = []
+        for var_key, data_var, vert_indices in items:
+            transform_name = self.variables[var_key].get('transform')
+            fn = self._get_block_transform(transform_name)
+            if fn is None:
+                raise RuntimeError(
+                    f'No block transform registered for {var_key!r} '
+                    f'(transform={transform_name!r}); should not be in multi_rechunker_items.'
+                )
+            item_transforms.append((var_key, data_var, vert_indices, fn))
+
+        # raw_to_unique mapping for the time axis. All source vars are assumed
+        # to have synchronised time coverage (validated below by shape match).
+        ref_paths = paths_per_src[all_sources[0]]
+        raw_to_unique = self._get_raw_to_unique(ref_paths)
+
+        y_sl, x_sl = spatial_slice
+
+        # Open each unique path once, then point each source var's
+        # ``_ConcatTimeSource`` at the relevant subset.
+        unique_paths = []
+        for sv in all_sources:
+            for p in paths_per_src[sv]:
+                if p not in unique_paths:
+                    unique_paths.append(p)
+
+        with ExitStack() as stack:
+            h5_by_path = {p: stack.enter_context(h5py.File(p, 'r')) for p in unique_paths}
+
+            sources = {}
+            ref_shape = None
+            ref_dtype = None
+            ref_source_chunks = None
+            for sv in all_sources:
+                h5_files = [h5_by_path[p] for p in paths_per_src[sv]]
+                file_lens = [int(h5[sv].shape[0]) for h5 in h5_files]
+                src = self._make_source(sv, h5_files, file_lens)
+                sources[sv] = src
+                if ref_shape is None:
+                    ref_shape = src.shape
+                    ref_dtype = src.dtype
+                    ref_source_chunks = src.source_chunks
+                elif src.shape != ref_shape:
+                    raise ValueError(
+                        f'Source-var shape mismatch in multi-rechunker: {sv} has {src.shape}, '
+                        f'expected {ref_shape} (all sources must share shape including the time axis)'
+                    )
+
+            if ref_source_chunks is None:
+                ref_source_chunks = rechunkit.guess_chunk_shape(
+                    ref_shape, ref_dtype.itemsize, max_mem,
+                )
+
+            spatial_axes = ref_shape[1:]
+            if len(spatial_axes) == 2:
+                y_start, y_stop, _ = y_sl.indices(spatial_axes[0])
+                x_start, x_stop, _ = x_sl.indices(spatial_axes[1])
+                sel = (slice(0, ref_shape[0]),
+                       slice(y_start, y_stop), slice(x_start, x_stop))
+                target_chunks = (target_t, y_stop - y_start, x_stop - x_start)
+            elif len(spatial_axes) == 3:
+                # 4D source: (T, Z, Y, X)
+                nz = spatial_axes[0]
+                y_start, y_stop, _ = y_sl.indices(spatial_axes[1])
+                x_start, x_stop, _ = x_sl.indices(spatial_axes[2])
+                sel = (slice(0, ref_shape[0]), slice(0, nz),
+                       slice(y_start, y_stop), slice(x_start, x_stop))
+                target_chunks = (target_t, nz, y_stop - y_start, x_stop - x_start)
+            else:
+                raise ValueError(f'Unsupported source ndim {len(ref_shape)}')
+
+            # Wrap virtual sources as callables for ``_multi_rechunker``.
+            source_callables = {sv: src.__call__ for sv, src in sources.items()}
+
+            for write_slices, data_blocks in self._multi_rechunker(
+                source_callables, ref_shape, ref_dtype, ref_source_chunks,
+                target_chunks, max_mem, sel,
+            ):
+                # Apply per-source-var post-block transform (e.g. lat reversal)
+                # before any block transforms run.
+                data_blocks_post = {
+                    sv: self._post_block_transform(b, sv, len(ref_shape))
+                    for sv, b in data_blocks.items()
+                }
+
+                n_block = write_slices[0].stop - write_slices[0].start
+                t_outs = [None] * n_block
+                for i in range(n_block):
+                    raw = write_slices[0].start + i
+                    u = int(raw_to_unique[raw])
+                    if u != -1 and u in output_map:
+                        t_outs[i] = output_map[u]
+
+                block_cache = {}
+                for var_key, data_var, vert_indices, fn in item_transforms:
+                    item_sources = {
+                        sv: data_blocks_post[sv]
+                        for sv in self.variables[var_key]['source_vars']
+                    }
+                    block_data = fn(item_sources, y_sl, x_sl, block_cache)
+                    self._write_block_from_t_outs(
+                        data_var, block_data, t_outs, vert_indices, None, None,
+                    )
+
+    def _populate_with_multi_rechunker_per_file(self, items, time_mask, spatial_slice, chunk_4d, max_mem,
+                                                filtered_y=None, filtered_x=None):
+        """
+        Legacy per-file multi-rechunker. Retained for the heterogeneous-grid
+        case until the cross-file path supports per-file spatial remapping.
+        """
+        if not items:
+            return
+
+        all_sources = set()
+        for var_key, _, _ in items:
+            for src in self.variables[var_key]['source_vars']:
+                all_sources.add(src)
+        all_sources = sorted(all_sources)
+
+        output_map = {}
+        out_idx = 0
+        for u_idx in range(len(time_mask)):
+            if time_mask[u_idx]:
+                output_map[u_idx] = out_idx
+                out_idx += 1
+
+        target_t = chunk_4d[0] if chunk_4d is not None else 1
+
         item_transforms = []
         for var_key, data_var, vert_indices in items:
             transform_name = self.variables[var_key].get('transform')
@@ -954,7 +1373,6 @@ class H5Ingest:
                     fy_sl, fx_sl = y_sl, x_sl
                     y_off, x_off = 0, 0
 
-                # Use the first source's shape/chunks/dtype as the shared reference.
                 ref = h5[all_sources[0]]
                 source_chunks = ref.chunks or rechunkit.guess_chunk_shape(
                     ref.shape, ref.dtype.itemsize, max_mem,
@@ -987,6 +1405,144 @@ class H5Ingest:
                         )
 
             raw_offset += n_file_times
+
+    def _populate_with_accumulation(self, data_var, var_key, time_mask, spatial_slice,
+                                    chunk_4d, max_mem, vert_indices,
+                                    filtered_y=None, filtered_x=None):
+        """
+        Populate an ``accumulation_increment`` variable (e.g. WRF RAINNC+RAINC)
+        using a single cross-file rechunker call, with stateful prev-block
+        tracking so that each cfdb chunk is written exactly once.
+
+        Sources are summed (with WRF bucket-counter reconstruction when
+        ``BUCKET_MM > 0``) into a per-block cumulative ``total``; the increment
+        is ``np.diff`` along the time axis, with the previous block's last
+        cumulative carried forward via ``self._prev_accum_total``. The very
+        first timestep of the entire conversion is NaN (no prior).
+        """
+        if self._heterogeneous_grids:
+            # Fall back to legacy per-timestep path for heterogeneous grids.
+            self._prev_accum_total = None
+            self._populate_per_timestep(
+                data_var, var_key, time_mask, spatial_slice, vert_indices, max_mem,
+                is_accumulation=True, filtered_y=filtered_y, filtered_x=filtered_x,
+            )
+            return
+
+        info = self.variables[var_key]
+        source_vars = list(info['source_vars'])
+        target_t = chunk_4d[0] if chunk_4d is not None else 1
+
+        paths = self._files_for_var(var_key)
+        if not paths:
+            return
+
+        # Probe the first file for WRF bucket counter setup. If BUCKET_MM > 0
+        # and ``I_<name>`` exists for any source, the cumulative reconstruction
+        # is ``<name> + BUCKET_MM * I_<name>`` per source (see
+        # ``_accumulation_source_sum`` for the per-timestep equivalent).
+        bucket_mm = 0.0
+        bucket_vars = []
+        with h5py.File(paths[0], 'r') as h5:
+            attr = h5.attrs.get('BUCKET_MM', -1.0)
+            try:
+                bucket_mm = float(np.asarray(attr).item())
+            except Exception:
+                bucket_mm = -1.0
+            if bucket_mm > 0.0:
+                for sv in source_vars:
+                    if 'I_' + sv in h5:
+                        bucket_vars.append('I_' + sv)
+        use_bucket = bucket_mm > 0.0 and len(bucket_vars) > 0
+        all_sources = source_vars + bucket_vars
+
+        output_map = {}
+        out_idx = 0
+        for u_idx in range(len(time_mask)):
+            if time_mask[u_idx]:
+                output_map[u_idx] = out_idx
+                out_idx += 1
+
+        raw_to_unique = self._get_raw_to_unique(paths)
+
+        y_sl, x_sl = spatial_slice
+        self._prev_accum_total = None
+
+        with ExitStack() as stack:
+            h5_files = [stack.enter_context(h5py.File(p, 'r')) for p in paths]
+
+            sources = {}
+            ref_shape = None
+            ref_dtype = None
+            ref_source_chunks = None
+            for sv in all_sources:
+                file_lens = [int(h5[sv].shape[0]) for h5 in h5_files]
+                src = self._make_source(sv, h5_files, file_lens)
+                sources[sv] = src
+                if ref_shape is None:
+                    ref_shape = src.shape
+                    ref_dtype = src.dtype
+                    ref_source_chunks = src.source_chunks
+
+            if ref_source_chunks is None:
+                ref_source_chunks = rechunkit.guess_chunk_shape(
+                    ref_shape, ref_dtype.itemsize, max_mem,
+                )
+
+            spatial_axes = ref_shape[1:]
+            if len(spatial_axes) != 2:
+                raise ValueError(
+                    f'accumulation_increment expects 2D-spatial sources, got {ref_shape}'
+                )
+            y_start, y_stop, _ = y_sl.indices(spatial_axes[0])
+            x_start, x_stop, _ = x_sl.indices(spatial_axes[1])
+            sel = (slice(0, ref_shape[0]),
+                   slice(y_start, y_stop), slice(x_start, x_stop))
+            target_chunks = (target_t, y_stop - y_start, x_stop - x_start)
+
+            source_callables = {sv: src.__call__ for sv, src in sources.items()}
+
+            for write_slices, data_blocks in self._multi_rechunker(
+                source_callables, ref_shape, ref_dtype, ref_source_chunks,
+                target_chunks, max_mem, sel,
+            ):
+                # Apply post-block transform (e.g. ERA5 lat reversal — currently
+                # no ERA5 var has accumulation_increment, but be consistent).
+                blocks = {
+                    sv: self._post_block_transform(b, sv, len(ref_shape))
+                    for sv, b in data_blocks.items()
+                }
+
+                # Cumulative total for this block, with optional bucket-counter
+                # reconstruction.
+                total = sum(blocks[sv].astype('float64') for sv in source_vars)
+                if use_bucket:
+                    bucket_sum = sum(blocks[bv].astype('float64') for bv in bucket_vars)
+                    total = total + bucket_mm * bucket_sum
+
+                # Increment along time axis. First timestep of the very first
+                # block has no prior → NaN; otherwise diff against the previous
+                # block's saved last timestep.
+                n_block = total.shape[0]
+                diff = np.empty_like(total)
+                if self._prev_accum_total is None:
+                    diff[0] = np.nan
+                else:
+                    diff[0] = total[0] - self._prev_accum_total
+                if n_block > 1:
+                    diff[1:] = total[1:] - total[:-1]
+                self._prev_accum_total = total[-1].copy()
+
+                t_outs = [None] * n_block
+                for i in range(n_block):
+                    raw = write_slices[0].start + i
+                    u = int(raw_to_unique[raw])
+                    if u != -1 and u in output_map:
+                        t_outs[i] = output_map[u]
+
+                self._write_block_from_t_outs(
+                    data_var, diff.astype('float32'), t_outs, vert_indices, None, None,
+                )
 
     def _populate_per_timestep(self, data_var, var_key, time_mask, spatial_slice, vert_indices, max_mem, is_accumulation,
                                filtered_y=None, filtered_x=None):

@@ -1269,12 +1269,30 @@ class WrfIngest(H5Ingest):
         'sea_level_pressure': '_block_sea_level_pressure',
         'land_sea_mask': '_block_land_sea_mask',
         'precip_sum': '_block_precip_sum',
+        'precipitable_water': '_block_precipitable_water',
+        'precipitable_water_tracer': '_block_precipitable_water_tracer',
+        'vimf_u': '_block_vimf_u',
+        'vimf_v': '_block_vimf_v',
     }
 
     def _get_block_transform(self, transform_name):
         """Return a bound block-transform method for ``transform_name``, or None."""
         method = self._BLOCK_TRANSFORMS.get(transform_name)
         return getattr(self, method) if method is not None else None
+
+    def _make_source(self, src_name, h5_files, file_lens):
+        """
+        Override the base virtual-source builder to wrap WRF's staggered
+        source variables. ``U`` is staggered on the x axis (last); ``V`` on
+        the y axis (second-to-last). Both 4D variables expose unstaggered
+        shape to rechunker, with the trapezoidal mean applied on read.
+        """
+        from cfdb_ingest.base import _ConcatTimeSourceUnstaggered, _ConcatTimeSource
+        if src_name == 'U':
+            return _ConcatTimeSourceUnstaggered(h5_files, 'U', file_lens, stagger_axis=3)
+        if src_name == 'V':
+            return _ConcatTimeSourceUnstaggered(h5_files, 'V', file_lens, stagger_axis=2)
+        return _ConcatTimeSource(h5_files, src_name, file_lens)
 
     def _block_rotated_wind_2d(self, sources, y_sl, x_sl, block_cache):
         """
@@ -1377,6 +1395,74 @@ class WrfIngest(H5Ingest):
         # Sum the pre-computed hourly precipitation source vars (e.g. PREC_ACC_C + PREC_ACC_NC).
         total = sum(arr.astype('float64') for arr in sources.values())
         return total.astype('float32')
+
+    # ------------------------------------------------------------------
+    # Column-integrated block transforms (4D source, 3D output).
+    # Sources are aligned on the unstaggered grid; reduction is along axis=1
+    # (the eta-level axis). dp is shared between PWAT and VIMF via block_cache.
+    # ------------------------------------------------------------------
+
+    def _block_dp(self, sources, block_cache):
+        """Pressure layer thickness on eta levels, shape (N, nz, ny, nx)."""
+        if 'dp' in block_cache:
+            return block_cache['dp']
+        p = sources['P'].astype('float64')
+        pb = sources['PB'].astype('float64')
+        pressure = p + pb
+        # Layer thickness via midpoint differences along the z axis (axis=1).
+        dp = np.empty_like(pressure)
+        dp[:, 0] = pressure[:, 0] - pressure[:, 1]
+        dp[:, -1] = pressure[:, -2] - pressure[:, -1]
+        dp[:, 1:-1] = (pressure[:, :-2] - pressure[:, 2:]) / 2.0
+        dp = np.abs(dp)
+        block_cache['dp'] = dp
+        return dp
+
+    def _block_rotated_wind_3d(self, sources, y_sl, x_sl, block_cache):
+        """
+        Earth-relative U/V on the unstaggered grid, shape (N, nz, ny, nx).
+        Sources ``U`` and ``V`` are unstaggered upstream by ``_make_source``.
+        """
+        if 'wind_3d' in block_cache:
+            return block_cache['wind_3d']
+        u_grid = sources['U'].astype('float64')
+        v_grid = sources['V'].astype('float64')
+        if self._cosalpha is not None:
+            cosa = self._cosalpha[y_sl, x_sl]
+            sina = self._sinalpha[y_sl, x_sl]
+            u_earth = u_grid * cosa + v_grid * sina
+            v_earth = -u_grid * sina + v_grid * cosa
+        else:
+            u_earth, v_earth = u_grid, v_grid
+        result = (u_earth, v_earth)
+        block_cache['wind_3d'] = result
+        return result
+
+    def _block_precipitable_water(self, sources, y_sl, x_sl, block_cache):
+        """PWAT = (1/g) * sum(QVAPOR * dp) over eta levels."""
+        q = sources['QVAPOR'].astype('float64')
+        dp = self._block_dp(sources, block_cache)
+        return (np.sum(q * dp, axis=1) / 9.80665).astype('float32')
+
+    def _block_precipitable_water_tracer(self, sources, y_sl, x_sl, block_cache):
+        """PWAT_TR = (1/g) * sum(qv_tr * dp) over eta levels."""
+        q = sources['qv_tr'].astype('float64')
+        dp = self._block_dp(sources, block_cache)
+        return (np.sum(q * dp, axis=1) / 9.80665).astype('float32')
+
+    def _block_vimf_u(self, sources, y_sl, x_sl, block_cache):
+        """VIMF_u = (1/g) * sum(QVAPOR * U_earth * dp) over eta levels."""
+        q = sources['QVAPOR'].astype('float64')
+        u_earth, _ = self._block_rotated_wind_3d(sources, y_sl, x_sl, block_cache)
+        dp = self._block_dp(sources, block_cache)
+        return (np.sum(q * u_earth * dp, axis=1) / 9.80665).astype('float32')
+
+    def _block_vimf_v(self, sources, y_sl, x_sl, block_cache):
+        """VIMF_v = (1/g) * sum(QVAPOR * V_earth * dp) over eta levels."""
+        q = sources['QVAPOR'].astype('float64')
+        _, v_earth = self._block_rotated_wind_3d(sources, y_sl, x_sl, block_cache)
+        dp = self._block_dp(sources, block_cache)
+        return (np.sum(q * v_earth * dp, axis=1) / 9.80665).astype('float32')
 
     def _setup_populate(self, var_key, target_levels):
         """Set up level-interpolation regrid function for 3D variables."""
