@@ -479,6 +479,48 @@ class TestBucketAwareAccumulation:
         # RAINNC at t=4 has wrapped — confirm our fix avoided that.
         assert np.all(got >= -1.0)
 
+    def test_negative_increment_is_clipped_to_zero(self, wrf_file_1, tmp_path):
+        """
+        WRF nudging and two-way feedback can occasionally reduce a parent-grid
+        accumulator between output steps, producing a negative RAINC+RAINNC
+        delta. Negative precip is non-physical and would wrap when stored in
+        cfdb's unsigned ``precip`` encoding (uint16, precision=2 → range
+        [0, 655.35] mm), so the increment computation must clip to zero.
+        """
+        import shutil
+        dst = tmp_path / 'wrfout_neg_delta.nc'
+        shutil.copy(wrf_file_1, dst)
+        with h5py.File(dst, 'r+') as h5:
+            n_t, ny, nx = h5['RAINNC'].shape
+            # Force a non-physical decrease at t=4 by zeroing RAINNC there.
+            # RAINNC at t=3 is whatever the source has (typically > 0 somewhere),
+            # so total[4] - total[3] is <= 0 at every pixel, and < 0 wherever
+            # the source had any rain by t=3.
+            rainnc = h5['RAINNC'][:]
+            rainnc[4] = 0.0
+            h5['RAINNC'][:] = rainnc
+
+        from cfdb_ingest.wrf import WrfIngest
+        ingest = WrfIngest(dst)
+        with h5py.File(dst, 'r') as h5:
+            # Confirm the test setup actually produces a negative raw delta
+            # somewhere (otherwise the assertion below is trivially true).
+            raw_delta = (h5['RAINNC'][4].astype('float64') + h5['RAINC'][4].astype('float64')) - (
+                h5['RAINNC'][3].astype('float64') + h5['RAINC'][3].astype('float64')
+            )
+            assert raw_delta.min() < -0.01, 'test setup did not produce a negative raw delta'
+
+            ingest._prev_accum_total = None
+            got = ingest._read_accumulation_increment(
+                h5, 'RAIN', 4, (slice(None), slice(None))
+            )
+        # All output values must be non-negative (clipped). Where the raw
+        # delta was negative, the clipped value should be exactly 0.
+        assert np.all(got >= 0.0), f'got contains negatives: min={got.min()}'
+        neg_mask = raw_delta < 0
+        if neg_mask.any():
+            np.testing.assert_array_equal(got[neg_mask], 0.0)
+
 
 # ======================================================================
 # Conversion — Filtering

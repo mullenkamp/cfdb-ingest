@@ -785,6 +785,11 @@ class H5Ingest:
         Sums all source_vars at current and previous timestep, returns the
         difference. Uses self._prev_accum_total for cross-file boundaries.
         Returns NaN for the very first overall timestep.
+
+        Negative increments are clipped to 0: the only current consumers are
+        precipitation accumulators which are physically non-negative, and
+        small negative deltas occasionally appear when WRF nudging or
+        two-way feedback retroactively reduces a parent-grid accumulator.
         """
         info = self.variables[var_key]
         source_vars = info['source_vars']
@@ -799,6 +804,7 @@ class H5Ingest:
         else:
             result = np.full_like(total, np.nan)
 
+        np.maximum(result, 0.0, out=result, where=~np.isnan(result))
         return result.astype('float32')
 
     def _populate_with_rechunkit(self, data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices,
@@ -1522,7 +1528,9 @@ class H5Ingest:
 
                 # Increment along time axis. First timestep of the very first
                 # block has no prior → NaN; otherwise diff against the previous
-                # block's saved last timestep.
+                # block's saved last timestep. Negative increments are clipped
+                # to 0 (precip can't go negative; nudging/feedback occasionally
+                # reduces parent-grid accumulators).
                 n_block = total.shape[0]
                 diff = np.empty_like(total)
                 if self._prev_accum_total is None:
@@ -1532,6 +1540,7 @@ class H5Ingest:
                 if n_block > 1:
                     diff[1:] = total[1:] - total[:-1]
                 self._prev_accum_total = total[-1].copy()
+                np.maximum(diff, 0.0, out=diff, where=~np.isnan(diff))
 
                 t_outs = [None] * n_block
                 for i in range(n_block):
