@@ -356,7 +356,7 @@ _WRF_DATASET_ATTRS = [
     'GRID_FDDA', 'GFDDA_INTERVAL_M',
     # Other
     'GWD_OPT', 'SF_LAKE_PHYSICS', 'SF_OCEAN_PHYSICS',
-    'SF_URBAN_PHYSICS', 'SST_UPDATE', 'PREC_ACC_DT',
+    'SF_URBAN_PHYSICS', 'SST_UPDATE',
 ]
 
 
@@ -536,23 +536,6 @@ class WrfIngest(H5Ingest):
 
         return {'x': x, 'y': y}
 
-    def _init_variables(self):
-        """
-        Override to prefer PREC_ACC_C/PREC_ACC_NC (pre-computed hourly precip)
-        over RAINC/RAINNC (running accumulations) when available, and also
-        allow precipitation when only PREC_ACC_* variables exist.
-        """
-        super()._init_variables()
-        with h5py.File(self.input_paths[0], 'r') as h5:
-            has_prec_acc = 'PREC_ACC_C' in h5 and 'PREC_ACC_NC' in h5
-        if has_prec_acc:
-            self.variables['RAIN'] = {
-                'cfdb_name': 'precip',
-                'source_vars': ['PREC_ACC_C', 'PREC_ACC_NC'],
-                'transform': 'precip_sum',
-                'height': 0.0,
-            }
-
     def _get_variable_mapping(self):
         """Return the WRF variable mapping dictionary."""
         return WRF_VARIABLE_MAPPING
@@ -608,9 +591,6 @@ class WrfIngest(H5Ingest):
 
         elif transform == 'accumulation_increment':
             return self._read_accumulation_increment(h5, var_key, time_idx, spatial_slice)
-
-        elif transform == 'precip_sum':
-            return self._read_precip_sum(h5, var_key, time_idx, spatial_slice)
 
         elif transform == 'wind_speed':
             u_earth, v_earth = self._read_rotated_wind(h5, time_idx, spatial_slice)
@@ -708,13 +688,6 @@ class WrfIngest(H5Ingest):
             return self._read_vimf_v(h5, time_idx, spatial_slice)
 
         raise ValueError(f'Unknown transform: {transform!r}')
-
-    def _read_precip_sum(self, h5, var_key, time_idx, spatial_slice):
-        """Sum pre-computed hourly precipitation fields (PREC_ACC_C + PREC_ACC_NC)."""
-        info = self.variables[var_key]
-        y_sl, x_sl = spatial_slice
-        total = sum(h5[sv][time_idx, y_sl, x_sl].astype('float64') for sv in info['source_vars'])
-        return total.astype('float32')
 
     def _read_rotated_wind(self, h5, time_idx, spatial_slice):
         """
@@ -1268,7 +1241,6 @@ class WrfIngest(H5Ingest):
         'vorticity': '_block_vorticity',
         'sea_level_pressure': '_block_sea_level_pressure',
         'land_sea_mask': '_block_land_sea_mask',
-        'precip_sum': '_block_precip_sum',
         'precipitable_water': '_block_precipitable_water',
         'precipitable_water_tracer': '_block_precipitable_water_tracer',
         'vimf_u': '_block_vimf_u',
@@ -1390,11 +1362,6 @@ class WrfIngest(H5Ingest):
     def _block_land_sea_mask(self, sources, y_sl, x_sl, block_cache):
         xland = sources['XLAND'].astype('float64')
         return np.where(xland < 1.5, 1.0, 0.0).astype('float32')
-
-    def _block_precip_sum(self, sources, y_sl, x_sl, block_cache):
-        # Sum the pre-computed hourly precipitation source vars (e.g. PREC_ACC_C + PREC_ACC_NC).
-        total = sum(arr.astype('float64') for arr in sources.values())
-        return total.astype('float32')
 
     # ------------------------------------------------------------------
     # Column-integrated block transforms (4D source, 3D output).
