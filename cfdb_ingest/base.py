@@ -212,6 +212,14 @@ class H5Ingest:
     def _init_variables(self):
         """
         Determine which mapped variables are available in the source files.
+
+        Mapping entries with a primary ``source_vars`` are checked first. If
+        all primary source vars exist in the wrfout, the entry is used as-is.
+        Otherwise, if the entry declares ``fallback_source_vars``, those are
+        checked and (if satisfied) promoted into the active source set with
+        the optional ``fallback_transform``. This lets the same cfdb output
+        name be served either by a native passthrough field or by an offline
+        computation from 3D source fields, depending on which the wrfout has.
         """
         mapping = self._get_variable_mapping()
 
@@ -221,6 +229,14 @@ class H5Ingest:
             for key, info in mapping.items():
                 if all(sv in source_vars for sv in info['source_vars']):
                     available[key] = info
+                elif 'fallback_source_vars' in info and \
+                        all(sv in source_vars for sv in info['fallback_source_vars']):
+                    promoted = dict(info)
+                    promoted['source_vars'] = info['fallback_source_vars']
+                    # Defensive .get() on both: tolerates a future entry that
+                    # omits 'transform' or 'fallback_transform' entirely.
+                    promoted['transform'] = info.get('fallback_transform', info.get('transform'))
+                    available[key] = promoted
 
         self.variables = available
 

@@ -251,10 +251,15 @@ WRF_VARIABLE_MAPPING = {
         'height': 'levels',
     },
     # --- Sea level pressure ---
+    # Native passthrough from WRF image >= wrf-auto-runs-intel-wvt:1.12, with
+    # fallback to the hypsometric computation for older wrfouts that only
+    # have PSFC/T2/HGT.
     'SLP': {
         'cfdb_name': 'mslp',
-        'source_vars': ['PSFC', 'T2', 'HGT'],
-        'transform': 'sea_level_pressure',
+        'source_vars': ['SLP'],
+        'transform': None,
+        'fallback_source_vars': ['PSFC', 'T2', 'HGT'],
+        'fallback_transform': 'sea_level_pressure',
         'height': 0.0,
     },
     # --- Geopotential height (for WPS intermediate files) ---
@@ -289,17 +294,21 @@ WRF_VARIABLE_MAPPING = {
         'transform': None,
         'height': 0.0,
     },
-    # --- Column-integrated variables (3D → 2D) ---
+    # --- Column-integrated variables (native 2D if WRF >= 1.12, else 3D→2D) ---
     'PWAT': {
         'cfdb_name': 'pwat',
-        'source_vars': ['QVAPOR', 'P', 'PB'],
-        'transform': 'precipitable_water',
+        'source_vars': ['PWAT'],
+        'transform': None,
+        'fallback_source_vars': ['QVAPOR', 'P', 'PB'],
+        'fallback_transform': 'precipitable_water',
         'height': 0.0,
     },
     'PWAT_TR': {
         'cfdb_name': 'pwat_tr',
-        'source_vars': ['qv_tr', 'P', 'PB'],
-        'transform': 'precipitable_water_tracer',
+        'source_vars': ['PWAT_TR'],
+        'transform': None,
+        'fallback_source_vars': ['qv_tr', 'P', 'PB'],
+        'fallback_transform': 'precipitable_water_tracer',
         'height': 0.0,
     },
     'RAIN_TR': {
@@ -310,14 +319,37 @@ WRF_VARIABLE_MAPPING = {
     },
     'VIMF_U': {
         'cfdb_name': 'vimf_u',
-        'source_vars': ['QVAPOR', 'U', 'V', 'P', 'PB'],
-        'transform': 'vimf_u',
+        'source_vars': ['VIMF_U'],
+        'transform': None,
+        'fallback_source_vars': ['QVAPOR', 'U', 'V', 'P', 'PB'],
+        'fallback_transform': 'vimf_u',
         'height': 0.0,
     },
     'VIMF_V': {
         'cfdb_name': 'vimf_v',
-        'source_vars': ['QVAPOR', 'U', 'V', 'P', 'PB'],
-        'transform': 'vimf_v',
+        'source_vars': ['VIMF_V'],
+        'transform': None,
+        'fallback_source_vars': ['QVAPOR', 'U', 'V', 'P', 'PB'],
+        'fallback_transform': 'vimf_v',
+        'height': 0.0,
+    },
+    # --- Tracer moisture flux and IVT magnitude (native only, WRF >= 1.12) ---
+    'VIMF_TR_U': {
+        'cfdb_name': 'vimf_tr_u',
+        'source_vars': ['VIMF_TR_U'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'VIMF_TR_V': {
+        'cfdb_name': 'vimf_tr_v',
+        'source_vars': ['VIMF_TR_V'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'IVT': {
+        'cfdb_name': 'ivt',
+        'source_vars': ['IVT'],
+        'transform': None,
         'height': 0.0,
     },
     # --- Soil variables ---
