@@ -251,10 +251,15 @@ WRF_VARIABLE_MAPPING = {
         'height': 'levels',
     },
     # --- Sea level pressure ---
+    # Native passthrough from WRF image >= wrf-auto-runs-intel-wvt:1.12, with
+    # fallback to the hypsometric computation for older wrfouts that only
+    # have PSFC/T2/HGT.
     'SLP': {
         'cfdb_name': 'mslp',
-        'source_vars': ['PSFC', 'T2', 'HGT'],
-        'transform': 'sea_level_pressure',
+        'source_vars': ['SLP'],
+        'transform': None,
+        'fallback_source_vars': ['PSFC', 'T2', 'HGT'],
+        'fallback_transform': 'sea_level_pressure',
         'height': 0.0,
     },
     # --- Geopotential height (for WPS intermediate files) ---
@@ -289,23 +294,62 @@ WRF_VARIABLE_MAPPING = {
         'transform': None,
         'height': 0.0,
     },
-    # --- Column-integrated variables (3D → 2D) ---
+    # --- Column-integrated variables (native 2D if WRF >= 1.12, else 3D→2D) ---
     'PWAT': {
         'cfdb_name': 'pwat',
-        'source_vars': ['QVAPOR', 'P', 'PB'],
-        'transform': 'precipitable_water',
+        'source_vars': ['PWAT'],
+        'transform': None,
+        'fallback_source_vars': ['QVAPOR', 'P', 'PB'],
+        'fallback_transform': 'precipitable_water',
+        'height': 0.0,
+    },
+    'PWAT_TR': {
+        'cfdb_name': 'pwat_tr',
+        'source_vars': ['PWAT_TR'],
+        'transform': None,
+        'fallback_source_vars': ['qv_tr', 'P', 'PB'],
+        'fallback_transform': 'precipitable_water_tracer',
+        'height': 0.0,
+    },
+    'RAIN_TR': {
+        'cfdb_name': 'precip_tr',
+        'source_vars': ['TR_RAINNC', 'TR_RAINC'],
+        'transform': 'accumulation_increment',
         'height': 0.0,
     },
     'VIMF_U': {
         'cfdb_name': 'vimf_u',
-        'source_vars': ['QVAPOR', 'U', 'V', 'P', 'PB'],
-        'transform': 'vimf_u',
+        'source_vars': ['VIMF_U'],
+        'transform': None,
+        'fallback_source_vars': ['QVAPOR', 'U', 'V', 'P', 'PB'],
+        'fallback_transform': 'vimf_u',
         'height': 0.0,
     },
     'VIMF_V': {
         'cfdb_name': 'vimf_v',
-        'source_vars': ['QVAPOR', 'U', 'V', 'P', 'PB'],
-        'transform': 'vimf_v',
+        'source_vars': ['VIMF_V'],
+        'transform': None,
+        'fallback_source_vars': ['QVAPOR', 'U', 'V', 'P', 'PB'],
+        'fallback_transform': 'vimf_v',
+        'height': 0.0,
+    },
+    # --- Tracer moisture flux and IVT magnitude (native only, WRF >= 1.12) ---
+    'VIMF_TR_U': {
+        'cfdb_name': 'vimf_tr_u',
+        'source_vars': ['VIMF_TR_U'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'VIMF_TR_V': {
+        'cfdb_name': 'vimf_tr_v',
+        'source_vars': ['VIMF_TR_V'],
+        'transform': None,
+        'height': 0.0,
+    },
+    'IVT': {
+        'cfdb_name': 'ivt',
+        'source_vars': ['IVT'],
+        'transform': None,
         'height': 0.0,
     },
     # --- Soil variables ---
@@ -344,7 +388,7 @@ _WRF_DATASET_ATTRS = [
     'GRID_FDDA', 'GFDDA_INTERVAL_M',
     # Other
     'GWD_OPT', 'SF_LAKE_PHYSICS', 'SF_OCEAN_PHYSICS',
-    'SF_URBAN_PHYSICS', 'SST_UPDATE', 'PREC_ACC_DT',
+    'SF_URBAN_PHYSICS', 'SST_UPDATE',
 ]
 
 
@@ -413,6 +457,7 @@ class WrfIngest(H5Ingest):
 
         self.x = spatial['x']
         self.y = spatial['y']
+        self._heterogeneous_grids = False
         self._dx = float(self.x[1] - self.x[0])
         self._dy = float(self.y[1] - self.y[0])
 
@@ -523,23 +568,6 @@ class WrfIngest(H5Ingest):
 
         return {'x': x, 'y': y}
 
-    def _init_variables(self):
-        """
-        Override to prefer PREC_ACC_C/PREC_ACC_NC (pre-computed hourly precip)
-        over RAINC/RAINNC (running accumulations) when available, and also
-        allow precipitation when only PREC_ACC_* variables exist.
-        """
-        super()._init_variables()
-        with h5py.File(self.input_paths[0], 'r') as h5:
-            has_prec_acc = 'PREC_ACC_C' in h5 and 'PREC_ACC_NC' in h5
-        if has_prec_acc:
-            self.variables['RAIN'] = {
-                'cfdb_name': 'precip',
-                'source_vars': ['PREC_ACC_C', 'PREC_ACC_NC'],
-                'transform': 'precip_sum',
-                'height': 0.0,
-            }
-
     def _get_variable_mapping(self):
         """Return the WRF variable mapping dictionary."""
         return WRF_VARIABLE_MAPPING
@@ -550,6 +578,36 @@ class WrfIngest(H5Ingest):
         attrs['source'] = self._source_title
         attrs.update(self._wrf_params)
         return attrs
+
+    def _accumulation_source_sum(self, h5, source_vars, time_idx, spatial_slice):
+        """
+        Sum source_vars with WRF bucket-counter reconstruction.
+
+        When BUCKET_MM > 0 is set on the wrfout file, WRF wraps accumulator
+        variables like RAINC/RAINNC periodically and stores the overflow
+        count in companion integer variables (I_RAINC/I_RAINNC). The true
+        cumulative total is ``<var> + BUCKET_MM * I_<var>``.
+
+        This override adds the bucket term for any source var that has a
+        companion ``I_<name>`` in the file. Backward compatible: when the
+        bucket is disabled (BUCKET_MM <= 0) or no I_<name> exists, behaves
+        identically to the base implementation.
+        """
+        y_sl, x_sl = spatial_slice
+
+        bucket_mm_attr = h5.attrs.get('BUCKET_MM', -1.0)
+        bucket_mm = float(np.asarray(bucket_mm_attr).item())
+        use_bucket = bucket_mm > 0.0
+
+        total = None
+        for sv in source_vars:
+            part = h5[sv][time_idx, y_sl, x_sl].astype('float64')
+            if use_bucket:
+                i_name = 'I_' + sv
+                if i_name in h5:
+                    part = part + bucket_mm * h5[i_name][time_idx, y_sl, x_sl].astype('float64')
+            total = part if total is None else total + part
+        return total
 
     def _read_variable(self, h5, var_key, time_idx, spatial_slice):
         """
@@ -565,9 +623,6 @@ class WrfIngest(H5Ingest):
 
         elif transform == 'accumulation_increment':
             return self._read_accumulation_increment(h5, var_key, time_idx, spatial_slice)
-
-        elif transform == 'precip_sum':
-            return self._read_precip_sum(h5, var_key, time_idx, spatial_slice)
 
         elif transform == 'wind_speed':
             u_earth, v_earth = self._read_rotated_wind(h5, time_idx, spatial_slice)
@@ -655,6 +710,9 @@ class WrfIngest(H5Ingest):
         elif transform == 'precipitable_water':
             return self._read_precipitable_water(h5, time_idx, spatial_slice)
 
+        elif transform == 'precipitable_water_tracer':
+            return self._read_precipitable_water_tracer(h5, time_idx, spatial_slice)
+
         elif transform == 'vimf_u':
             return self._read_vimf_u(h5, time_idx, spatial_slice)
 
@@ -662,13 +720,6 @@ class WrfIngest(H5Ingest):
             return self._read_vimf_v(h5, time_idx, spatial_slice)
 
         raise ValueError(f'Unknown transform: {transform!r}')
-
-    def _read_precip_sum(self, h5, var_key, time_idx, spatial_slice):
-        """Sum pre-computed hourly precipitation fields (PREC_ACC_C + PREC_ACC_NC)."""
-        info = self.variables[var_key]
-        y_sl, x_sl = spatial_slice
-        total = sum(h5[sv][time_idx, y_sl, x_sl].astype('float64') for sv in info['source_vars'])
-        return total.astype('float32')
 
     def _read_rotated_wind(self, h5, time_idx, spatial_slice):
         """
@@ -1152,6 +1203,23 @@ class WrfIngest(H5Ingest):
         pwat = np.sum(qvapor * dp, axis=0) / 9.80665
         return pwat.astype('float32')
 
+    def _read_precipitable_water_tracer(self, h5, time_idx, spatial_slice):
+        """
+        Compute tracer precipitable water by vertically integrating qv_tr.
+
+        PWAT_TR = (1/g) * sum(qv_tr * dp)  over all eta levels.
+
+        Returns
+        -------
+        np.ndarray
+            Tracer precipitable water in kg/m2, shape (ny, nx).
+        """
+        _, dp = self._compute_column_qvapor_dp(h5, time_idx, spatial_slice)
+        y_sl, x_sl = spatial_slice
+        qv_tr = h5['qv_tr'][time_idx, :, y_sl, x_sl].astype('float64')
+        pwat_tr = np.sum(qv_tr * dp, axis=0) / 9.80665
+        return pwat_tr.astype('float32')
+
     def _read_vimf_u(self, h5, time_idx, spatial_slice):
         """
         Compute eastward vertically integrated moisture flux.
@@ -1183,6 +1251,217 @@ class WrfIngest(H5Ingest):
         _, v_earth = self._read_rotated_wind_3d(h5, time_idx, spatial_slice)
         vimf_v = np.sum(qvapor * v_earth * dp, axis=0) / 9.80665
         return vimf_v.astype('float32')
+
+    # ------------------------------------------------------------------
+    # Block-mode (time-batched) transforms.
+    # Each takes ``sources`` = {src_name: ndarray of shape (N, ny, nx)} and
+    # returns an ndarray of shape (N, ny, nx). They share a per-block
+    # ``block_cache`` dict for intermediates that span multiple variables
+    # (e.g. earth-relative wind for both wind_speed and wind_direction).
+    # ------------------------------------------------------------------
+
+    _BLOCK_TRANSFORMS = {
+        'mixing_ratio_to_specific_humidity_2d': '_block_specific_humidity_2d',
+        'relative_humidity_2d': '_block_relative_humidity_2d',
+        'dew_point_2d': '_block_dew_point_2d',
+        'potential_temperature_2d': '_block_potential_temperature_2d',
+        'equivalent_potential_temperature_2d': '_block_equivalent_potential_temperature_2d',
+        'wind_speed': '_block_wind_speed',
+        'wind_direction': '_block_wind_direction',
+        'u_wind': '_block_u_wind',
+        'v_wind': '_block_v_wind',
+        'vorticity': '_block_vorticity',
+        'sea_level_pressure': '_block_sea_level_pressure',
+        'land_sea_mask': '_block_land_sea_mask',
+        'precipitable_water': '_block_precipitable_water',
+        'precipitable_water_tracer': '_block_precipitable_water_tracer',
+        'vimf_u': '_block_vimf_u',
+        'vimf_v': '_block_vimf_v',
+    }
+
+    def _get_block_transform(self, transform_name):
+        """Return a bound block-transform method for ``transform_name``, or None."""
+        method = self._BLOCK_TRANSFORMS.get(transform_name)
+        return getattr(self, method) if method is not None else None
+
+    def _make_source(self, src_name, h5_files, file_lens):
+        """
+        Override the base virtual-source builder to wrap WRF's staggered
+        source variables. ``U`` is staggered on the x axis (last); ``V`` on
+        the y axis (second-to-last). Both 4D variables expose unstaggered
+        shape to rechunker, with the trapezoidal mean applied on read.
+        """
+        from cfdb_ingest.base import _ConcatTimeSourceUnstaggered, _ConcatTimeSource
+        if src_name == 'U':
+            return _ConcatTimeSourceUnstaggered(h5_files, 'U', file_lens, stagger_axis=3)
+        if src_name == 'V':
+            return _ConcatTimeSourceUnstaggered(h5_files, 'V', file_lens, stagger_axis=2)
+        return _ConcatTimeSource(h5_files, src_name, file_lens)
+
+    def _block_rotated_wind_2d(self, sources, y_sl, x_sl, block_cache):
+        """
+        Earth-relative U/V wind from grid-relative U10/V10. Shape (N, ny, nx).
+        Cached per block so wind_speed/wind_direction/u_wind/v_wind/vorticity share work.
+        """
+        if 'wind_2d' in block_cache:
+            return block_cache['wind_2d']
+        u_grid = sources['U10'].astype('float64')
+        v_grid = sources['V10'].astype('float64')
+        if self._cosalpha is not None:
+            cosa = self._cosalpha[y_sl, x_sl]
+            sina = self._sinalpha[y_sl, x_sl]
+            u_earth = u_grid * cosa + v_grid * sina
+            v_earth = -u_grid * sina + v_grid * cosa
+        else:
+            u_earth, v_earth = u_grid, v_grid
+        result = (u_earth, v_earth)
+        block_cache['wind_2d'] = result
+        return result
+
+    def _block_specific_humidity_2d(self, sources, y_sl, x_sl, block_cache):
+        q = sources['Q2'].astype('float64')
+        return (q / (1.0 + q)).astype('float32')
+
+    def _block_relative_humidity_2d(self, sources, y_sl, x_sl, block_cache):
+        t2 = sources['T2'].astype('float64')
+        q2 = sources['Q2'].astype('float64')
+        psfc = sources['PSFC'].astype('float64')
+        es = 611.2 * np.exp(17.67 * (t2 - 273.15) / (t2 - 273.15 + 243.5))
+        e = q2 * psfc / (0.622 + q2)
+        rh = np.clip(e / es, 0.0, 1.0)
+        return rh.astype('float32')
+
+    def _block_dew_point_2d(self, sources, y_sl, x_sl, block_cache):
+        q2 = sources['Q2'].astype('float64')
+        psfc = sources['PSFC'].astype('float64')
+        e = q2 * psfc / (0.622 + q2)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ln_ratio = np.log(e / 611.2)
+            td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+        return td.astype('float32')
+
+    def _block_potential_temperature_2d(self, sources, y_sl, x_sl, block_cache):
+        t2 = sources['T2'].astype('float64')
+        psfc = sources['PSFC'].astype('float64')
+        return (t2 * (100000.0 / psfc) ** 0.2854).astype('float32')
+
+    def _block_equivalent_potential_temperature_2d(self, sources, y_sl, x_sl, block_cache):
+        t2 = sources['T2'].astype('float64')
+        q2 = sources['Q2'].astype('float64')
+        psfc = sources['PSFC'].astype('float64')
+        e = q2 * psfc / (0.622 + q2)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ln_ratio = np.log(e / 611.2)
+            td = 273.15 + 243.5 * ln_ratio / (17.67 - ln_ratio)
+            tl = 1.0 / (1.0 / (td - 56.0) + np.log(t2 / td) / 800.0) + 56.0
+            theta_e = t2 * (100000.0 / psfc) ** (0.2854 * (1.0 - 0.28 * q2)) \
+                * np.exp(q2 * (1.0 + 0.81 * q2) * (3376.0 / tl - 2.54))
+        return theta_e.astype('float32')
+
+    def _block_wind_speed(self, sources, y_sl, x_sl, block_cache):
+        u, v = self._block_rotated_wind_2d(sources, y_sl, x_sl, block_cache)
+        return np.sqrt(u**2 + v**2).astype('float32')
+
+    def _block_wind_direction(self, sources, y_sl, x_sl, block_cache):
+        u, v = self._block_rotated_wind_2d(sources, y_sl, x_sl, block_cache)
+        return ((270.0 - np.degrees(np.arctan2(v, u))) % 360.0).astype('float32')
+
+    def _block_u_wind(self, sources, y_sl, x_sl, block_cache):
+        u, _ = self._block_rotated_wind_2d(sources, y_sl, x_sl, block_cache)
+        return u.astype('float32')
+
+    def _block_v_wind(self, sources, y_sl, x_sl, block_cache):
+        _, v = self._block_rotated_wind_2d(sources, y_sl, x_sl, block_cache)
+        return v.astype('float32')
+
+    def _block_vorticity(self, sources, y_sl, x_sl, block_cache):
+        u, v = self._block_rotated_wind_2d(sources, y_sl, x_sl, block_cache)
+        # u, v shape: (N, ny, nx). y is axis=1, x is axis=2.
+        dvdx = np.gradient(v, self._dx, axis=2)
+        dudy = np.gradient(u, self._dy, axis=1)
+        return (dvdx - dudy).astype('float32')
+
+    def _block_sea_level_pressure(self, sources, y_sl, x_sl, block_cache):
+        psfc = sources['PSFC'].astype('float64')
+        t2 = sources['T2'].astype('float64')
+        hgt = sources['HGT'].astype('float64')
+        gamma = 0.0065
+        g = 9.81
+        rd = 287.05
+        t_mean = t2 + gamma * hgt / 2.0
+        return (psfc * np.exp(g * hgt / (rd * t_mean))).astype('float32')
+
+    def _block_land_sea_mask(self, sources, y_sl, x_sl, block_cache):
+        xland = sources['XLAND'].astype('float64')
+        return np.where(xland < 1.5, 1.0, 0.0).astype('float32')
+
+    # ------------------------------------------------------------------
+    # Column-integrated block transforms (4D source, 3D output).
+    # Sources are aligned on the unstaggered grid; reduction is along axis=1
+    # (the eta-level axis). dp is shared between PWAT and VIMF via block_cache.
+    # ------------------------------------------------------------------
+
+    def _block_dp(self, sources, block_cache):
+        """Pressure layer thickness on eta levels, shape (N, nz, ny, nx)."""
+        if 'dp' in block_cache:
+            return block_cache['dp']
+        p = sources['P'].astype('float64')
+        pb = sources['PB'].astype('float64')
+        pressure = p + pb
+        # Layer thickness via midpoint differences along the z axis (axis=1).
+        dp = np.empty_like(pressure)
+        dp[:, 0] = pressure[:, 0] - pressure[:, 1]
+        dp[:, -1] = pressure[:, -2] - pressure[:, -1]
+        dp[:, 1:-1] = (pressure[:, :-2] - pressure[:, 2:]) / 2.0
+        dp = np.abs(dp)
+        block_cache['dp'] = dp
+        return dp
+
+    def _block_rotated_wind_3d(self, sources, y_sl, x_sl, block_cache):
+        """
+        Earth-relative U/V on the unstaggered grid, shape (N, nz, ny, nx).
+        Sources ``U`` and ``V`` are unstaggered upstream by ``_make_source``.
+        """
+        if 'wind_3d' in block_cache:
+            return block_cache['wind_3d']
+        u_grid = sources['U'].astype('float64')
+        v_grid = sources['V'].astype('float64')
+        if self._cosalpha is not None:
+            cosa = self._cosalpha[y_sl, x_sl]
+            sina = self._sinalpha[y_sl, x_sl]
+            u_earth = u_grid * cosa + v_grid * sina
+            v_earth = -u_grid * sina + v_grid * cosa
+        else:
+            u_earth, v_earth = u_grid, v_grid
+        result = (u_earth, v_earth)
+        block_cache['wind_3d'] = result
+        return result
+
+    def _block_precipitable_water(self, sources, y_sl, x_sl, block_cache):
+        """PWAT = (1/g) * sum(QVAPOR * dp) over eta levels."""
+        q = sources['QVAPOR'].astype('float64')
+        dp = self._block_dp(sources, block_cache)
+        return (np.sum(q * dp, axis=1) / 9.80665).astype('float32')
+
+    def _block_precipitable_water_tracer(self, sources, y_sl, x_sl, block_cache):
+        """PWAT_TR = (1/g) * sum(qv_tr * dp) over eta levels."""
+        q = sources['qv_tr'].astype('float64')
+        dp = self._block_dp(sources, block_cache)
+        return (np.sum(q * dp, axis=1) / 9.80665).astype('float32')
+
+    def _block_vimf_u(self, sources, y_sl, x_sl, block_cache):
+        """VIMF_u = (1/g) * sum(QVAPOR * U_earth * dp) over eta levels."""
+        q = sources['QVAPOR'].astype('float64')
+        u_earth, _ = self._block_rotated_wind_3d(sources, y_sl, x_sl, block_cache)
+        dp = self._block_dp(sources, block_cache)
+        return (np.sum(q * u_earth * dp, axis=1) / 9.80665).astype('float32')
+
+    def _block_vimf_v(self, sources, y_sl, x_sl, block_cache):
+        """VIMF_v = (1/g) * sum(QVAPOR * V_earth * dp) over eta levels."""
+        q = sources['QVAPOR'].astype('float64')
+        _, v_earth = self._block_rotated_wind_3d(sources, y_sl, x_sl, block_cache)
+        dp = self._block_dp(sources, block_cache)
+        return (np.sum(q * v_earth * dp, axis=1) / 9.80665).astype('float32')
 
     def _setup_populate(self, var_key, target_levels):
         """Set up level-interpolation regrid function for 3D variables."""

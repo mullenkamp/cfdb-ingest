@@ -11,7 +11,7 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-  "cfdb>=0.6.0",
+  "cfdb>=0.7.1",
   'cfdb-vars>=0.2.2',
   "wrf_to_int>=0.1.1",
 ]
@@ -152,6 +152,8 @@ ban-relative-imports = "all"
 "tests/**/*" = ["PLR2004", "S101", "TID252"]
 "cfdb_ingest/tests/create_test_data.py" = ["T201"]
 "benchmarks/**/*" = ["T201", "S101"]
+# Standalone CLI helper scripts are expected to print
+"scripts/**/*" = ["T201"]
 
 [tool.coverage.run]
 source_pkgs = ["cfdb_ingest", "tests"]

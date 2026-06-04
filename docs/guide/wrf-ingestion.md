@@ -97,6 +97,64 @@ wrf.convert(
 )
 ```
 
+### Potential temperature, vorticity, and surface fluxes
+
+Beyond temperature, humidity, and wind, the mapping also covers several other field groups. They are
+selected by key like any other variable:
+
+- **Potential temperature** -- `THETA2`/`THETA_E2` (2 m) and `THETA`/`THETA_E` (3D level-interpolated)
+- **Relative vorticity** -- `VORT10` (10 m) and `VORT` (3D level-interpolated)
+- **Surface energy and land fields** -- `HFX` (sensible heat flux), `QFX` (moisture flux), `ALBEDO`,
+  `EMISS` (emissivity), and `LU_INDEX` (MODIS land-use category)
+
+See the [WRF Variables reference](../reference/wrf-variables.md) for the full list.
+
+### Precipitation and accumulators
+
+`RAIN` and `RAIN_TR` are stored as per-timestep accumulation increments: each value is the difference
+between successive accumulated totals, so the cfdb variable holds the precipitation that fell during
+each interval rather than a running total. Several details are handled automatically:
+
+- **Cross-file boundaries** -- the increment is computed across input files, so multi-file
+  conversions produce a continuous series with no gap or spike where files join.
+- **Bucket counters** -- when a `wrfout` uses WRF's bucket accumulators (a non-zero `BUCKET_MM`
+  attribute with companion `I_RAINNC`/`I_RAINC` overflow counts), the true total is reconstructed as
+  `RAINNC + BUCKET_MM * I_RAINNC` before differencing.
+- **Negative increments** -- small negative differences (which can occur with nudging or two-way
+  nesting feedback) are clipped to zero.
+
+### Column-integrated and moisture-transport variables
+
+Precipitable water and vertically integrated moisture flux are available as surface (`height_0m`)
+variables:
+
+```python
+wrf.convert(
+    cfdb_path='output.cfdb',
+    variables=['PWAT', 'VIMF_U', 'VIMF_V', 'IVT'],
+)
+```
+
+- `PWAT` / `PWAT_TR` -- total / tracer precipitable water
+- `VIMF_U` / `VIMF_V` -- eastward / northward vertically integrated moisture flux
+- `VIMF_TR_U` / `VIMF_TR_V` -- tracer moisture flux components
+- `IVT` -- integrated vapour transport magnitude
+
+### Native passthrough vs. computed fallback
+
+Some variables can be obtained either directly from the source file or reconstructed from 3D fields.
+Recent WRF builds (`wrf-auto-runs-intel-wvt:1.12`+) emit these fields directly, so they are read as a
+native passthrough. On older `wrfout` files that lack them, the same cfdb output is computed on the
+fly from the variable's fallback 3D fields.
+
+Resolution is automatic and per-variable: if the native source variable is present in the file it is
+used as-is; otherwise the fallback source variables and transform are applied. No flag or
+configuration is required -- the output cfdb variable is identical either way.
+
+- **Native or computed fallback:** `SLP` (native, else hypsometric from `PSFC`/`T2`/`HGT`),
+  `PWAT`, `PWAT_TR`, `VIMF_U`, `VIMF_V` (native, else integrated from `QVAPOR`/wind/pressure)
+- **Native only** (require a WRF build that emits them): `VIMF_TR_U`, `VIMF_TR_V`, `IVT`
+
 ### Custom chunk shape
 
 All variables are stored as 4D. The output chunk shape defaults to `(1, 1, ny, nx)`. Override:

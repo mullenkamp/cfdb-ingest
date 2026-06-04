@@ -29,8 +29,8 @@ uv run pytest cfdb_ingest/tests/test_era5.py::TestConvertSurface::test_2m_variab
 
 - `cfdb_ingest/`
   - `base.py` -- `H5Ingest` abstract base class. Handles variable classification (surface/level/soil), named height coordinates, cfdb dataset creation, and three population strategies (rechunkit, per-timestep, batch). Subclass hooks: `file_glob_pattern`, `x_coord_name`/`y_coord_name`, `_init_source_metadata()`, `_create_spatial_coords()`.
-  - `wrf.py` -- `WrfIngest(H5Ingest)` for WRF wrfout files. CRS parsing from MAP_PROJ, wind rotation via COSALPHA/SINALPHA, 3D eta-to-height/pressure interpolation, ~60 variable mappings with ~30 transforms.
-  - `era5.py` -- `Era5Ingest(H5Ingest)` for NCAR ERA5 NetCDF files. One-variable-per-file handling with `_var_file_map`/`_var_time_map`. EPSG:4326 lat/lon grid. ~92 variable mappings. Z disambiguation (pressure-level vs invariant). Split/combined output modes.
+  - `wrf.py` -- `WrfIngest(H5Ingest)` for WRF wrfout files. CRS parsing from MAP_PROJ, wind rotation via COSALPHA/SINALPHA, 3D eta-to-height/pressure interpolation, 53 variable mappings with ~30 transforms.
+  - `era5.py` -- `Era5Ingest(H5Ingest)` for NCAR ERA5 NetCDF files. One-variable-per-file handling with `_var_file_map`/`_var_time_map`. EPSG:4326 lat/lon grid. 94 variable mappings. Z disambiguation (pressure-level vs invariant). Split/combined output modes.
   - `cli.py` -- Typer CLI with `wrf`, `era5`, and `cfdb-to-int` commands.
   - `cfdb_to_int.py` -- cfdb to WPS intermediate file conversion.
 - `cfdb_ingest/tests/`
@@ -63,6 +63,8 @@ Both `WRF_VARIABLE_MAPPING` and `ERA5_VARIABLE_MAPPING` follow the same structur
 - `height: <float>` -- surface variable at fixed height, gets `height_{int}m` coordinate
 - `height: 'levels'` -- variable on vertical levels (pressure or height), shared multi-value coordinate
 - `height: 'soil'` -- soil variable using depth coordinate
+
+An entry may also declare optional `fallback_source_vars` (and an optional `fallback_transform`). When the primary `source_vars` are missing from a file but the fallback sources are present, `_init_variables()` in `base.py` promotes the entry to use the fallback sources/transform. This lets one cfdb output be served either by a native field (emitted directly by newer WRF builds) or computed from 3D fields on older `wrfout` files. Used by WRF `SLP`, `PWAT`, `PWAT_TR`, `VIMF_U`, `VIMF_V`.
 
 Variable metadata (dtype, encoding, CF attributes) comes from the [cfdb-vars](https://github.com/mullenkamp/cfdb-vars) package. Template creation methods (`ds.create.data_var.<cfdb_name>()`) auto-apply the registered metadata. Unregistered names fall back to generic float32.
 
