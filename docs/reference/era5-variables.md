@@ -82,6 +82,16 @@ When a variable name conflicts between surface and pressure levels, the surface 
 | `VAR_100U` | `u_wind` | VAR_100U | 100 metre U wind component |
 | `VAR_100V` | `v_wind` | VAR_100V | 100 metre V wind component |
 
+## Column-integrated moisture flux (height 0m)
+
+Derived by vertically integrating the pressure-level humidity and wind fields. See the
+[VIMF computation](../guide/era5-ingestion.md#vimf-computation) section of the ERA5 guide for details.
+
+| Key | cfdb Name | Source Vars | Transform | Description |
+|-----|-----------|-----------|-----------|-------------|
+| `VIMF_U` | `vimf_u` | Q, U | (1/g)∫ q·u dp | Vertically integrated eastward moisture flux |
+| `VIMF_V` | `vimf_v` | Q, V | (1/g)∫ q·v dp | Vertically integrated northward moisture flux |
+
 ## Invariant variables (height 0m)
 
 | Key | cfdb Name | Source Var | Transform | Description |

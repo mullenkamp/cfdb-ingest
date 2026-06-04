@@ -27,11 +27,12 @@ Supported sources:
 
 Key features:
 
-- **Automatic variable mapping** -- source variable names are translated to CF-standard names with proper metadata via [cfdb-vars](https://github.com/mullenkamp/cfdb-vars)
+- **Automatic variable mapping** -- source variable names are translated to CF-standard names with proper metadata via [cfdb-vars](https://github.com/mullenkamp/cfdb-vars), covering surface, soil, pressure/height-level, potential-temperature, vorticity, surface-flux, and moisture-transport fields
 - **Named height coordinates** -- surface variables at specific heights (0m, 2m, 10m, 100m) get their own named coordinates (e.g. `height_2m`), allowing them to coexist with pressure-level variables without ambiguity
 - **Wind rotation** (WRF) -- grid-relative wind components are rotated to earth-relative
-- **VIMF computation** (ERA5) -- native calculation of vertically integrated moisture flux from Q, U, and V
+- **Moisture-transport variables** -- vertically integrated moisture flux (VIMF) and integrated vapour transport (IVT) for WRF; VIMF for ERA5
 - **3D level interpolation** (WRF) -- eta-level variables are interpolated to user-specified height or pressure levels
+- **Native passthrough with computed fallback** (WRF) -- derived fields (sea-level pressure, precipitable water, moisture flux) are read directly from newer WRF builds, or reconstructed from 3D fields on older `wrfout` files
 - **Auto pressure level detection** (ERA5) -- pressure levels are read directly from source files
 - **Split or combined output** (ERA5) -- create one cfdb per variable or combine into a single dataset
 - **WPS intermediate file export** -- convert cfdb datasets to WPS intermediate format for metgrid.exe
