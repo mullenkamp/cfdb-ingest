@@ -266,6 +266,55 @@ class TestConvertPressureLevels:
             assert len(pressure) == 5
             assert pressure[0] == 50000.0  # 500 hPa in Pa
 
+    def test_single_target_level(self, cfdb_out, tmp_path):
+        """A single target level must be honored (regression for the level-subset bug)."""
+        Era5Ingest(PL_DIR).convert(
+            cfdb_path=cfdb_out, variables=['T'],
+            start_date='2020-01-01T00:00', end_date='2020-01-01T23:00',
+            target_levels=[85000.0],
+        )
+        all_out = tmp_path / 'all.cfdb'
+        Era5Ingest(PL_DIR).convert(
+            cfdb_path=all_out, variables=['T'],
+            start_date='2020-01-01T00:00', end_date='2020-01-01T23:00',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds, cfdb.open_dataset(all_out, 'r') as ref:
+            assert list(ds['pressure'].data) == [85000.0]
+            sub = np.squeeze(ds['air_temperature'].data)
+            k = list(ref['pressure'].data).index(85000.0)
+            ref_850 = np.squeeze(ref['air_temperature'][(slice(None), k, slice(None), slice(None))].data)
+            np.testing.assert_array_equal(sub, ref_850)
+
+    def test_subset_target_levels_noncontiguous(self, cfdb_out, tmp_path):
+        """A non-contiguous subset must be selected, ordered ascending, with correct values."""
+        Era5Ingest(PL_DIR).convert(
+            cfdb_path=cfdb_out, variables=['T'],
+            start_date='2020-01-01T00:00', end_date='2020-01-01T23:00',
+            target_levels=[70000.0, 92500.0],  # 700 & 925 hPa = native idx 1 & 3
+        )
+        all_out = tmp_path / 'all.cfdb'
+        Era5Ingest(PL_DIR).convert(
+            cfdb_path=all_out, variables=['T'],
+            start_date='2020-01-01T00:00', end_date='2020-01-01T23:00',
+        )
+        with cfdb.open_dataset(cfdb_out, 'r') as ds, cfdb.open_dataset(all_out, 'r') as ref:
+            assert list(ds['pressure'].data) == [70000.0, 92500.0]
+            ref_levels = list(ref['pressure'].data)
+            for out_k, lev in enumerate([70000.0, 92500.0]):
+                ref_k = ref_levels.index(lev)
+                got = np.squeeze(ds['air_temperature'][(slice(None), out_k, slice(None), slice(None))].data)
+                exp = np.squeeze(ref['air_temperature'][(slice(None), ref_k, slice(None), slice(None))].data)
+                np.testing.assert_array_equal(got, exp)
+
+    def test_target_level_not_native_raises(self, cfdb_out):
+        """Requesting a level absent from the source should raise (no interpolation)."""
+        with pytest.raises(ValueError, match='not among the source native levels'):
+            Era5Ingest(PL_DIR).convert(
+                cfdb_path=cfdb_out, variables=['T'],
+                start_date='2020-01-01T00:00', end_date='2020-01-01T23:00',
+                target_levels=[123450.0],
+            )
+
     def test_pressure_axis_z(self, cfdb_out):
         """Pressure coordinate should have axis='Z'."""
         ingest = Era5Ingest(PL_DIR)

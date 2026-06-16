@@ -601,11 +601,32 @@ class H5Ingest:
                     depth_indices = list(range(len(soil_depths)))
                     _classify((var_key, data_var, depth_indices), self.variables[var_key])
 
+            # Map requested (sorted, ascending) levels onto source native level indices so
+            # the rechunkit path can subset/reorder the level axis. None keeps the original
+            # all-native-levels path untouched (computed only when the request differs).
+            source_level_sel = None
+            if has_multi_level:
+                native_levels = self._native_level_values()
+                if native_levels is not None and not (
+                    len(native_levels) == len(sorted_levels)
+                    and np.allclose(np.sort(native_levels), sorted_levels)
+                ):
+                    source_level_sel = []
+                    for lev in sorted_levels:
+                        idx = np.where(np.isclose(native_levels, lev))[0]
+                        if len(idx) == 0:
+                            raise ValueError(
+                                f'Requested level {lev} is not among the source native levels '
+                                f'{np.sort(native_levels).tolist()}; interpolation is not supported '
+                                f'for non-transform pressure-level variables.'
+                            )
+                        source_level_sel.append(int(idx[0]))
+
             # Process each group with its optimal strategy
             for var_key, data_var, vert_indices in rechunkit_items:
                 self._setup_populate(var_key, target_levels)
                 self._populate_with_rechunkit(data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices,
-                                              chunk_4d=chunk_4d,
+                                              chunk_4d=chunk_4d, source_level_sel=source_level_sel,
                                               filtered_y=filtered_y, filtered_x=filtered_x)
 
             for var_key, data_var, vert_indices in accumulation_items:
@@ -783,6 +804,15 @@ class H5Ingest:
         """Hook called before populating a data variable. Override as needed."""
         pass
 
+    def _native_level_values(self):
+        """
+        Native vertical level values (same units as ``target_levels``) in source-file
+        axis order, or None when the source has no native level axis (e.g. transform-based
+        vertical interpolation, as in WRF). Subclasses with on-disk pressure levels
+        override this so the rechunkit path can subset/reorder to requested levels.
+        """
+        return None
+
     def _accumulation_source_sum(self, h5, source_vars, time_idx, spatial_slice):
         """
         Sum source_vars at a given timestep.
@@ -824,7 +854,7 @@ class H5Ingest:
         return result.astype('float32')
 
     def _populate_with_rechunkit(self, data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices,
-                                 chunk_4d=None, filtered_y=None, filtered_x=None):
+                                 chunk_4d=None, filtered_y=None, filtered_x=None, source_level_sel=None):
         """
         Populate a simple (no-transform, single source var) data variable using
         a single rechunkit call across all input files.
@@ -845,6 +875,7 @@ class H5Ingest:
             return self._populate_with_rechunkit_per_file(
                 data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices,
                 chunk_4d=chunk_4d, filtered_y=filtered_y, filtered_x=filtered_x,
+                source_level_sel=source_level_sel,
             )
 
         src_var = self.variables[var_key]['source_vars'][0]
@@ -876,6 +907,7 @@ class H5Ingest:
 
             y_sl, x_sl = spatial_slice
             spatial_axes = source.shape[1:]
+            level_pick = None  # in-block level reindexing for subset/reorder (4D only)
             if len(spatial_axes) == 2:
                 y_start, y_stop, _ = y_sl.indices(spatial_axes[0])
                 x_start, x_stop, _ = x_sl.indices(spatial_axes[1])
@@ -887,9 +919,20 @@ class H5Ingest:
                 nz = spatial_axes[0]
                 y_start, y_stop, _ = y_sl.indices(spatial_axes[1])
                 x_start, x_stop, _ = x_sl.indices(spatial_axes[2])
-                sel = (slice(0, source.shape[0]), slice(0, nz),
+                if source_level_sel is not None:
+                    # Honor target_levels: read only the contiguous bounding span of the
+                    # requested source levels, then pick (and reorder) within each block.
+                    # Handles single levels (one slice) and non-contiguous subsets.
+                    lo, hi = min(source_level_sel), max(source_level_sel) + 1
+                    z_slice = slice(lo, hi)
+                    level_pick = [i - lo for i in source_level_sel]
+                    nz_read = hi - lo
+                else:
+                    z_slice = slice(0, nz)
+                    nz_read = nz
+                sel = (slice(0, source.shape[0]), z_slice,
                        slice(y_start, y_stop), slice(x_start, x_stop))
-                target_chunks = (target_t, nz, y_stop - y_start, x_stop - x_start)
+                target_chunks = (target_t, nz_read, y_stop - y_start, x_stop - x_start)
             else:
                 raise ValueError(f'Unsupported source ndim {len(source.shape)} for {var_key!r}')
 
@@ -906,6 +949,8 @@ class H5Ingest:
                 block = self._post_block_transform(data, src_var, len(source.shape))
                 if block_fn is not None:
                     block = block_fn({src_var: block}, y_sl, x_sl, {})
+                if level_pick is not None:
+                    block = block[:, level_pick]
                 n_block = write_slices[0].stop - write_slices[0].start
                 t_outs = [None] * n_block
                 for i in range(n_block):
@@ -945,10 +990,14 @@ class H5Ingest:
 
     def _populate_with_rechunkit_per_file(self, data_var, var_key, time_mask, spatial_slice,
                                           max_mem, vert_indices, chunk_4d=None,
-                                          filtered_y=None, filtered_x=None):
+                                          filtered_y=None, filtered_x=None, source_level_sel=None):
         """
         Legacy per-file rechunkit populate. Retained for the heterogeneous-grid
         case until the cross-file path supports per-file spatial remapping.
+
+        ``source_level_sel`` (target-level subsetting) is accepted for signature
+        parity but not yet supported here: this path is 3D-only and is reached only
+        for heterogeneous grids, which ERA5 pressure-level conversion never uses.
         """
         src_var = self.variables[var_key]['source_vars'][0]
         y_sl, x_sl = spatial_slice

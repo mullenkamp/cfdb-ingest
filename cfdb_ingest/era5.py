@@ -887,6 +887,16 @@ class Era5Ingest(H5Ingest):
                         return np.array(h5['level'][:], dtype='float64') * 100.0
         raise ValueError("No pressure levels found in source files.")
 
+    def _native_level_values(self):
+        """
+        Native pressure levels (Pa, in source-file axis order) so the rechunkit path can
+        subset/reorder to a requested ``target_levels``. None when no PL files are present.
+        """
+        try:
+            return self._get_pressure_levels()
+        except ValueError:
+            return None
+
     def _get_cached_source_var(self, src_var, time_idx, spatial_slice):
         """Read and cache a source variable for the current timestep."""
         cache = getattr(self, '_ts_cache', None)
@@ -1131,12 +1141,15 @@ class Era5Ingest(H5Ingest):
 
     def _populate_with_rechunkit_per_file(self, data_var, var_key, time_mask, spatial_slice,
                                           max_mem, vert_indices, chunk_4d=None,
-                                          filtered_y=None, filtered_x=None):
+                                          filtered_y=None, filtered_x=None, source_level_sel=None):
         """
         Heterogeneous-grids fallback for ERA5. Per-file rechunkit iteration with
         per-file spatial remapping. Inherits the partial-chunk write
         amplification pattern of the pre-cross-file code; acceptable until the
         cross-file path supports per-file spatial remapping (rare in practice).
+
+        ``source_level_sel`` honors a ``target_levels`` subset/reorder on the level
+        axis (same semantics as the cross-file path).
         """
         info = self.variables[var_key]
         src_var = info['source_vars'][0]
@@ -1209,13 +1222,22 @@ class Era5Ingest(H5Ingest):
                 sel_y = slice(y_start, y_stop)
                 sel_x = slice(x_start, x_stop)
 
+                level_pick = None
                 if h5_var.ndim == 3:
                     sel = (sel_time, sel_y, sel_x)
                     target_chunks = (target_t, ny, nx)
                 else:
                     nz = h5_var.shape[1]
-                    sel = (sel_time, slice(0, nz), sel_y, sel_x)
-                    target_chunks = (target_t, nz, ny, nx)
+                    if source_level_sel is not None:
+                        lo, hi = min(source_level_sel), max(source_level_sel) + 1
+                        z_slice = slice(lo, hi)
+                        level_pick = [i - lo for i in source_level_sel]
+                        nz_read = hi - lo
+                    else:
+                        z_slice = slice(0, nz)
+                        nz_read = nz
+                    sel = (sel_time, z_slice, sel_y, sel_x)
+                    target_chunks = (target_t, nz_read, ny, nx)
 
                 lat_reversed = self._lat_reversed
                 lat_axis = 2 if h5_var.ndim == 4 else 1  # axis of y in (N, [nz,] ny, nx)
@@ -1240,6 +1262,8 @@ class Era5Ingest(H5Ingest):
                             block = block[:, ::-1, :]
                     if apply_geopotential:
                         block = block / _G
+                    if level_pick is not None:
+                        block = block[:, level_pick]
 
                     self._write_block_from_t_outs(
                         data_var, block, t_outs, vert_indices, y_write, x_write,
