@@ -138,6 +138,13 @@ class H5Ingest:
         """
         Derive all metadata from the source files by calling subclass methods.
         """
+        # Region (multi-region WVT) state. Initialized here so it always exists
+        # for every subclass — including those that override _init_variables
+        # (e.g. ERA5) and never populate it. Populated by the base
+        # _init_variables for region_aware fields; a no-op elsewhere.
+        self._field_region_size = {}
+        self._n_wvt_regions = None
+
         self._init_source_metadata()
         self._init_time()
         self._init_variables()
@@ -238,7 +245,57 @@ class H5Ingest:
                     promoted['transform'] = info.get('fallback_transform', info.get('transform'))
                     available[key] = promoted
 
+            # Detect region-dimensioned (multi-region WVT) fields, using the
+            # still-open file. A region_aware field is region-dimensioned iff its
+            # NATIVE (unpromoted) primary source var carries a `wvt_regions`
+            # named HDF5 dimension at axis 1. Probe the native primary from
+            # ``mapping`` (not ``available``): after fallback promotion the
+            # active primary may differ (e.g. PWAT_TR -> qv_tr).
+            for key, info in available.items():
+                if not info.get('region_aware'):
+                    continue
+                native_primary = mapping[key]['source_vars'][0]
+                if native_primary not in source_vars:
+                    continue
+                n = self._region_axis_size(h5[native_primary])
+                if n is not None:
+                    self._field_region_size[key] = n
+
         self.variables = available
+
+        if self._field_region_size:
+            sizes = set(self._field_region_size.values())
+            if len(sizes) != 1:
+                raise ValueError(
+                    f'Inconsistent WVT region counts across fields: {self._field_region_size}'
+                )
+            self._n_wvt_regions = sizes.pop()
+
+    @staticmethod
+    def _region_axis_size(h5ds):
+        """
+        Return the region count N if ``h5ds`` carries a ``wvt_regions`` named
+        HDF5 dimension scale at axis 1, else None.
+
+        Detection is by dimension NAME, not ndim: a future natively-3D
+        region_aware field would also be 4D in a single-region run, where a bare
+        ndim test would misread the vertical level count as the region count.
+        WRF/netCDF always attaches the dimension scale (axis path
+        ``/wvt_regions``).
+        """
+        if h5ds.ndim < 2:
+            return None
+        dim = h5ds.dims[1]
+        if len(dim) == 0:
+            return None
+        name = dim[0].name.rsplit('/', 1)[-1]
+        if name != 'wvt_regions':
+            return None
+        # Region fields are (time, wvt_regions, y, x). Corroborate the layout.
+        assert h5ds.ndim == 4, (
+            f'{h5ds.name!r} has a wvt_regions axis but ndim={h5ds.ndim} (expected 4)'
+        )
+        return int(h5ds.shape[1])
 
     def _compute_bbox_geographic(self):
         """
@@ -462,6 +519,30 @@ class H5Ingest:
             if soil_depths is None:
                 raise ValueError('Soil variables requested but source has no soil depth data.')
 
+        # Region (multi-region WVT) guards. region_keys = requested region_aware
+        # fields that resolved to a region-dimensioned native source.
+        region_keys = [k for k in var_keys
+                       if self.variables[k].get('region_aware') and self._field_region_size.get(k)]
+        if region_keys:
+            if self._heterogeneous_grids:
+                # The per-file / per-timestep fallbacks index [time, y, x] and
+                # would treat the region axis as y — silent corruption. WVT runs
+                # are single-domain, so this never triggers in practice.
+                raise NotImplementedError(
+                    'Multi-region WVT fields are not supported with heterogeneous grids.'
+                )
+            # A requested region_aware field that did NOT resolve to a region
+            # source (e.g. fell back to its 3D fallback) while others did would
+            # silently drop the region axis — refuse rather than mislead.
+            dropped = [k for k in var_keys
+                       if self.variables[k].get('region_aware') and not self._field_region_size.get(k)]
+            if dropped:
+                raise ValueError(
+                    f'Region-aware field(s) {dropped} lack a native wvt_regions axis while other '
+                    f'fields are region-dimensioned (N={self._n_wvt_regions}); native region '
+                    f'outputs are required (the fallback path cannot reconstruct per-region values).'
+                )
+
         # Filter time
         time_mask, filtered_times = self._filter_time(start_date, end_date)
 
@@ -482,6 +563,7 @@ class H5Ingest:
         level_vars = {}      # cfdb_name -> [var_key, ...]
         surface_vars = {}    # cfdb_name -> [var_key, ...]  (vars at a fixed height)
         soil_vars = {}       # cfdb_name -> [var_key, ...]
+        region_vars = {}     # cfdb_name -> [var_key, ...]  (multi-region WVT, region axis)
 
         sorted_levels = np.array(sorted(target_levels), dtype='float64') if target_levels else None
 
@@ -490,7 +572,14 @@ class H5Ingest:
             cfdb_name = info['cfdb_name']
             height_spec = info['height']
 
-            if height_spec == 'levels':
+            # Region-dimensioned fields take priority over their nominal height:
+            # they are 2D-surface quantities (height 0.0) carrying an extra
+            # wvt_regions axis. Gated on a recorded region size, so a region_aware
+            # field in a single-region (3D) file falls through to surface_vars
+            # (current behavior, byte-identical).
+            if self._field_region_size.get(var_key):
+                region_vars.setdefault(cfdb_name, []).append(var_key)
+            elif height_spec == 'levels':
                 level_vars.setdefault(cfdb_name, []).append(var_key)
             elif height_spec == 'soil':
                 soil_vars.setdefault(cfdb_name, []).append(var_key)
@@ -544,6 +633,17 @@ class H5Ingest:
                     data=np.array([h], dtype='float64'),
                     axis=axis,
                 )
+
+            # Region (multi-region WVT) coordinate: integer source-region index
+            # 1..N. axis=None (categorical, not a physical Z). Created before the
+            # region data-var loop (cfdb requires named coords to pre-exist).
+            if region_vars:
+                region_coord = ds.create.coord.generic(
+                    'wvt_region',
+                    data=np.arange(1, self._n_wvt_regions + 1, dtype='int64'),
+                    axis=None,
+                )
+                region_coord.attrs['long_name'] = 'Water Vapour Tracer Source Region'
 
             # Set CRS
             ds.create.crs.from_user_input(self.crs, x_coord=self.x_coord_name, y_coord=self.y_coord_name)
@@ -601,6 +701,16 @@ class H5Ingest:
                     depth_indices = list(range(len(soil_depths)))
                     _classify((var_key, data_var, depth_indices), self.variables[var_key])
 
+            # Region (multi-region WVT) variables: (time, wvt_region, y, x).
+            # Mechanically identical to level/soil — the region axis is written
+            # via vert_indices=range(N) by the existing populate paths.
+            region_coord_names = ('time', 'wvt_region', self.y_coord_name, self.x_coord_name)
+            for cfdb_name, var_key_list in region_vars.items():
+                data_var = self._create_cfdb_data_var(ds, cfdb_name, region_coord_names, chunk_4d)
+                for var_key in var_key_list:
+                    region_indices = list(range(self._field_region_size[var_key]))
+                    _classify((var_key, data_var, region_indices), self.variables[var_key])
+
             # Map requested (sorted, ascending) levels onto source native level indices so
             # the rechunkit path can subset/reorder the level axis. None keeps the original
             # all-native-levels path untouched (computed only when the request differs).
@@ -625,8 +735,13 @@ class H5Ingest:
             # Process each group with its optimal strategy
             for var_key, data_var, vert_indices in rechunkit_items:
                 self._setup_populate(var_key, target_levels)
+                # Region passthrough fields share the 4D rechunkit branch with
+                # native pressure-level vars; their middle axis is regions, not
+                # levels, so the level-subset selector must not apply (it is
+                # always None for WRF today, but be explicit).
+                sls = None if self._field_region_size.get(var_key) else source_level_sel
                 self._populate_with_rechunkit(data_var, var_key, time_mask, spatial_slice, max_mem, vert_indices,
-                                              chunk_4d=chunk_4d, source_level_sel=source_level_sel,
+                                              chunk_4d=chunk_4d, source_level_sel=sls,
                                               filtered_y=filtered_y, filtered_x=filtered_x)
 
             for var_key, data_var, vert_indices in accumulation_items:
@@ -1111,10 +1226,18 @@ class H5Ingest:
 
     @staticmethod
     def _write_data_var(data_var, data, output_time_idx, vert_indices, y_write=None, x_write=None):
-        """Write data for a single timestep at the correct indices."""
+        """
+        Write data for a single timestep at the correct indices.
+
+        Branches on ``data.ndim`` (not ``len(vert_indices)``): 2D data is a
+        no-middle-axis surface field; 3D data carries a middle axis (levels /
+        soil / wvt_region) and is written one slice per ``vert_indices`` entry.
+        Equivalent to the old len(vert_indices) test for surface/level/soil, and
+        additionally correct for a length-1 region axis (3D data, single index).
+        """
         ys = y_write if y_write is not None else slice(None)
         xs = x_write if x_write is not None else slice(None)
-        if len(vert_indices) == 1:
+        if data.ndim == 2:
             data_var[(output_time_idx, vert_indices[0], ys, xs)] = data[np.newaxis, np.newaxis, ...]
         else:
             for lev_i, v_idx in enumerate(vert_indices):
@@ -1125,13 +1248,19 @@ class H5Ingest:
         """
         Coalesced write of a multi-timestep block.
 
-        ``block`` shape:
-            - ``(N, ny, nx)`` when ``len(vert_indices) == 1`` (surface variables).
-            - ``(N, n_levels, ny, nx)`` when ``len(vert_indices) > 1``.
+        Branches on ``block.ndim``:
+            - ``(N, ny, nx)`` (ndim 3): no middle axis — surface variables.
+            - ``(N, K, ny, nx)`` (ndim 4): middle axis (levels / soil /
+              wvt_region), written one slice per ``vert_indices`` entry
+              (``K == len(vert_indices)``).
+
+        Discriminating on ndim (not ``len(vert_indices)``) keeps surface/level/
+        soil behavior identical and additionally handles a length-1 region axis,
+        where a 4D ``(N, 1, ny, nx)`` block has a single vert index.
         """
         ys = y_write if y_write is not None else slice(None)
         xs = x_write if x_write is not None else slice(None)
-        if len(vert_indices) == 1:
+        if block.ndim == 3:
             data_var[(time_slice, vert_indices[0], ys, xs)] = block
         else:
             for lev_i, v_idx in enumerate(vert_indices):
@@ -1561,15 +1690,27 @@ class H5Ingest:
                 )
 
             spatial_axes = ref_shape[1:]
-            if len(spatial_axes) != 2:
+            if len(spatial_axes) == 2:
+                # Ordinary 2D-spatial source: (T, Y, X).
+                y_start, y_stop, _ = y_sl.indices(spatial_axes[0])
+                x_start, x_stop, _ = x_sl.indices(spatial_axes[1])
+                sel = (slice(0, ref_shape[0]),
+                       slice(y_start, y_stop), slice(x_start, x_stop))
+                target_chunks = (target_t, y_stop - y_start, x_stop - x_start)
+            elif len(spatial_axes) == 3:
+                # Region-dimensioned source: (T, N, Y, X). The block math below is
+                # elementwise / time-axis-0, so it works unchanged on (n, N, y, x);
+                # the write uses vert_indices=range(N). The region axis is read whole.
+                nreg = spatial_axes[0]
+                y_start, y_stop, _ = y_sl.indices(spatial_axes[1])
+                x_start, x_stop, _ = x_sl.indices(spatial_axes[2])
+                sel = (slice(0, ref_shape[0]), slice(0, nreg),
+                       slice(y_start, y_stop), slice(x_start, x_stop))
+                target_chunks = (target_t, nreg, y_stop - y_start, x_stop - x_start)
+            else:
                 raise ValueError(
-                    f'accumulation_increment expects 2D-spatial sources, got {ref_shape}'
+                    f'accumulation_increment expects 2D- or 3D-spatial sources, got {ref_shape}'
                 )
-            y_start, y_stop, _ = y_sl.indices(spatial_axes[0])
-            x_start, x_stop, _ = x_sl.indices(spatial_axes[1])
-            sel = (slice(0, ref_shape[0]),
-                   slice(y_start, y_stop), slice(x_start, x_stop))
-            target_chunks = (target_t, y_stop - y_start, x_stop - x_start)
 
             source_callables = {sv: src.__call__ for sv, src in sources.items()}
 

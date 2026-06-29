@@ -310,12 +310,14 @@ WRF_VARIABLE_MAPPING = {
         'fallback_source_vars': ['qv_tr', 'P', 'PB'],
         'fallback_transform': 'precipitable_water_tracer',
         'height': 0.0,
+        'region_aware': True,
     },
     'RAIN_TR': {
         'cfdb_name': 'precip_tr',
         'source_vars': ['TR_RAINNC', 'TR_RAINC'],
         'transform': 'accumulation_increment',
         'height': 0.0,
+        'region_aware': True,
     },
     'VIMF_U': {
         'cfdb_name': 'vimf_u',
@@ -339,12 +341,14 @@ WRF_VARIABLE_MAPPING = {
         'source_vars': ['VIMF_TR_U'],
         'transform': None,
         'height': 0.0,
+        'region_aware': True,
     },
     'VIMF_TR_V': {
         'cfdb_name': 'vimf_tr_v',
         'source_vars': ['VIMF_TR_V'],
         'transform': None,
         'height': 0.0,
+        'region_aware': True,
     },
     'IVT': {
         'cfdb_name': 'ivt',

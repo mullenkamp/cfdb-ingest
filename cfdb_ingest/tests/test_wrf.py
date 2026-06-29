@@ -1382,3 +1382,184 @@ class TestNewSurfaceVars:
             mask = np.squeeze(np.array(ds['land_sea_mask'][0]))
             unique_vals = set(np.unique(mask))
             assert unique_vals <= {0.0, 1.0}
+
+
+# ======================================================================
+# Multi-region WVT tracers (region-dimensioned source fields)
+# ======================================================================
+
+
+def _make_region_wrfout(src_path, dst_path, n_regions=4, fractions=None,
+                        i_rainnc_counts=None, bucket_mm=100.0):
+    """
+    Copy a wrfout test file and inject region-dimensioned ``(T, N, y, x)`` WVT
+    tracer fields with a ``wvt_regions`` HDF5 dimension scale attached to axis 1,
+    exactly as the multi-region WRF build presents them.
+
+    Per-region values are a distinct fraction of total RAINNC/RAINC (Σ fractions
+    < 1, so Σ_region <= total), letting both per-region correctness and
+    conservation be checked. ``I_TR_RAINNC`` carries a per-region bucket count
+    (region r -> r wraps) to exercise per-region bucket reconstruction.
+
+    Returns ``(fractions, i_rainnc_counts)`` for the caller's reference math.
+    """
+    import shutil
+    shutil.copy(src_path, dst_path)
+    if fractions is None:
+        fractions = np.linspace(0.1, 0.3, n_regions)
+    fractions = np.asarray(fractions, dtype='float64')
+    if i_rainnc_counts is None:
+        i_rainnc_counts = np.arange(n_regions)
+    i_rainnc_counts = np.asarray(i_rainnc_counts)
+
+    with h5py.File(dst_path, 'r+') as h5:
+        h5.attrs['BUCKET_MM'] = np.float32(bucket_mm)
+        rainnc = h5['RAINNC'][:].astype('float64')
+        rainc = h5['RAINC'][:].astype('float64')
+        n_t, ny, nx = rainnc.shape
+
+        reg = h5.create_dataset('wvt_regions', data=np.arange(n_regions, dtype='int32'))
+        reg.make_scale('wvt_regions')
+        f = fractions[None, :, None, None]
+
+        def add(name, arr, dt='float32'):
+            d = h5.create_dataset(name, data=np.asarray(arr).astype(dt), dtype=dt)
+            d.dims[1].attach_scale(reg)
+
+        add('TR_RAINNC', f * rainnc[:, None, :, :])
+        add('TR_RAINC', f * rainc[:, None, :, :])
+        i_rnc = np.zeros((n_t, n_regions, ny, nx))
+        for r in range(n_regions):
+            i_rnc[:, r] = i_rainnc_counts[r]
+        add('I_TR_RAINNC', i_rnc, 'int32')
+        add('I_TR_RAINC', np.zeros((n_t, n_regions, ny, nx)), 'int32')
+        add('PWAT_TR', f * (rainnc[:, None, :, :] + 1.0))
+        add('VIMF_TR_U', f * np.ones((n_t, n_regions, ny, nx)) * 2.0)
+        add('VIMF_TR_V', f * np.ones((n_t, n_regions, ny, nx)) * 3.0)
+
+    return fractions, i_rainnc_counts
+
+
+class TestRegionTracers:
+    def test_region_axis_size_detects_by_name(self, tmp_path):
+        """_region_axis_size keys on the axis-1 dimension NAME, not ndim."""
+        from cfdb_ingest.base import H5Ingest
+        p = tmp_path / 'dims.h5'
+        with h5py.File(p, 'w') as h5:
+            a = h5.create_dataset('A', data=np.zeros((2, 4, 3, 5), 'f4'))
+            b = h5.create_dataset('B', data=np.zeros((2, 16, 3, 5), 'f4'))
+            reg = h5.create_dataset('wvt_regions', data=np.arange(4, dtype='i4'))
+            reg.make_scale('wvt_regions')
+            a.dims[1].attach_scale(reg)
+            bt = h5.create_dataset('bottom_top', data=np.arange(16, dtype='i4'))
+            bt.make_scale('bottom_top')
+            b.dims[1].attach_scale(bt)
+            # A: wvt_regions axis -> region count 4. B: bottom_top axis -> not region.
+            assert H5Ingest._region_axis_size(h5['A']) == 4
+            assert H5Ingest._region_axis_size(h5['B']) is None
+
+    def test_detection_and_count(self, wrf_file_1, tmp_path):
+        """All four region_aware fields are detected with a consistent N."""
+        from cfdb_ingest.wrf import WrfIngest
+        dst = tmp_path / 'wrfout_region.nc'
+        _make_region_wrfout(wrf_file_1, dst, n_regions=4)
+        ing = WrfIngest(dst)
+        assert ing._n_wvt_regions == 4
+        assert set(ing._field_region_size) == {'PWAT_TR', 'RAIN_TR', 'VIMF_TR_U', 'VIMF_TR_V'}
+
+    def test_passthrough_pwat_tr_per_region(self, wrf_file_1, tmp_path, cfdb_out):
+        """pwat_tr stored as (time, wvt_region, y, x); per-region values match input."""
+        import cfdb
+        from cfdb_ingest.wrf import WrfIngest
+        dst = tmp_path / 'wrfout_region.nc'
+        fr, _ = _make_region_wrfout(wrf_file_1, dst, n_regions=4)
+        WrfIngest(dst).convert(cfdb_out, variables=['PWAT_TR'])
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            assert 'wvt_region' in ds.coord_names
+            np.testing.assert_array_equal(np.array(ds['wvt_region'][:]), [1, 2, 3, 4])
+            assert ds['wvt_region'].attrs['long_name'] == 'Water Vapour Tracer Source Region'
+            assert ds['pwat_tr'].coord_names == ('time', 'wvt_region', 'y', 'x')
+            pwat = np.array(ds['pwat_tr'][:, :, :, :])
+        with h5py.File(dst, 'r') as h5:
+            rainnc = h5['RAINNC'][:].astype('float64')
+        assert pwat.shape[1] == 4
+        for r in range(4):
+            expected = (fr[r] * (rainnc + 1.0)).astype('float32')
+            np.testing.assert_allclose(pwat[:, r], expected, atol=0.05)
+
+    def test_accumulation_per_region_and_conservation(self, wrf_file_1, tmp_path, cfdb_out):
+        """precip_tr per-region accumulation (with per-region bucket) + conservation."""
+        import cfdb
+        from cfdb_ingest.wrf import WrfIngest
+        dst = tmp_path / 'wrfout_region.nc'
+        n = 4
+        fr, i_counts = _make_region_wrfout(wrf_file_1, dst, n_regions=n)
+        WrfIngest(dst).convert(cfdb_out, variables=['RAIN_TR', 'RAIN'])
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            assert ds['precip_tr'].coord_names == ('time', 'wvt_region', 'y', 'x')
+            precip_tr = np.array(ds['precip_tr'][:, :, :, :])
+            precip = np.squeeze(np.array(ds['precipitation'][:, 0, :, :]))
+
+        # First overall timestep has no prior -> NaN.
+        assert np.all(np.isnan(precip_tr[0]))
+
+        with h5py.File(dst, 'r') as h5:
+            rnc = h5['RAINNC'][:].astype('float64')
+            rc = h5['RAINC'][:].astype('float64')
+            bucket = float(np.asarray(h5.attrs['BUCKET_MM']).item())
+        for r in range(n):
+            # total = frac*(RAINNC + bucket*I_RAINNC) + frac*RAINC; I_TR_RAINC = 0.
+            tot = fr[r] * rnc + bucket * i_counts[r] + fr[r] * rc
+            ref = np.maximum(np.diff(tot, axis=0), 0.0).astype('float32')
+            np.testing.assert_allclose(precip_tr[1:, r], ref, atol=0.05)
+
+        # Conservation: Σ_region precip_tr <= total precip (to encoding precision).
+        s = np.nansum(precip_tr, axis=1)
+        valid = ~np.isnan(precip) & (precip > 1e-6)
+        assert np.all(s[valid] <= precip[valid] + 0.05)
+
+    def test_single_region_3d_is_unchanged(self, wrf_file_1, tmp_path, cfdb_out):
+        """A 3D (single-region) tracer field -> ordinary surface var, no wvt_region."""
+        import shutil
+        import cfdb
+        from cfdb_ingest.wrf import WrfIngest
+        dst = tmp_path / 'wrfout_3d.nc'
+        shutil.copy(wrf_file_1, dst)
+        with h5py.File(dst, 'r+') as h5:
+            pwat3d = (0.3 * (h5['RAINNC'][:] + 1.0)).astype('float32')
+            h5.create_dataset('PWAT_TR', data=pwat3d, dtype='float32')
+        ing = WrfIngest(dst)
+        assert ing._n_wvt_regions is None
+        assert ing._field_region_size == {}
+        ing.convert(cfdb_out, variables=['PWAT_TR'])
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            assert 'wvt_region' not in ds.coord_names
+            assert ds['pwat_tr'].coord_names == ('time', 'height_0m', 'y', 'x')
+            assert ds['pwat_tr'].ndims == 4
+
+    def test_region_n1_writes(self, wrf_file_1, tmp_path, cfdb_out):
+        """num_wvt_regions=1 still emits a size-1 wvt_regions axis (write-helper fix F)."""
+        import cfdb
+        from cfdb_ingest.wrf import WrfIngest
+        dst = tmp_path / 'wrfout_n1.nc'
+        fr, _ = _make_region_wrfout(wrf_file_1, dst, n_regions=1)
+        WrfIngest(dst).convert(cfdb_out, variables=['PWAT_TR', 'RAIN_TR'])
+        with cfdb.open_dataset(cfdb_out, 'r') as ds:
+            assert list(np.array(ds['wvt_region'][:])) == [1]
+            pwat = np.array(ds['pwat_tr'][:, :, :, :])
+            precip_tr = np.array(ds['precip_tr'][:, :, :, :])
+        assert pwat.shape[1] == 1
+        assert precip_tr.shape[1] == 1
+        with h5py.File(dst, 'r') as h5:
+            rainnc = h5['RAINNC'][:].astype('float64')
+        np.testing.assert_allclose(pwat[:, 0], (fr[0] * (rainnc + 1.0)).astype('float32'), atol=0.05)
+
+    def test_heterogeneous_grid_guard(self, wrf_file_1, tmp_path, cfdb_out):
+        """Region fields + heterogeneous grids -> NotImplementedError (no silent corruption)."""
+        from cfdb_ingest.wrf import WrfIngest
+        dst = tmp_path / 'wrfout_region.nc'
+        _make_region_wrfout(wrf_file_1, dst, n_regions=4)
+        ing = WrfIngest(dst)
+        ing._heterogeneous_grids = True
+        with pytest.raises(NotImplementedError):
+            ing.convert(cfdb_out, variables=['PWAT_TR'])
