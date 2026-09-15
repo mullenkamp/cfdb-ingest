@@ -122,7 +122,9 @@ Surface variables are stored with named height coordinates indicating their meas
 
 Pressure level variables use a `pressure` coordinate with `axis='Z'`. Named height coordinates do not have `axis='Z'` when a pressure coordinate is also present.
 
-When a variable name conflicts between surface and pressure levels (e.g. `air_temperature` from both `VAR_2T` and `T`), the surface variant is suffixed: `air_temperature_2m`.
+When a variable name conflicts between surface and pressure levels (e.g. `air_temperature` from both `VAR_2T` and `T`), the surface variant is suffixed: `air_temperature_2m`. A name present at two heights is suffixed at both, so `VAR_10U` and `VAR_100U` are stored as `u_wind_10m` and `u_wind_100m` (before 0.4.0 the 100 m field silently overwrote the 10 m one).
+
+Relative humidity (`R`, percent in the source) is stored as a 0-1 fraction, the convention shared by every source.
 
 ## Geopotential Transform
 

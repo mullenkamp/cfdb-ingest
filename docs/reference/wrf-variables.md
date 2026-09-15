@@ -8,7 +8,9 @@ Variables are stored with coordinates appropriate to their type:
 - **Level-interpolated variables**: `(time, height, y, x)` or `(time, pressure, y, x)`
 - **Soil variables**: `(time, depth, y, x)`
 
-When a surface variable shares a cfdb name with a 3D level-interpolated variable (e.g., `T2` and `T` both map to `air_temp`), the surface variant is suffixed with its height (e.g., `air_temp_2m`) to avoid conflicts.
+When a surface variable shares a cfdb name with a 3D level-interpolated variable (e.g., `T2` and `T` both map to `air_temp`), or a name appears at more than one height, the surface variant is stored with its height suffixed to the **full** cfdb-vars name (e.g., `air_temperature_2m`, `u_wind_10m`). Relative humidity (`RH`, `RH2`) is a 0-1 fraction.
+
+In forecast mode (`dataset_type='grid_forecast'`) `time` becomes the pair `(forecast_reference_time, forecast_period)`; see the [Forecast Datasets](../guide/forecast-datasets.md) guide.
 
 ## Surface variables
 

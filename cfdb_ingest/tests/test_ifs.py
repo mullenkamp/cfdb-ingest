@@ -125,7 +125,7 @@ def test_values_match_closed_forms(converted):
             # orography from the 0 h message, broadcast to every lead, in metres
             terrain = _sq(ds['terrain_height'][0, i, 0, :, :].data)
             np.testing.assert_allclose(terrain, syn.z_sfc(lat2, lon2, 0) / syn.G, atol=0.05)
-            assert (terrain[~land] < 0).all()  # negative orography survives (float32, not the packed template)
+            assert (terrain[~land] < 0).all()  # negative orography survives
             # soil layer 2 (index 1)
             np.testing.assert_allclose(
                 _sq(ds['soil_layer_temp'][0, i, 1, :, :].data), syn.sot(lat2, lon2, 2, step), atol=0.01

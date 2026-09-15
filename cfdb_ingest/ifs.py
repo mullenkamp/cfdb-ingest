@@ -44,8 +44,8 @@ IFS_SOIL_DEPTHS = np.array([0.07, 0.28, 1.00, 2.89])
 
 # Entry format follows the other sources: cfdb_name (cfdb-vars SHORT name), source_vars (GRIB
 # shortNames), transform, height ('levels' | 'soil' | float metres). Extra keys: ``invariant``
-# (source exists at one step only -> broadcast to every lead), ``attrs`` (CF attrs for names
-# cfdb-vars has no template for).
+# (source exists at one step only -> broadcast to every lead), ``attrs`` (extra CF attrs, applied on
+# top of the cfdb-vars template).
 IFS_VARIABLE_MAPPING = {
     # --- pressure levels ---------------------------------------------------------------------
     'T': {'cfdb_name': 'air_temp', 'source_vars': ['t'], 'transform': None, 'height': 'levels'},
@@ -67,13 +67,7 @@ IFS_VARIABLE_MAPPING = {
     'V10': {'cfdb_name': 'v_wind', 'source_vars': ['10v'], 'transform': None, 'height': 10.0},
     'U100': {'cfdb_name': 'u_wind', 'source_vars': ['100u'], 'transform': None, 'height': 100.0},
     'V100': {'cfdb_name': 'v_wind', 'source_vars': ['100v'], 'transform': None, 'height': 100.0},
-    'FG10': {
-        'cfdb_name': 'wind_gust',
-        'source_vars': ['10fg'],
-        'transform': None,
-        'height': 10.0,
-        'attrs': {'long_name': 'wind speed of gust', 'units': 'm s-1', 'standard_name': 'wind_speed_of_gust'},
-    },
+    'FG10': {'cfdb_name': 'wind_gust', 'source_vars': ['10fg'], 'transform': None, 'height': 10.0},
     'MSL': {'cfdb_name': 'mslp', 'source_vars': ['msl'], 'transform': None, 'height': 0.0},
     'SP': {'cfdb_name': 'surface_pressure', 'source_vars': ['sp'], 'transform': None, 'height': 0.0},
     'SKT': {'cfdb_name': 'skin_temp', 'source_vars': ['skt'], 'transform': None, 'height': 0.0},
@@ -342,7 +336,7 @@ class IfsIngest:
         return resolve_variable_keys(self.variables, variables)
 
     def _bbox_selection(self, bbox):
-        """(x indices into the rolled lon axis (may wrap), y indices (north->south), lon values, ascending lat values)."""
+        """(x indices into the rolled lon axis, may wrap; y indices north->south; lon values; ascending lat values)."""
         ni = len(self._lon_axis)
         if bbox is None:
             ii = np.arange(ni)

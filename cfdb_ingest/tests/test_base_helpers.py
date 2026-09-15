@@ -64,7 +64,7 @@ def test_create_cfdb_data_var_names_and_templates(tmp_path):
         assert dv.attrs['units'] == 'K' and dv.attrs['standard_name'] == 'air_temperature'
         dv = base.create_cfdb_data_var(ds, 'u_wind_100m', coords, (1, 1, 3, 4))
         assert dv.name == 'u_wind_100m' and dv.attrs['standard_name'] == 'eastward_wind'
-        # relative humidity: fraction at 0.001 resolution, units '1'
+        # relative humidity: fraction at 0.001 resolution, units '1' (cfdb-vars >= 0.2.4 template)
         rh = base.create_cfdb_data_var(ds, 'relative_humidity_2m', coords, (1, 1, 3, 4))
         rh[0, 0, :, :] = np.full((3, 4), 0.123, dtype='float32')
         assert rh.attrs['units'] == '1'
@@ -77,9 +77,10 @@ def test_create_cfdb_data_var_names_and_templates(tmp_path):
             'wind_gust',
             ('time', 'y', 'x'),
             (1, 3, 4),
-            attrs={'units': 'm s-1', 'standard_name': 'wind_speed_of_gust'},
         )
-        assert g.name == 'wind_gust' and g.attrs['standard_name'] == 'wind_speed_of_gust'
+        assert g.name == 'wind_gust' and g.attrs['standard_name'] == 'wind_speed_of_gust'  # registry template
+        u = base.create_cfdb_data_var(ds, 'unknown_thing', ('time', 'y', 'x'), (1, 3, 4), attrs={'units': 'x'})
+        assert u.attrs['units'] == 'x'  # caller attrs for names cfdb-vars does not know
         # append mode: an existing name is reused, a coordinate mismatch is refused
         assert base.create_cfdb_data_var(ds, 'air_temp_2m', coords, (1, 1, 3, 4)).name == 'air_temperature_2m'
         with pytest.raises(ValueError, match='coords'):

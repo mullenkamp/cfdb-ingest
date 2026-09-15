@@ -13,7 +13,6 @@ import numpy as np
 import pyproj
 import rechunkit
 import cfdb
-from cfdb import dtypes as cfdb_dtypes
 from cfdb.utils import get_var_params
 from cfdb_vars import short_name_map
 import cfdb_ingest
@@ -22,11 +21,8 @@ from cfdb_ingest import forecast as _fc
 _HEIGHT_SUFFIX = re.compile(r'_(\d+)m$')
 _FULL_TO_SHORT = {full: short for short, full in short_name_map.items()}
 
-# Relative humidity is stored as a FRACTION (0-1) in every cfdb-ingest source. The cfdb-vars
-# template (precision 1) would quantise a fraction to 0.1, so the resolution is pinned here until
-# the registry carries it.
-RELATIVE_HUMIDITY_DTYPE = cfdb_dtypes.dtype('float32', precision=3, min_value=0.0, max_value=1.0)
-RELATIVE_HUMIDITY_ATTRS = {'units': '1'}
+# Relative humidity is stored as a FRACTION (0-1) in every cfdb-ingest source (cfdb-vars >= 0.2.4:
+# precision 3, units '1').
 
 
 ######################################################
@@ -150,8 +146,6 @@ def create_cfdb_data_var(ds, cfdb_name: str, coord_names: Tuple[str, ...], chunk
     kwargs = {'chunk_shape': chunk_shape}
     if dtype is not None:
         kwargs['dtype'] = dtype
-    elif full_cfdb_name(base) == 'relative_humidity':
-        kwargs['dtype'] = RELATIVE_HUMIDITY_DTYPE
 
     if base in short_name_map:
         stored_base, var_params, template_attrs = get_var_params(base, kwargs)
@@ -159,8 +153,6 @@ def create_cfdb_data_var(ds, cfdb_name: str, coord_names: Tuple[str, ...], chunk
         stored_base, var_params, template_attrs = base, dict(kwargs), {}
         var_params.setdefault('dtype', 'float32')
     name = stored_base + suffix
-    if stored_base == 'relative_humidity':
-        template_attrs = {**template_attrs, **RELATIVE_HUMIDITY_ATTRS}
     if attrs:
         template_attrs = {**template_attrs, **attrs}
 

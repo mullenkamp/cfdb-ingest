@@ -39,6 +39,15 @@ cfdb-ingest wrf /path/to/wrfout/ output.cfdb --preset wps \
 cfdb-to-int output.cfdb -s 2023-02-10 -e 2023-02-10_06
 ```
 
+## IFS forecasts
+
+```bash
+cfdb-ingest ifs /data/ifs/2026091300/ nz_ifs.cfdb --preset wps --bbox 142,-54,192,-14 --max-lead-hours 144
+cfdb-to-int nz_ifs.cfdb --init 2026-09-13T00 -h 3 -p IFS
+```
+
+One cycle's GRIB2 files become one init of a `grid_forecast` dataset; the export writes one WPS file per lead. See [IFS Ingestion](../guide/ifs-ingestion.md).
+
 ## ERA5
 
 ### Python API

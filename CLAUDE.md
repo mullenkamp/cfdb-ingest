@@ -33,7 +33,7 @@ uv run pytest cfdb_ingest/tests/test_era5.py::TestConvertSurface::test_2m_variab
   - `era5.py` -- `Era5Ingest(H5Ingest)` for NCAR ERA5 NetCDF files. One-variable-per-file handling with `_var_file_map`/`_var_time_map`. EPSG:4326 lat/lon grid. 94 variable mappings. Z disambiguation (pressure-level vs invariant). Split/combined output modes.
   - `ifs.py` -- `IfsIngest` for ECMWF IFS open-data forecast GRIB2 (one cycle per instance; standalone, no h5py machinery). Two-pass read (headers, then per (variable, level) decode/clip) into a `grid_forecast` dataset via `ForecastWriter`. 31 variable mappings; eccodes is the optional `ifs` extra (`eccodeslib` for CCSDS packing).
   - `forecast.py` -- the `grid_forecast` rules shared by every source: `(forecast_reference_time, forecast_period, level, y, x)` layout, explicit init step in minutes, lead `units`, `open_target` (path or open handle; remote-backed paths refused), `place_init` (new / backfill / overwrite), completion marker `attrs['complete_inits']`, `forecast_chunk_shape`, and `ForecastWriter` (one chunk-row buffered per (variable, level), written once).
-  - `thermo.py` -- RH diagnostics (Thompson RSLF from q/t; Clausius-Clapeyron from T/Td). **Relative humidity is a 0-1 fraction everywhere in cfdb** (precision 0.001 via `base.RELATIVE_HUMIDITY_DTYPE` until cfdb-vars carries it); the WPS exporter multiplies by 100.
+  - `thermo.py` -- RH diagnostics (Thompson RSLF from q/t; Clausius-Clapeyron from T/Td). **Relative humidity is a 0-1 fraction everywhere in cfdb** (cfdb-vars >= 0.2.4: precision 0.001, units '1'); the WPS exporter multiplies by 100.
   - `cli.py` -- Typer CLI with `wrf` (incl. `--forecast`), `era5`, `ifs`, and `cfdb-to-int` (incl. `--init`) commands.
   - `cfdb_to_int.py` -- cfdb to WPS intermediate file conversion, for `grid` and `grid_forecast` (one init) datasets. Matches variables by canonical stored name (height suffix stripped), handles 4-D surface variables, refuses two candidates for one WPS field, reads chunk-aligned.
 - `cfdb_ingest/tests/`
@@ -47,7 +47,8 @@ uv run pytest cfdb_ingest/tests/test_era5.py::TestConvertSurface::test_2m_variab
 ## Naming rules that changed in 0.4.0 (release note)
 
 - Surface variables that need a height suffix are stored under the **full** cfdb-vars name (`air_temperature_2m`, not `air_temp_2m`) and carry the template's attrs/dtype; a name that appears at more than one height gets a suffix at every height (`u_wind_10m` / `u_wind_100m` -- previously the last height silently won).
-- `relative_humidity` is a **fraction** at 0.001 resolution in every source (WRF already stored a fraction, but the precision-1 template quantised it to 0.1; ERA5 `R` is now divided by 100). The exporter writes percent.
+- `relative_humidity` is a **fraction** at 0.001 resolution in every source (WRF already stored a fraction, but the precision-1 template quantised it to 0.1; ERA5 `R` is now divided by 100; cfdb-vars 0.2.4 carries the precision-3 template). The exporter writes percent. cfdb-vars 0.2.4 also lifts the −0.9 m floor on `terrain_height`/`geopotential_height` and adds `wind_gust`.
+- ERA5 variables now receive the cfdb-vars templates (packed dtype + CF attrs); before 0.4.0 the full-name mapping entries never matched the short-name templates and every ERA5 variable was generic float32 with no attrs.
 - `cfdb-to-int` previously exported no surface field at all (4-D surface variables were skipped) and no 3-D `TT` (short-name tables never matched stored names), and put `SOILHGT` at level 1.0 instead of 200100.
 
 ## Named Height Coordinates

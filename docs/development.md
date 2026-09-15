@@ -11,8 +11,11 @@ uv sync
 ## Run tests
 
 ```bash
+uv sync --extra ifs      # the IFS tests need eccodes; without the extra they skip
 uv run pytest
 ```
+
+The IFS tests write their own small GRIB2 cycles with eccodes (`cfdb_ingest/tests/create_ifs_test_data.py`); nothing binary is committed for them.
 
 ## Lint and format
 
@@ -36,7 +39,7 @@ uv run mkdocs serve
 
 ## Keeping variable docs in sync
 
-The variable mapping dicts (`WRF_VARIABLE_MAPPING`, `ERA5_VARIABLE_MAPPING`) are the source of
+The variable mapping dicts (`WRF_VARIABLE_MAPPING`, `ERA5_VARIABLE_MAPPING`, `IFS_VARIABLE_MAPPING`) are the source of
 truth for supported variables. A helper checks that every mapped variable is documented in the
 reference pages with a matching cfdb name:
 

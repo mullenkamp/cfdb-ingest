@@ -162,7 +162,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cfdb", specifier = ">=0.9.7" },
-    { name = "cfdb-vars", specifier = ">=0.2.3" },
+    { name = "cfdb-vars", specifier = ">=0.2.4" },
     { name = "eccodes", marker = "extra == 'ifs'", specifier = ">=2.38" },
     { name = "eccodeslib", marker = "extra == 'ifs'", specifier = ">=2.38" },
     { name = "wrf-to-int", specifier = ">=0.1.1" },
@@ -191,15 +191,15 @@ wheels = [
 
 [[package]]
 name = "cfdb-vars"
-version = "0.2.3"
+version = "0.2.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cfdb-models" },
     { name = "msgspec" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/eb/8b/5e280983ed082f9305cc14b1cad3b8330cd7b20ca093b2978f77555c5a03/cfdb_vars-0.2.3.tar.gz", hash = "sha256:606d22c068c76e6a5d704ed1c281124874b5d023658ba9d2d054264e9b09bee1", size = 8836, upload-time = "2026-08-25T01:44:49.427Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8f/93/684d91df4f4386d025d188098531ca2bf41f88b7102844ff5552cf1c0b41/cfdb_vars-0.2.4.tar.gz", hash = "sha256:b6b538090c96f0a12e4fcdef9ce842cba8ba6926462d133ef1b75e116d3ceff0", size = 9064, upload-time = "2026-09-15T01:08:04.43Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fa/b4/008cad8cb4cc389becb65fef40b05cb5cc5a6e814f2d0d1c7cc18c412717/cfdb_vars-0.2.3-py3-none-any.whl", hash = "sha256:9f89657563bddef02ffbbf8b153136ae1a7f2cf5c3ec43c83206041ac94ea1bf", size = 8953, upload-time = "2026-08-25T01:44:48.189Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/44/d5fdec95e4e6d0e8aabb89f64dbb29fa8be5be087eade7bf5dbd4c74bd4d/cfdb_vars-0.2.4-py3-none-any.whl", hash = "sha256:fece4c995791fa666e739d39055daf3adf5ac711de178e6b27a683b15dbaa50f", size = 9202, upload-time = "2026-09-15T01:08:03.508Z" },
 ]
 
 [[package]]

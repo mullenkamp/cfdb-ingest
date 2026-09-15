@@ -7,7 +7,7 @@ Variables are stored with coordinates appropriate to their type:
 - **Surface variables**: `(time, height_Xm, latitude, longitude)` -- named height coordinate (e.g. `height_0m`, `height_2m`, `height_10m`, `height_100m`)
 - **Pressure level variables**: `(time, pressure, latitude, longitude)` -- pressure coordinate with `axis='Z'`
 
-When a variable name conflicts between surface and pressure levels, the surface variant is suffixed with its height (e.g. `air_temperature_2m`).
+When a variable name conflicts between surface and pressure levels, or appears at more than one height, the surface variant is suffixed with its height (e.g. `air_temperature_2m`, `u_wind_10m` / `u_wind_100m`). `R` is stored as a 0-1 fraction.
 
 ## Surface variables at 0m
 
@@ -123,7 +123,7 @@ Derived by vertically integrating the pressure-level humidity and wind fields. S
 | `W` | `vertical_velocity` | W | | Vertical velocity |
 | `VO` | `vorticity` | VO | | Vorticity (relative) |
 | `D` | `divergence` | D | | Divergence |
-| `R` | `relative_humidity` | R | | Relative humidity |
+| `R` | `relative_humidity` | R | percent to fraction | Relative humidity |
 | `O3` | `ozone_mixing_ratio` | O3 | | Ozone mass mixing ratio |
 | `PV` | `potential_vorticity` | PV | | Potential vorticity |
 | `CC` | `cloud_cover` | CC | | Cloud cover |

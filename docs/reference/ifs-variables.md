@@ -16,8 +16,8 @@ Every IFS dataset is a `grid_forecast`:
 - **Soil variables**: `(forecast_reference_time, forecast_period, depth, latitude, longitude)` with
   `depth` = [0.07, 0.28, 1.0, 2.89] m (cumulative layer bottoms of the 0-7 / 7-28 / 28-100 / 100-289 cm layers)
 
-All variables are stored as **unpacked float32** (the GRIB is already 12-16-bit quantised; the packed
-cfdb-vars templates would floor `terrain_height` / `geopotential_height` at -0.9 m). Relative humidity is
+All variables are stored as **unpacked float32** (the GRIB is already 12-16-bit quantised, so a second
+quantisation would only lose information). Relative humidity is
 a 0-1 fraction; `sea_ice` is a 0/1 flag derived from sea-ice thickness (the open data carries no
 fraction); `land_sea_mask` is the IFS fraction; `sea_surface_temp` is skin temperature over water
 (the open data carries no SST field and the IFS is ocean-coupled). Accumulated fields (`tp`, `ssrd`,

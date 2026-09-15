@@ -83,7 +83,9 @@ wrf.convert(
     variables=['T2', 'T'],
     target_levels=[100.0, 500.0],
 )
-# Creates: air_temperature (time, height, y, x) and air_temp_2m (time, height_2m, y, x)
+# Creates: air_temperature (time, height, y, x) and air_temperature_2m (time, height_2m, y, x)
+# (the surface variant takes a height suffix on the full cfdb-vars name because the name also
+# exists on levels; a name present at two heights, e.g. 10 m and 100 m winds, is suffixed at both)
 ```
 
 ### Soil variables
@@ -155,6 +157,19 @@ configuration is required -- the output cfdb variable is identical either way.
   `PWAT`, `PWAT_TR`, `VIMF_U`, `VIMF_V` (native, else integrated from `QVAPOR`/wind/pressure)
 - **Native only** (require a WRF build that emits them): `VIMF_TR_U`, `VIMF_TR_V`, `IVT`
 
+### Forecast mode
+
+A WRF run can be stored as one init of a `grid_forecast` dataset -- `(forecast_reference_time, forecast_period, level, y, x)` -- and successive runs appended:
+
+```python
+wrf.convert('forecasts.cfdb', variables=['T2', 'RAIN', 'U10', 'V10'], dataset_type='grid_forecast')
+# init from SIMULATION_START_DATE (else START_DATE, else the first timestep); leads are hours since it
+wrf_next.convert('forecasts.cfdb', variables=['T2', 'RAIN', 'U10', 'V10'], dataset_type='grid_forecast',
+                 forecast_reference_time='2026-09-13T12')
+```
+
+The target may also be an open cfdb `Dataset` / `EDataset` handle. Every (init, variable, level) chunk-row is buffered and written once, so keep forecast-mode ingests to 2-D variables (each buffered row is `n_lead × ny × nx`). Relative humidity is a 0-1 fraction. See [Forecast Datasets](forecast-datasets.md).
+
 ### Custom chunk shape
 
 All variables are stored as 4D. The output chunk shape defaults to `(1, 1, ny, nx)`. Override:
@@ -219,6 +234,10 @@ cfdb-ingest wrf [OPTIONS] INPUT_PATHS... CFDB_PATH
 | `--chunk-shape` | `-c` | Output chunk shape: `time,z,y,x` (e.g. `1,1,50,50`) |
 | `--max-mem` | | Read buffer size in bytes (default: 536 MiB) |
 | `--compression` | | Compression algorithm: `zstd` or `lz4` (default: `zstd`) |
+| `--forecast` | | Treat the files as ONE forecast run and write a `grid_forecast` dataset (appends to an existing one) |
+| `--init` | | Forecast mode: the run's init (ISO); default `SIMULATION_START_DATE` / `START_DATE` |
+| `--forecast-step-minutes` | | Forecast mode: init step baked into a new dataset (default 360) |
+| `--overwrite` | | Forecast mode: replace an init the dataset already holds complete |
 
 ### Examples
 
