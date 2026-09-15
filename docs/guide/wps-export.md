@@ -10,6 +10,9 @@ Variables are matched by their stored cfdb-vars names after stripping any height
 variables `(time, height_Xm, y, x)` are handled, relative humidity is written in percent from the
 stored 0-1 fraction, and `SKINTEMP` comes from `skin_temperature` (IFS) or `soil_temperature` (WRF `TSK`)
 -- a dataset holding both is refused rather than first-matched.
+When one quantity is stored at several heights (IFS `u_wind_10m` and `u_wind_100m`), the WPS
+surface field takes the screen / anemometer one -- 2 m for `TT`/`DEWPT`/`RH`, 10 m for `UU`/`VV` --
+and the others are simply not exported; two heights with neither the WPS one is refused.
 
 ## The WPS Preset
 

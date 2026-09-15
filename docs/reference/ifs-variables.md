@@ -16,8 +16,15 @@ Every IFS dataset is a `grid_forecast`:
 - **Soil variables**: `(forecast_reference_time, forecast_period, depth, latitude, longitude)` with
   `depth` = [0.07, 0.28, 1.0, 2.89] m (cumulative layer bottoms of the 0-7 / 7-28 / 28-100 / 100-289 cm layers)
 
-All variables are stored as **unpacked float32** (the GRIB is already 12-16-bit quantised, so a second
-quantisation would only lose information). Relative humidity is
+Variables use the **cfdb-vars packed templates** (uint16/uint32 with a fixed decimal precision --
+0.01 K, 0.01 m/s, 0.1 Pa, 1e-6 kg/kg ...). Measured on a real cycle (2026-09-14 12z, 0.4.1): every
+template's precision is at or below the GRIB's own 12-16-bit quantisation step (temperatures 0.01 vs
+0.03 K, pressures 0.1 vs 16 Pa; soil moisture and snow depth 2-4x coarser at 0.001 m3/m3 and 1 mm),
+and the file is 30 % smaller than float32 (220 vs 312 MB for one 49-lead cycle over
+`bbox=(142, -54, 192, -14)`: 201 x 161 points at 0.25 deg, 14 levels, 29 variables). Two fields override the template with float32 (`dtype` in
+the mapping): `cape`, whose template caps at 6552 J kg-1, and `land_sea_mask`, whose template is a
+0/1 flag and would drop the fraction. A value outside a packed template's range would be stored as
+*missing*, so the ingest checks every block against the range and raises instead. Relative humidity is
 a 0-1 fraction; `sea_ice` is a 0/1 flag derived from sea-ice thickness (the open data carries no
 fraction); `land_sea_mask` is the IFS fraction; `sea_surface_temp` is skin temperature over water
 (the open data carries no SST field and the IFS is ocean-coupled). Accumulated fields (`tp`, `ssrd`,

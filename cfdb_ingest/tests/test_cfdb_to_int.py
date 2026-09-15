@@ -114,8 +114,9 @@ BBOX = (160.0, -50.0, 190.0, -30.0)
 @pytest.fixture(scope='module')
 def ifs_cfdb(tmp_path_factory, ifs_cycle_dir, ifs_cycle_b):
     path = tmp_path_factory.mktemp('ifs') / 'ifs.cfdb'
-    IfsIngest(ifs_cycle_dir).convert(path, bbox=BBOX, variables=IFS_WPS_PRESET_KEYS)
-    IfsIngest(ifs_cycle_b).convert(path, bbox=BBOX, variables=IFS_WPS_PRESET_KEYS)
+    keys = IFS_WPS_PRESET_KEYS + ['U100', 'V100', 'TP']  # the extras bundle: 100 m winds coexist with 10 m
+    IfsIngest(ifs_cycle_dir).convert(path, bbox=BBOX, variables=keys)
+    IfsIngest(ifs_cycle_b).convert(path, bbox=BBOX, variables=keys)
     return path
 
 
@@ -173,6 +174,11 @@ def test_forecast_export_one_init(tmp_path, ifs_cfdb, monkeypatch):
         assert set(np.unique(lsm)) <= {0.0, 1.0}
         sst = by[('SST', 200100.0)]
         assert (sst[lsm == 1.0] == MISSING).all() and (sst[lsm == 0.0] > 200.0).all()
+        # UU/VV at the surface are the 10 m winds, never the 100 m ones that share the canonical name
+        assert 'u_wind_100m' in ds.data_var_names
+        np.testing.assert_allclose(by[('UU', 200100.0)], _sq(ds['u_wind_10m'][2, 1, 0, :, :].data), rtol=1e-6)
+        assert not np.allclose(by[('UU', 200100.0)], _sq(ds['u_wind_100m'][2, 1, 0, :, :].data))
+        assert sum(1 for r in recs if r['field'] == 'UU' and r['xlvl'] == 200100.0) == 1
 
 
 def test_forecast_export_rh2_from_dewpoint(tmp_path, ifs_cycle_dir, monkeypatch):
@@ -234,4 +240,11 @@ def test_legacy_3d_surface_and_duplicate_skintemp(tmp_path, monkeypatch):
             dv = ds.create.data_var.generic(name, ('time', 'latitude', 'longitude'), dtype=dtypes.dtype('float32'))
             dv[:] = np.full((2, 3, 4), 290.0, dtype='float32')
     with pytest.raises(ValueError, match='SKINTEMP'):
+        convert_cfdb_to_int(path, hour_interval=6)
+    # one quantity at two heights, neither the WPS surface height, is a real ambiguity
+    with cfdb.open_dataset(str(path), 'w') as ds:
+        for name in ('air_temperature_50m', 'air_temperature_100m'):
+            dv = ds.create.data_var.generic(name, ('time', 'latitude', 'longitude'), dtype=dtypes.dtype('float32'))
+            dv[:] = np.full((2, 3, 4), 280.0, dtype='float32')
+    with pytest.raises(ValueError, match='several heights'):
         convert_cfdb_to_int(path, hour_interval=6)

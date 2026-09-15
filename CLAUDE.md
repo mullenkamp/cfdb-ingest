@@ -41,8 +41,15 @@ uv run pytest cfdb_ingest/tests/test_era5.py::TestConvertSurface::test_2m_variab
   - `test_era5.py` -- 43 ERA5 conversion tests using synthetic data in `tests/data/era5/`
   - `create_test_data.py` -- generates subsetted WRF test files from full wrfout via ncks
   - `create_era5_test_data.py` -- generates synthetic ERA5 test files via h5py
-  - `create_ifs_test_data.py` -- generates a synthetic IFS cycle as real GRIB2 (eccodes) with every production quirk (dateline seam, CCSDS, `soilLayer` indices, `sithick` bitmap, 0 h-only orography, accumulated fields); closed-form values exported for assertions. Generated into a session temp dir by the `ifs_cycle_*` fixtures (deterministic, sub-second) -- nothing binary is committed.
+  - `cfdb_ingest/ifs_synthetic.py` (public module, not under tests/) -- generates a synthetic IFS cycle as real GRIB2 (eccodes) with every production quirk (dateline seam, CCSDS, `soilLayer` indices, `sithick` bitmap, 0 h-only orography, accumulated fields); closed-form values exported for assertions. Generated into a session temp dir by the `ifs_cycle_*` fixtures (deterministic, sub-second) -- nothing binary is committed. Public so `ifs-download` can build the same cycles in its tests.
   - `test_ifs.py`, `test_forecast.py`, `test_wrf_forecast.py`, `test_cfdb_to_int.py`, `test_base_helpers.py` -- forecast mode, the exporter (round-trips through `wps_int_reader.py`, a minimal WPS intermediate-format reader), and the shared helpers
+
+## 0.4.1 (release note)
+
+- `cfdb_ingest.ifs_synthetic` -- the synthetic IFS GRIB2 cycle generator moved out of `tests/` (which the wheel does not ship) so downstream packages can use it.
+- `cfdb-to-int`: a surface quantity stored at several heights (IFS 10 m AND 100 m winds from the extras bundle) exports the WPS one (2 m for T/Td/RH, 10 m for winds) instead of raising on the name collision; two heights with neither the WPS one is still refused.
+- **IFS variables now use the cfdb-vars packed templates** (were float32 in 0.4.0): measured against the GRIB's own quantisation the templates lose nothing; 30 % smaller. `cape` and `land_sea_mask` stay float32 (`dtype` override in the mapping); `soil_moisture` is clipped at 0; a block outside a packed template's range raises (`check_packed_range`) instead of being stored as missing. **A 0.4.0 float32 dataset and a 0.4.1 packed one differ in dtype -- create the production archive with 0.4.1.**
+- `cfdb_ingest.ifs.required_messages(variables)` -- the `{(category, shortName, invariant)}` set a variable selection needs, resolved exactly as `IfsIngest.convert` resolves it; `ifs-download` derives its byte-range manifest from it so the download and the ingest cannot drift.
 
 ## Naming rules that changed in 0.4.0 (release note)
 

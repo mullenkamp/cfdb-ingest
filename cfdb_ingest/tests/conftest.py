@@ -51,7 +51,7 @@ def cfdb_out(tmp_path):
 
 def _write_cycle(tmp_path_factory, init, **kw):
     pytest.importorskip('eccodes')
-    from cfdb_ingest.tests.create_ifs_test_data import write_cycle
+    from cfdb_ingest.ifs_synthetic import write_cycle
     out = tmp_path_factory.mktemp('ifs') / init.replace('-', '').replace('T', '')
     write_cycle(out, init=init, **kw)
     return out
@@ -61,7 +61,7 @@ def _write_cycle(tmp_path_factory, init, **kw):
 def ifs_cycle_dir(tmp_path_factory):
     """The reference synthetic cycle (init 2026-09-13T00, steps 0/3/6, levels 1000/850/500 hPa).
 
-    Generated per session by create_ifs_test_data.write_cycle rather than committed: the generator
+    Generated per session by ifs_synthetic.write_cycle rather than committed: the generator
     is deterministic and sub-second, and a committed copy can drift from it.
     """
     return _write_cycle(tmp_path_factory, '2026-09-13T00')

@@ -8,11 +8,17 @@ import pytest
 
 from cfdb_ingest import forecast as fc
 from cfdb_ingest import thermo
-from cfdb_ingest.tests import create_ifs_test_data as syn
+from cfdb_ingest import ifs_synthetic as syn
 
 pytest.importorskip('eccodes')
 
-from cfdb_ingest.ifs import IFS_SOIL_DEPTHS, IFS_VARIABLE_MAPPING, IFS_WPS_PRESET_KEYS, IfsIngest  # noqa: E402
+from cfdb_ingest.ifs import (  # noqa: E402
+    IFS_SOIL_DEPTHS,
+    IFS_VARIABLE_MAPPING,
+    IFS_WPS_PRESET_KEYS,
+    IfsIngest,
+    required_messages,
+)
 
 BBOX = (160.0, -50.0, 190.0, -30.0)  # crosses the dateline seam of the source grid
 INIT_A = np.datetime64('2026-09-13T00', 'm')
@@ -76,7 +82,11 @@ def test_convert_layout(converted):
         assert ds['soil_moisture'].coord_names == (fc.FRT, fc.LEAD, 'depth', 'latitude', 'longitude')
         np.testing.assert_allclose(ds['depth'].data, IFS_SOIL_DEPTHS, atol=1e-3)  # packed depth coord
         assert ds['air_temperature'].chunk_shape == (1, 3, 1, 5, 7)
-        assert str(ds['air_temperature'].dtype.name) == 'float32' and ds['air_temperature'].attrs['units'] == 'K'
+        # packed templates by default (0.01 K, finer than the GRIB's 0.03 K step); float32 only where the template would misrepresent
+        assert ds['air_temperature'].dtype.precision == 2 and ds['air_temperature'].attrs['units'] == 'K'
+        assert ds['air_temperature'].dtype.dtype_encoded == np.dtype('uint16')
+        assert ds['cape'].dtype.precision is None and ds['land_sea_mask'].dtype.precision is None
+        assert ds['soil_moisture'].dtype.precision == 3
         assert ds['relative_humidity'].attrs['units'] == '1'
         assert ds['wind_gust'].attrs['standard_name'] == 'wind_speed_of_gust'
         assert fc.complete_inits(ds) == ['2026-09-13T00:00']
@@ -197,6 +207,33 @@ def test_wps_preset_keys_are_available(ifs_cycle_dir):
     assert set(IFS_WPS_PRESET_KEYS) <= set(IfsIngest(ifs_cycle_dir).variables)
 
 
+def test_required_messages_matches_the_ingest_needs(ifs_cycle_dir):
+    """The download manifest and the ingest resolve the same sources; z is 0 h-only, nothing else is."""
+    req = required_messages(IFS_WPS_PRESET_KEYS)
+    assert {(c, s) for c, s, _ in req} == {
+        *(('pl', s) for s in ('t', 'u', 'v', 'q', 'gh')),
+        *(('sfc', s) for s in ('2t', '2d', '10u', '10v', 'msl', 'sp', 'skt', 'lsm', 'sithick', 'sd', 'rsn', 'z')),
+        ('soil', 'sot'),
+        ('soil', 'vsw'),
+    }
+    assert {s for c, s, inv in req if inv} == {'z'}
+    # every source the ingest actually reads for the preset is in the set
+    ing = IfsIngest(ifs_cycle_dir)
+    read = {
+        (ing.variables[k]['height'], sv)
+        for k in ing.resolve_variables(IFS_WPS_PRESET_KEYS)
+        for sv in ing.variables[k]['source_vars']
+    }
+    cat = {'levels': 'pl', 'soil': 'soil'}
+    assert {(cat.get(h, 'sfc'), sv) for h, sv in read} == {(c, s) for c, s, _ in req}
+    # extras add exactly the surface bundle; a cfdb short name fans out to every height
+    assert {s for c, s, _ in required_messages(IFS_WPS_PRESET_KEYS + ['TP', 'u_wind'])} - {s for c, s, _ in req} == {
+        'tp',
+        '100u',
+    }
+    assert required_messages(None) >= req
+
+
 # ---------------------------------------------------------------- lifecycle
 
 
@@ -244,3 +281,31 @@ def test_open_handle_and_mismatches(tmp_path, ifs_cycle_dir, ifs_cycle_b):
         ds.create.coord.time(data=np.array(['2026-01-01'], dtype='datetime64[m]'))
     with pytest.raises(ValueError, match="expected 'grid_forecast'"):
         IfsIngest(ifs_cycle_b).convert(g, bbox=BBOX, variables=['SP'])
+
+
+def test_packed_range_guard_refuses_a_value_past_the_template(tmp_path, ifs_cycle_dir, monkeypatch):
+    """A value above a packed template's max would be stored as MISSING; the ingest must refuse instead."""
+    from cfdb import dtypes
+
+    from cfdb_ingest.ifs import check_packed_range, packed_range
+
+    tiny = dtypes.dtype('float32', precision=1, min_value=0, max_value=100)  # 2 m temperature is ~290 K
+    assert packed_range(tiny) == (-0.9, 6552.5)  # offset = min_value - 1, code 0 reserved, uint16 codes
+    assert packed_range(dtypes.dtype('float32')) is None
+    check_packed_range(np.array([np.nan, 1.0, 50.0], dtype='float32'), (0.1, 100.0), 'x')
+    with pytest.raises(ValueError, match='exceed the packed template range'):
+        check_packed_range(np.array([1.0, 100.1], dtype='float32'), (0.1, 100.0), 'x')
+    with pytest.raises(ValueError, match='exceed'):
+        check_packed_range(np.array([-0.5, 1.0], dtype='float32'), (0.1, 100.0), 'x')
+    monkeypatch.setitem(
+        IFS_VARIABLE_MAPPING['T2'], 'dtype', dtypes.dtype('float32', precision=1, min_value=0, max_value=10)
+    )
+    with pytest.raises(ValueError, match='air_temperature.*exceed'):  # no level T requested -> no _2m suffix
+        IfsIngest(ifs_cycle_dir).convert(tmp_path / 'x.cfdb', variables=['T2'], bbox=(160, -50, 190, -30))
+
+
+def test_soil_moisture_is_clipped_at_zero():
+    from cfdb_ingest.ifs import _TRANSFORMS
+
+    out = _TRANSFORMS['clip_nonneg']({'vsw': np.array([-3.6e-12, 0.0, 0.3], dtype='float32')}, None)
+    assert out.dtype == np.dtype('float32') and out.tolist() == [0.0, 0.0, pytest.approx(0.3)]

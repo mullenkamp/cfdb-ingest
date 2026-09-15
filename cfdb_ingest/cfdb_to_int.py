@@ -195,6 +195,16 @@ SOIL_VARS = [
 # Fields whose WPS meaning is a 0/1 flag; IFS stores a fraction.
 _FLAG_FIELDS = {'LANDSEA'}
 
+# The height (m) WPS means by a surface (200100) field: screen-level T / Td / RH, anemometer winds.
+# A dataset holding the same quantity at several heights (IFS 10 m AND 100 m winds) exports this one.
+_WPS_SURFACE_HEIGHT_M = {
+    'air_temperature': 2,
+    'dew_point_temperature': 2,
+    'relative_humidity': 2,
+    'u_wind': 10,
+    'v_wind': 10,
+}
+
 
 ######################################################
 # Dataset introspection
@@ -208,17 +218,42 @@ def _classify_data_vars(ds):
     ``depth``, and a surface field otherwise (a ``height_Xm`` coordinate, or the legacy 3-D layout).
     """
     groups = {'levels': {}, 'surface': {}, 'soil': {}}
+    surface_by_height = {}  # canon -> {height m or None: dv}
     for name in ds.data_var_names:
         dv = ds[name]
         coords = dv.coord_names
         canon = _canon(name)
         group = 'levels' if 'pressure' in coords else 'soil' if 'depth' in coords else 'surface'
+        if group == 'surface':
+            m = _HEIGHT_SUFFIX.search(name)
+            height = int(m.group(1)) if m else None
+            if height in surface_by_height.setdefault(canon, {}):
+                raise ValueError(
+                    f'two variables resolve to {canon!r} at {height} m in the surface group: '
+                    f'{surface_by_height[canon][height].name!r} and {name!r}'
+                )
+            surface_by_height[canon][height] = dv
+            continue
         if canon in groups[group]:
             raise ValueError(
                 f'two variables resolve to {canon!r} in the {group} group: '
                 f'{groups[group][canon].name!r} and {name!r}'
             )
         groups[group][canon] = dv
+    # one quantity at several heights: WPS wants the screen / anemometer one, the rest are not exported
+    for canon, by_height in surface_by_height.items():
+        if len(by_height) == 1:
+            groups['surface'][canon] = next(iter(by_height.values()))
+            continue
+        want = _WPS_SURFACE_HEIGHT_M.get(canon)
+        if want in by_height:
+            groups['surface'][canon] = by_height[want]
+        else:
+            names = sorted(dv.name for dv in by_height.values())
+            raise ValueError(
+                f'{canon!r} is stored at several heights {names} and none is the WPS surface height '
+                f'({want} m): the dataset must hold that one'
+            )
     return groups
 
 

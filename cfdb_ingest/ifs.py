@@ -27,7 +27,7 @@ Requires the ``ifs`` extra: ``pip install 'cfdb-ingest[ifs]'``.
 
 import datetime
 import pathlib
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import pyproj
@@ -45,7 +45,8 @@ IFS_SOIL_DEPTHS = np.array([0.07, 0.28, 1.00, 2.89])
 # Entry format follows the other sources: cfdb_name (cfdb-vars SHORT name), source_vars (GRIB
 # shortNames), transform, height ('levels' | 'soil' | float metres). Extra keys: ``invariant``
 # (source exists at one step only -> broadcast to every lead), ``attrs`` (extra CF attrs, applied on
-# top of the cfdb-vars template).
+# top of the cfdb-vars template), ``dtype`` (override the template's packed encoding; default = the
+# template, whose precision is finer than the GRIB's own 12-16-bit quantisation for every field here).
 IFS_VARIABLE_MAPPING = {
     # --- pressure levels ---------------------------------------------------------------------
     'T': {'cfdb_name': 'air_temp', 'source_vars': ['t'], 'transform': None, 'height': 'levels'},
@@ -77,7 +78,8 @@ IFS_VARIABLE_MAPPING = {
         'transform': 'skt_over_water',
         'height': 0.0,
     },
-    'LSM': {'cfdb_name': 'land_sea_mask', 'source_vars': ['lsm'], 'transform': None, 'height': 0.0},
+    # float32: the template is a 0/1 flag and would drop the IFS fraction
+    'LSM': {'cfdb_name': 'land_sea_mask', 'source_vars': ['lsm'], 'transform': None, 'height': 0.0, 'dtype': 'float32'},
     'SEAICE': {'cfdb_name': 'sea_ice', 'source_vars': ['sithick'], 'transform': 'thickness_to_flag', 'height': 0.0},
     'SD': {'cfdb_name': 'snow_water_equiv', 'source_vars': ['sd'], 'transform': 'm_to_kg_m2', 'height': 0.0},
     'SNOWH': {
@@ -101,7 +103,8 @@ IFS_VARIABLE_MAPPING = {
         'height': 0.0,
     },
     'TCWV': {'cfdb_name': 'pwat', 'source_vars': ['tcwv'], 'transform': None, 'height': 0.0},
-    'CAPE': {'cfdb_name': 'cape', 'source_vars': ['mucape'], 'transform': None, 'height': 0.0},
+    # float32: the packed template caps at 6552 J kg-1 and tropical CAPE exceeds it (a value past the cap packs as missing)
+    'CAPE': {'cfdb_name': 'cape', 'source_vars': ['mucape'], 'transform': None, 'height': 0.0, 'dtype': 'float32'},
     'Z_SFC': {
         'cfdb_name': 'terrain_height',
         'source_vars': ['z'],
@@ -111,7 +114,7 @@ IFS_VARIABLE_MAPPING = {
     },
     # --- soil ---------------------------------------------------------------------------------
     'SOT': {'cfdb_name': 'soil_layer_temp', 'source_vars': ['sot'], 'transform': None, 'height': 'soil'},
-    'VSW': {'cfdb_name': 'soil_moisture', 'source_vars': ['vsw'], 'transform': None, 'height': 'soil'},
+    'VSW': {'cfdb_name': 'soil_moisture', 'source_vars': ['vsw'], 'transform': 'clip_nonneg', 'height': 'soil'},
 }
 
 # The rows cfdb_to_int consumes for WRF forcing.
@@ -171,6 +174,10 @@ def _t_snow_physical_depth(src, level_pa):
     return (src['sd'] * 1000.0 / rsn).astype('float32')
 
 
+def _t_clip_nonneg(src, level_pa):
+    return np.clip(next(iter(src.values())), 0.0, None).astype('float32')  # GRIB rounding gives -1e-12 soil moisture
+
+
 def _t_geopotential_to_height(src, level_pa):
     return (src['z'] / G).astype('float32')
 
@@ -196,6 +203,7 @@ _TRANSFORMS = {
     'm_to_kg_m2': _t_m_to_kg_m2,
     'snow_physical_depth': _t_snow_physical_depth,
     'geopotential_to_height': _t_geopotential_to_height,
+    'clip_nonneg': _t_clip_nonneg,
     'accumulation_increment_m_to_mm': _t_accumulation_increment_m_to_mm,
     'accumulation_to_mean_flux': _t_accumulation_to_mean_flux,
 }
@@ -213,9 +221,61 @@ def _require_eccodes():
     return eccodes
 
 
+def packed_range(dt) -> Optional[Tuple[float, float]]:
+    """
+    The representable ``(lo, hi)`` of a cfdb packed dtype, or None for an unpacked one. Code 0 is
+    the missing marker, so ``lo`` is one step above the offset; ``hi`` is the largest code.
+    """
+    if getattr(dt, 'precision', None) is None or getattr(dt, 'offset', None) is None:
+        return None
+    step = 10.0**-dt.precision
+    return dt.offset + step, dt.offset + float(np.iinfo(dt.dtype_encoded).max) * step
+
+
+def check_packed_range(block: np.ndarray, rng: Tuple[float, float], what: str) -> None:
+    """
+    Refuse a block a packed template cannot hold: cfdb encodes a value above ``hi`` as MISSING
+    (silently, per cell) and a value below ``lo`` wraps in the code space, so either would poke holes
+    into the archive rather than fail. NaN cells (accumulation lead 0, SST over land) are expected.
+    """
+    finite = block[np.isfinite(block)]
+    if finite.size == 0:
+        return
+    lo, hi = rng
+    bmin, bmax = float(finite.min()), float(finite.max())
+    if bmin < lo or bmax > hi:
+        raise ValueError(
+            f'{what}: values {bmin:.6g}..{bmax:.6g} exceed the packed template range {lo:.6g}..{hi:.6g} '
+            f'(a value past the range would be stored as missing); give the mapping entry a wider dtype'
+        )
+
+
 def _category(info) -> str:
     h = info['height']
     return 'pl' if h == 'levels' else 'soil' if h == 'soil' else 'sfc'
+
+
+def required_messages(variables: Optional[List[str]] = None) -> Set[Tuple[str, str, bool]]:
+    """
+    The GRIB messages a set of mapping keys needs, as ``{(category, shortName, invariant)}``.
+
+    ``category`` is ``'pl'`` (all pressure levels), ``'soil'`` (all four layers) or ``'sfc'``;
+    ``invariant`` is True for sources that exist in the 0 h file only (orography ``z``) and so must
+    be fetched for the first step alone. ``variables`` are resolved exactly as ``IfsIngest.convert``
+    resolves them (mapping keys, GRIB shortNames or cfdb short names; None = every mapping row), so a
+    downloader that fetches this set is guaranteed to feed the ingest everything it will ask for.
+    """
+    keys = resolve_variable_keys(IFS_VARIABLE_MAPPING, variables)
+    out = set()
+    for key in keys:
+        info = IFS_VARIABLE_MAPPING[key]
+        cat = _category(info)
+        invariant = bool(info.get('invariant'))
+        for sv in info['source_vars']:
+            out.add((cat, sv, invariant))
+    # a source needed by both an invariant row and a per-step row must be fetched every step
+    per_step = {(c, s) for c, s, inv in out if not inv}
+    return {(c, s, inv and (c, s) not in per_step) for c, s, inv in out}
 
 
 class IfsIngest:
@@ -522,12 +582,15 @@ class IfsIngest:
                     stored_name,
                     coord_names,
                     storage_chunk,
-                    dtype='float32',
+                    dtype=next((self.variables[k].get('dtype') for k in keys if self.variables[k].get('dtype')), None),
                     attrs=next((self.variables[k].get('attrs') for k in keys if self.variables[k].get('attrs')), None),
                 )
+                packed = packed_range(data_var.dtype)
                 for key in keys:
                     for k_idx, level in enumerate(level_values):
                         block = self._read_block(self.variables[key], level, leads, ii, jj)
+                        if packed is not None:
+                            check_packed_range(block, packed, f'{data_var.name} level {level}')
                         writer.put(data_var, k_idx, slice(0, n_lead), block)
 
             # every coordinate exists before the first data variable (cfdb creation order rule)

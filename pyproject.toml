@@ -157,7 +157,7 @@ ban-relative-imports = "all"
 # Tests can use magic values, assertions, and relative imports
 "tests/**/*" = ["PLR2004", "S101", "TID252"]
 "cfdb_ingest/tests/create_test_data.py" = ["T201"]
-"cfdb_ingest/tests/create_ifs_test_data.py" = ["T201"]
+"cfdb_ingest/ifs_synthetic.py" = ["T201"]
 "benchmarks/**/*" = ["T201", "S101"]
 # Standalone CLI helper scripts are expected to print
 "scripts/**/*" = ["T201"]

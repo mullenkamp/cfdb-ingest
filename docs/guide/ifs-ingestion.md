@@ -75,8 +75,30 @@ Rules (see [Forecast Datasets](forecast-datasets.md) for the full set):
 - an init the dataset already holds **complete** is immutable unless `overwrite=True`;
 - every (init, variable, level) chunk-row is written exactly once (`chunk_writes` in the result).
 
-Peak memory is one global field plus one chunk-row `(n_lead, ny, nx)`; a 49-lead NZ box is
-~2 s per lead-file of I/O and ~250 MB compressed per cycle.
+Peak memory is one global field plus one chunk-row `(n_lead, ny, nx)`. Size scales with the box:
+the 49-lead cycle for `bbox=(142, -54, 192, -14)` -- 201 x 161 points at 0.25 deg, all 14 levels,
+the WPS preset plus the extras bundle, 29 variables -- is ~220 MB (packed templates; see
+[IFS Variables](../reference/ifs-variables.md) for the encodings and the range guard).
+
+Two things the ingest does **not** check, because it cannot: that every step of the cycle is on
+disk, and that every step is complete. `leads` come from the files it is given, so a cycle with one
+step file missing ingests as 48 leads and is marked complete. A downloader must therefore pass the
+explicit step files (not the directory), compare `IfsIngest(files).leads` with the step set it
+expects **before** `convert`, and check `result['n_leads']` after. The message set it has to fetch
+comes from the same mapping the ingest uses:
+
+```python
+from cfdb_ingest.ifs import required_messages
+required_messages(IFS_WPS_PRESET_KEYS)
+# {('pl', 't', False), ('pl', 'u', False), ..., ('sfc', 'z', True), ('soil', 'sot', False), ...}
+```
+
+`category` is `pl` (every pressure level), `soil` (every layer) or `sfc`; `invariant=True` marks a
+source that exists in the 0 h file only.
+
+Synthetic cycles for tests come from `cfdb_ingest.ifs_synthetic.write_cycle(out_dir, init, steps,
+levels_hpa)` -- real GRIB2 with the production quirks (dateline seam, CCSDS packing, `soilLayer`
+indices, `sithick` bitmap, 0 h-only orography) and closed-form values for assertions.
 
 ## Downstream: WRF forcing
 

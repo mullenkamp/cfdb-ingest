@@ -15,7 +15,7 @@ uv sync --extra ifs      # the IFS tests need eccodes; without the extra they sk
 uv run pytest
 ```
 
-The IFS tests write their own small GRIB2 cycles with eccodes (`cfdb_ingest/tests/create_ifs_test_data.py`); nothing binary is committed for them.
+The IFS tests write their own small GRIB2 cycles with eccodes (`cfdb_ingest/ifs_synthetic.py`, a public module so `ifs-download` can reuse it); nothing binary is committed for them.
 
 ## Lint and format
 

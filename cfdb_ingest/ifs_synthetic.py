@@ -11,17 +11,20 @@ quirk of the production files that IfsIngest has to handle:
 - accumulated ``tp`` / ``ssrd`` / ``strd``.
 
 Every field is a closed-form function of (lat, lon, level, step) exported here so tests can assert
-values without re-reading the GRIB. The test fixtures generate cycles into a session temp dir (the
-generator is deterministic and sub-second, so nothing binary is committed); run as a module to write
-a cycle somewhere for manual inspection:
+values without re-reading the GRIB. It is a public module (since 0.4.1) so that downstream packages
+-- ``ifs-download`` -- can build the same cycles in their own tests; cfdb-ingest's fixtures generate
+cycles into a session temp dir (the generator is deterministic and sub-second, so nothing binary is
+committed). Run as a module to write a cycle somewhere for manual inspection:
 
-    uv run python -m cfdb_ingest.tests.create_ifs_test_data /tmp/ifs_cycle
+    uv run python -m cfdb_ingest.ifs_synthetic /tmp/ifs_cycle
 """
 
 import pathlib
 import sys
 
 import numpy as np
+
+from cfdb_ingest.ifs import _require_eccodes
 
 NI, NJ = 72, 37  # 5-degree grid, 180E first, 90N first
 DLON = DLAT = 5.0
@@ -31,9 +34,6 @@ LEVELS_HPA = (1000, 850, 500)
 SOIL_LAYERS = (1, 2, 3, 4)
 MISSING = 9999.0
 G = 9.80665
-
-DATA_DIR = pathlib.Path(__file__).parent / 'data' / 'ifs'
-
 
 def grid_lons_lats():
     """Raw (unrolled) grid as written: lons 180, 185, ... 535 (mod 360), lats 90 -> -90."""
@@ -252,7 +252,7 @@ def write_cycle(out_dir, init='2026-09-13T00', steps=STEPS, levels_hpa=LEVELS_HP
 
     ``extras=False`` omits the non-WRF surface bundle (10fg, tcwv, mucape, ssrd, strd, 100u/v).
     """
-    import eccodes as ec
+    ec = _require_eccodes()
 
     init64 = np.datetime64(init, 'm')
     date = int(np.datetime_as_string(init64, unit='D').replace('-', ''))
@@ -300,7 +300,10 @@ def write_cycle(out_dir, init='2026-09-13T00', steps=STEPS, levels_hpa=LEVELS_HP
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    out = pathlib.Path(argv[0]) if argv else DATA_DIR / '2026091300'
+    if not argv:
+        print('usage: python -m cfdb_ingest.ifs_synthetic <out_dir>', file=sys.stderr)
+        return 2
+    out = pathlib.Path(argv[0])
     paths = write_cycle(out)
     total = sum(p.stat().st_size for p in paths)
     print(f'wrote {len(paths)} files, {total / 1024:.0f} KiB, to {out}')
