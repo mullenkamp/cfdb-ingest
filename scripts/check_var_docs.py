@@ -25,6 +25,7 @@ import pathlib
 import re
 
 from cfdb_ingest.era5 import ERA5_VARIABLE_MAPPING
+from cfdb_ingest.ifs import IFS_VARIABLE_MAPPING
 from cfdb_ingest.wrf import WRF_VARIABLE_MAPPING
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -33,6 +34,7 @@ DOCS = REPO_ROOT / 'docs' / 'reference'
 SOURCES = {
     'WRF': (WRF_VARIABLE_MAPPING, DOCS / 'wrf-variables.md'),
     'ERA5': (ERA5_VARIABLE_MAPPING, DOCS / 'era5-variables.md'),
+    'IFS': (IFS_VARIABLE_MAPPING, DOCS / 'ifs-variables.md'),
 }
 
 # First two cells of a table row: | `KEY` | `cfdb_name` | ...

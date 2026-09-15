@@ -254,3 +254,35 @@ class TestCliVerticalCoord:
             assert 'pressure' in ds.coord_names
             assert 'height' not in ds.coord_names
             assert ds['air_temperature'].coord_names == ('time', 'pressure', 'y', 'x')
+
+
+# ---------------------------------------------------------------- forecast mode (WRF --forecast, ifs, cfdb-to-int --init)
+
+class TestForecastCli:
+    def test_wrf_forecast(self, tmp_path):
+        out = tmp_path / 'f.cfdb'
+        result = runner.invoke(app, ['wrf', str(WRF_FILE_1), str(out), '-v', 'T2', '--forecast', '--init', '2023-02-12T00'])
+        assert result.exit_code == 0, result.output
+        assert "'status': 'new'" in result.output
+        import cfdb
+        with cfdb.open_dataset(str(out)) as ds:
+            assert ds.dataset_type == 'grid_forecast'
+        # appending the same init again is refused without --overwrite
+        result = runner.invoke(app, ['wrf', str(WRF_FILE_1), str(out), '-v', 'T2', '--forecast', '--init', '2023-02-12T00'])
+        assert result.exit_code != 0
+        result = runner.invoke(app, ['wrf', str(WRF_FILE_1), str(out), '-v', 'T2', '--forecast', '--init', '2023-02-12T00', '--overwrite'])
+        assert result.exit_code == 0, result.output
+
+    def test_ifs_and_cfdb_to_int_init(self, tmp_path, monkeypatch, ifs_cycle_dir):
+        out = tmp_path / 'ifs.cfdb'
+        result = runner.invoke(app, ['ifs', str(ifs_cycle_dir), str(out), '--preset', 'wps', '-b', '160,-50,190,-30', '--max-lead-hours', '6'])
+        assert result.exit_code == 0, result.output
+        assert "'n_leads': 3" in result.output
+        result = runner.invoke(app, ['ifs', '--help'])
+        assert result.exit_code == 0 and 'grid_forecast' in result.output
+        monkeypatch.chdir(tmp_path)
+        result = runner.invoke(app, ['cfdb-to-int', str(out), '--init', '2026-09-13T00', '-h', '3', '-p', 'IFS'])
+        assert result.exit_code == 0, result.output
+        assert sorted(p.name for p in tmp_path.glob('IFS:*')) == ['IFS:2026-09-13_00', 'IFS:2026-09-13_03', 'IFS:2026-09-13_06']
+        result = runner.invoke(app, ['cfdb-to-int', str(out), '-p', 'IFS'])
+        assert result.exit_code != 0          # init is required for a forecast dataset

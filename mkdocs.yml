@@ -72,9 +72,12 @@ nav:
     - User Guide:
         - WRF Ingestion: guide/wrf-ingestion.md
         - ERA5 Ingestion: guide/era5-ingestion.md
+        - IFS Ingestion: guide/ifs-ingestion.md
+        - Forecast Datasets: guide/forecast-datasets.md
         - WPS Export: guide/wps-export.md
     - Reference:
         - WRF Variables: reference/wrf-variables.md
         - ERA5 Variables: reference/era5-variables.md
+        - IFS Variables: reference/ifs-variables.md
         - API: reference/cfdb_ingest.md
     - Development: development.md

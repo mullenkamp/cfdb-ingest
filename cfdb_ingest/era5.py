@@ -543,7 +543,7 @@ ERA5_VARIABLE_MAPPING = {
     'R': {
         'cfdb_name': 'relative_humidity',
         'source_vars': ['R'],
-        'transform': None,
+        'transform': 'percent_to_fraction',
         'height': 'levels',
     },
     'O3': {
@@ -1097,6 +1097,7 @@ class Era5Ingest(H5Ingest):
 
     _BLOCK_TRANSFORMS = {
         'geopotential_to_height': '_block_geopotential_to_height',
+        'percent_to_fraction': '_block_percent_to_fraction',
         'compute_vimf_u': '_block_vimf_u',
         'compute_vimf_v': '_block_vimf_v',
     }
@@ -1104,6 +1105,11 @@ class Era5Ingest(H5Ingest):
     def _get_block_transform(self, transform_name):
         method = self._BLOCK_TRANSFORMS.get(transform_name)
         return getattr(self, method) if method is not None else None
+
+    def _block_percent_to_fraction(self, sources, y_sl, x_sl, block_cache):
+        """ERA5 relative humidity is in percent; cfdb-ingest stores a 0-1 fraction. Single source."""
+        r = next(iter(sources.values()))
+        return np.clip(r / 100.0, 0.0, 1.0).astype('float32')
 
     def _block_geopotential_to_height(self, sources, y_sl, x_sl, block_cache):
         """Z (geopotential, m^2/s^2) -> geopotential height (m). Single source."""

@@ -655,11 +655,13 @@ class TestVariableMapping:
                 assert len(info['source_vars']) == 1, f'{key} has multiple source vars'
 
     def test_no_transforms_except_geopotential(self):
-        """Only Z and VIMF should have transforms."""
+        """Only Z, VIMF and R (percent -> fraction) should have transforms."""
         for key, info in ERA5_VARIABLE_MAPPING.items():
             if key in ('Z_PL', 'Z_INV'):
                 assert info['transform'] == 'geopotential_to_height'
             elif key.startswith('VIMF_'):
                 assert info['transform'].startswith('compute_vimf_')
+            elif key == 'R':
+                assert info['transform'] == 'percent_to_fraction'
             else:
                 assert info['transform'] is None, f'{key} has unexpected transform'

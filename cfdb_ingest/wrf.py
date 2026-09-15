@@ -454,6 +454,15 @@ class WrfIngest(H5Ingest):
 
             # Extract WRF source info and physics parameters
             self._source_title = _wrf_attr(h5.attrs, 'TITLE').strip()
+            # The run's init, for forecast mode: SIMULATION_START_DATE is the true init of a
+            # restarted run; START_DATE is the start of this segment.
+            self._simulation_start = None
+            for key in ('SIMULATION_START_DATE', 'START_DATE'):
+                if key in h5.attrs:
+                    val = _wrf_attr(h5.attrs, key).strip()
+                    if val:
+                        self._simulation_start = np.datetime64(val.replace('_', 'T'), 'm')
+                        break
             self._wrf_params = {}
             for key in _WRF_DATASET_ATTRS:
                 if key in h5.attrs:
@@ -464,6 +473,12 @@ class WrfIngest(H5Ingest):
         self._heterogeneous_grids = False
         self._dx = float(self.x[1] - self.x[0])
         self._dy = float(self.y[1] - self.y[0])
+
+    def _default_forecast_reference_time(self, filtered_times):
+        """Forecast mode: the run's init from SIMULATION_START_DATE / START_DATE, else the first timestep."""
+        if self._simulation_start is not None:
+            return self._simulation_start
+        return super()._default_forecast_reference_time(filtered_times)
 
     def _parse_crs(self, h5):
         """

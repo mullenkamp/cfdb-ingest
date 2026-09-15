@@ -24,6 +24,7 @@ Supported sources:
 
 - **WRF** -- wrfout NetCDF files (all variables in one file per time range)
 - **ERA5** -- NCAR ERA5 NetCDF files (one variable per file, surface + pressure level + invariant products)
+- **IFS** -- ECMWF IFS open-data forecast cycles (GRIB2), into cfdb `grid_forecast` datasets (`pip install 'cfdb-ingest[ifs]'`)
 
 Key features:
 
@@ -35,7 +36,8 @@ Key features:
 - **Native passthrough with computed fallback** (WRF) -- derived fields (sea-level pressure, precipitable water, moisture flux) are read directly from newer WRF builds, or reconstructed from 3D fields on older `wrfout` files
 - **Auto pressure level detection** (ERA5) -- pressure levels are read directly from source files
 - **Split or combined output** (ERA5) -- create one cfdb per variable or combine into a single dataset
-- **WPS intermediate file export** -- convert cfdb datasets to WPS intermediate format for metgrid.exe
+- **Forecast datasets** -- WRF runs and IFS cycles stored as `grid_forecast` (init × lead), appended one init at a time with every chunk written once
+- **WPS intermediate file export** -- convert cfdb datasets (`grid`, or one init of a `grid_forecast`) to WPS intermediate format for metgrid.exe
 - **Spatial and temporal filtering** -- subset by bounding box and/or date range
 - **Multi-file support** -- seamlessly spans multiple input files
 
@@ -81,6 +83,18 @@ For WPS export, use the `--preset wps` flag:
 ```bash
 cfdb-ingest wrf /path/to/wrfout/ output.cfdb --preset wps -s 2023-02-10 -e 2023-02-10_06
 cfdb-to-int output.cfdb -s 2023-02-10 -e 2023-02-10_06
+```
+
+### IFS forecasts
+
+```bash
+cfdb-ingest ifs /data/ifs/2026091300/ nz_ifs.cfdb --preset wps --bbox 142,-54,192,-14 --max-lead-hours 144
+cfdb-to-int nz_ifs.cfdb --init 2026-09-13T00 -h 3 -p IFS
+```
+
+```python
+from cfdb_ingest import IfsIngest
+IfsIngest('/data/ifs/2026091300/').convert('nz_ifs.cfdb', bbox=(142, -54, 192, -14), max_lead_hours=144)
 ```
 
 ### ERA5

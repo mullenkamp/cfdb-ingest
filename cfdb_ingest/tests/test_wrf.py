@@ -768,7 +768,7 @@ class TestConvert3D:
             # T2 gets suffixed with height to avoid conflict: air_temperature_2m
             assert len(var_names) == 2
             assert 'air_temperature' in var_names
-            assert 'air_temp_2m' in var_names
+            assert 'air_temperature_2m' in var_names
 
             # 3D variable on height coordinate
             t3d = ds['air_temperature']
@@ -779,7 +779,7 @@ class TestConvert3D:
             np.testing.assert_array_equal(height, [100.0, 500.0])
 
             # Surface variable with named height coordinate
-            t2 = ds['air_temp_2m']
+            t2 = ds['air_temperature_2m']
             assert t2.ndims == 4
             assert t2.coord_names == ('time', 'height_2m', 'y', 'x')
 
@@ -1255,10 +1255,10 @@ class TestConvertPressureLevels:
         with cfdb.open_dataset(cfdb_out, 'r') as ds:
             var_names = sorted(v.name for v in ds.data_vars)
             assert 'air_temperature' in var_names
-            assert 'air_temp_2m' in var_names
+            assert 'air_temperature_2m' in var_names
 
             assert ds['air_temperature'].coord_names == ('time', 'pressure', 'y', 'x')
-            assert ds['air_temp_2m'].coord_names == ('time', 'height_2m', 'y', 'x')
+            assert ds['air_temperature_2m'].coord_names == ('time', 'height_2m', 'y', 'x')
 
 
 # ======================================================================

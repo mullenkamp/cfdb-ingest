@@ -31,13 +31,24 @@ uv run pytest cfdb_ingest/tests/test_era5.py::TestConvertSurface::test_2m_variab
   - `base.py` -- `H5Ingest` abstract base class. Handles variable classification (surface/level/soil), named height coordinates, cfdb dataset creation, and three population strategies (rechunkit, per-timestep, batch). Subclass hooks: `file_glob_pattern`, `x_coord_name`/`y_coord_name`, `_init_source_metadata()`, `_create_spatial_coords()`.
   - `wrf.py` -- `WrfIngest(H5Ingest)` for WRF wrfout files. CRS parsing from MAP_PROJ, wind rotation via COSALPHA/SINALPHA, 3D eta-to-height/pressure interpolation, 53 variable mappings with ~30 transforms.
   - `era5.py` -- `Era5Ingest(H5Ingest)` for NCAR ERA5 NetCDF files. One-variable-per-file handling with `_var_file_map`/`_var_time_map`. EPSG:4326 lat/lon grid. 94 variable mappings. Z disambiguation (pressure-level vs invariant). Split/combined output modes.
-  - `cli.py` -- Typer CLI with `wrf`, `era5`, and `cfdb-to-int` commands.
-  - `cfdb_to_int.py` -- cfdb to WPS intermediate file conversion.
+  - `ifs.py` -- `IfsIngest` for ECMWF IFS open-data forecast GRIB2 (one cycle per instance; standalone, no h5py machinery). Two-pass read (headers, then per (variable, level) decode/clip) into a `grid_forecast` dataset via `ForecastWriter`. 31 variable mappings; eccodes is the optional `ifs` extra (`eccodeslib` for CCSDS packing).
+  - `forecast.py` -- the `grid_forecast` rules shared by every source: `(forecast_reference_time, forecast_period, level, y, x)` layout, explicit init step in minutes, lead `units`, `open_target` (path or open handle; remote-backed paths refused), `place_init` (new / backfill / overwrite), completion marker `attrs['complete_inits']`, `forecast_chunk_shape`, and `ForecastWriter` (one chunk-row buffered per (variable, level), written once).
+  - `thermo.py` -- RH diagnostics (Thompson RSLF from q/t; Clausius-Clapeyron from T/Td). **Relative humidity is a 0-1 fraction everywhere in cfdb** (precision 0.001 via `base.RELATIVE_HUMIDITY_DTYPE` until cfdb-vars carries it); the WPS exporter multiplies by 100.
+  - `cli.py` -- Typer CLI with `wrf` (incl. `--forecast`), `era5`, `ifs`, and `cfdb-to-int` (incl. `--init`) commands.
+  - `cfdb_to_int.py` -- cfdb to WPS intermediate file conversion, for `grid` and `grid_forecast` (one init) datasets. Matches variables by canonical stored name (height suffix stripped), handles 4-D surface variables, refuses two candidates for one WPS field, reads chunk-aligned.
 - `cfdb_ingest/tests/`
   - `test_wrf.py` -- 92 WRF conversion tests using subsetted real data in `tests/data/`
   - `test_era5.py` -- 43 ERA5 conversion tests using synthetic data in `tests/data/era5/`
   - `create_test_data.py` -- generates subsetted WRF test files from full wrfout via ncks
   - `create_era5_test_data.py` -- generates synthetic ERA5 test files via h5py
+  - `create_ifs_test_data.py` -- generates a synthetic IFS cycle as real GRIB2 (eccodes) with every production quirk (dateline seam, CCSDS, `soilLayer` indices, `sithick` bitmap, 0 h-only orography, accumulated fields); closed-form values exported for assertions. Generated into a session temp dir by the `ifs_cycle_*` fixtures (deterministic, sub-second) -- nothing binary is committed.
+  - `test_ifs.py`, `test_forecast.py`, `test_wrf_forecast.py`, `test_cfdb_to_int.py`, `test_base_helpers.py` -- forecast mode, the exporter (round-trips through `wps_int_reader.py`, a minimal WPS intermediate-format reader), and the shared helpers
+
+## Naming rules that changed in 0.4.0 (release note)
+
+- Surface variables that need a height suffix are stored under the **full** cfdb-vars name (`air_temperature_2m`, not `air_temp_2m`) and carry the template's attrs/dtype; a name that appears at more than one height gets a suffix at every height (`u_wind_10m` / `u_wind_100m` -- previously the last height silently won).
+- `relative_humidity` is a **fraction** at 0.001 resolution in every source (WRF already stored a fraction, but the precision-1 template quantised it to 0.1; ERA5 `R` is now divided by 100). The exporter writes percent.
+- `cfdb-to-int` previously exported no surface field at all (4-D surface variables were skipped) and no 3-D `TT` (short-name tables never matched stored names), and put `SOILHGT` at level 1.0 instead of 200100.
 
 ## Named Height Coordinates
 

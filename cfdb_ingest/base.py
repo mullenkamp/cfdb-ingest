@@ -1,8 +1,10 @@
 """
 Base class for HDF5/netCDF4 ingestion to cfdb via h5py.
 """
+import contextlib
 import datetime
 import pathlib
+import re
 from contextlib import ExitStack
 from typing import Union, List, Tuple, Dict, Optional
 import concurrent.futures
@@ -11,7 +13,169 @@ import numpy as np
 import pyproj
 import rechunkit
 import cfdb
+from cfdb import dtypes as cfdb_dtypes
+from cfdb.utils import get_var_params
+from cfdb_vars import short_name_map
 import cfdb_ingest
+from cfdb_ingest import forecast as _fc
+
+_HEIGHT_SUFFIX = re.compile(r'_(\d+)m$')
+_FULL_TO_SHORT = {full: short for short, full in short_name_map.items()}
+
+# Relative humidity is stored as a FRACTION (0-1) in every cfdb-ingest source. The cfdb-vars
+# template (precision 1) would quantise a fraction to 0.1, so the resolution is pinned here until
+# the registry carries it.
+RELATIVE_HUMIDITY_DTYPE = cfdb_dtypes.dtype('float32', precision=3, min_value=0.0, max_value=1.0)
+RELATIVE_HUMIDITY_ATTRS = {'units': '1'}
+
+
+######################################################
+# Helpers shared by every source (h5py-based or not)
+
+
+def resolve_variable_keys(mapping: Dict[str, dict], variables: Optional[List[str]]) -> List[str]:
+    """
+    Resolve user-provided variable names to mapping keys.
+
+    Accepts mapping keys, source variable names, or cfdb short names. When a cfdb_name maps to
+    multiple keys (e.g. both surface and level-interpolated variants of air_temp), all matching keys
+    are returned. ``None`` returns every key.
+    """
+    if variables is None:
+        return list(mapping.keys())
+
+    cfdb_name_to_keys = {}
+    source_var_to_key = {}
+    for key, info in mapping.items():
+        cfdb_name_to_keys.setdefault(info['cfdb_name'], []).append(key)
+        for sv in info['source_vars']:
+            # a source name resolves to its passthrough entry when one exists (``2t`` -> T2, not the
+            # derived RH2 that also reads 2t); otherwise to the first entry that reads it
+            single = len(info['source_vars']) == 1
+            if sv not in source_var_to_key or (single and len(mapping[source_var_to_key[sv]]['source_vars']) > 1):
+                source_var_to_key[sv] = key
+
+    resolved = []
+    seen = set()
+    for name in variables:
+        if name in mapping:
+            keys = [name]
+        elif name in cfdb_name_to_keys:
+            keys = cfdb_name_to_keys[name]
+        elif name in source_var_to_key:
+            keys = [source_var_to_key[name]]
+        else:
+            raise ValueError(f'Unknown variable: {name!r}. '
+                             f'Available: {list(mapping.keys())}')
+        for key in keys:
+            if key not in seen:
+                resolved.append(key)
+                seen.add(key)
+
+    return resolved
+
+
+def full_cfdb_name(cfdb_name: str) -> str:
+    """The name a variable is stored under: the cfdb-vars full name when ``cfdb_name`` is a short name."""
+    return short_name_map.get(cfdb_name, cfdb_name)
+
+
+def split_height_suffix(name: str) -> Tuple[str, str]:
+    """``'air_temperature_2m'`` -> ``('air_temperature', '_2m')``; names without a suffix return ``''``."""
+    m = _HEIGHT_SUFFIX.search(name)
+    if m is None:
+        return name, ''
+    return name[:m.start()], m.group(0)
+
+
+def group_variables(mapping: Dict[str, dict], var_keys: List[str],
+                    region_size: Optional[Dict[str, int]] = None) -> Tuple[dict, dict, dict, dict]:
+    """
+    Classify mapping keys into coordinate groups.
+
+    Returns ``(level_vars, surface_vars, soil_vars, region_vars)``. ``level_vars`` / ``soil_vars`` /
+    ``region_vars`` map ``cfdb_name -> [var_key, ...]``. ``surface_vars`` maps
+    ``stored_name -> (height, [var_key, ...])`` where fixed-height surface fields are grouped by
+    (name, height): a name that also exists as a level/soil field, OR that appears at more than one
+    height, gets a ``_<h>m`` suffix on its FULL cfdb-vars name (``air_temperature_2m``,
+    ``u_wind_10m`` and ``u_wind_100m`` coexist). Otherwise the surface field keeps the bare name.
+    """
+    region_size = region_size or {}
+    level_vars = {}
+    soil_vars = {}
+    region_vars = {}
+    by_name_height = {}   # cfdb_name -> {height: [var_key, ...]}
+
+    for var_key in var_keys:
+        info = mapping[var_key]
+        cfdb_name = info['cfdb_name']
+        height_spec = info['height']
+        # Region-dimensioned fields take priority over their nominal height: they are 2D surface
+        # quantities carrying an extra wvt_regions axis. Gated on a recorded region size, so a
+        # region_aware field in a single-region (3D) file falls through to the surface group.
+        if region_size.get(var_key):
+            region_vars.setdefault(cfdb_name, []).append(var_key)
+        elif height_spec == 'levels':
+            level_vars.setdefault(cfdb_name, []).append(var_key)
+        elif height_spec == 'soil':
+            soil_vars.setdefault(cfdb_name, []).append(var_key)
+        else:
+            by_name_height.setdefault(cfdb_name, {}).setdefault(float(height_spec), []).append(var_key)
+
+    surface_vars = {}
+    for cfdb_name, heights in by_name_height.items():
+        conflicting = cfdb_name in level_vars or cfdb_name in soil_vars or len(heights) > 1
+        for h, keys in heights.items():
+            stored = f'{full_cfdb_name(cfdb_name)}_{int(h)}m' if conflicting else cfdb_name
+            surface_vars[stored] = (h, keys)
+
+    return level_vars, surface_vars, soil_vars, region_vars
+
+
+def create_cfdb_data_var(ds, cfdb_name: str, coord_names: Tuple[str, ...], chunk_shape: Tuple[int, ...],
+                         dtype=None, attrs: Optional[dict] = None):
+    """
+    Create (or, in append mode, reuse) a cfdb data variable.
+
+    The cfdb-vars template -- dtype encoding and CF attributes -- is looked up by the BASE name
+    (height suffix stripped, short or full spelling), and the variable is stored under
+    ``full_name + suffix``. ``dtype`` overrides the template encoding (attrs are kept); ``attrs``
+    are applied on top (and are the only attrs for names cfdb-vars does not know).
+
+    If the resolved name already exists (appending an init to an existing forecast dataset) the
+    existing variable is returned after checking its coordinates match.
+    """
+    base, suffix = split_height_suffix(cfdb_name)
+    base = _FULL_TO_SHORT.get(base, base)     # accept either spelling; templates are keyed by short name
+    kwargs = {'chunk_shape': chunk_shape}
+    if dtype is not None:
+        kwargs['dtype'] = dtype
+    elif full_cfdb_name(base) == 'relative_humidity':
+        kwargs['dtype'] = RELATIVE_HUMIDITY_DTYPE
+
+    if base in short_name_map:
+        stored_base, var_params, template_attrs = get_var_params(base, kwargs)
+    else:
+        stored_base, var_params, template_attrs = base, dict(kwargs), {}
+        var_params.setdefault('dtype', 'float32')
+    name = stored_base + suffix
+    if stored_base == 'relative_humidity':
+        template_attrs = {**template_attrs, **RELATIVE_HUMIDITY_ATTRS}
+    if attrs:
+        template_attrs = {**template_attrs, **attrs}
+
+    if name in ds.data_var_names:
+        existing = ds[name]
+        if tuple(existing.coord_names) != tuple(coord_names):
+            raise ValueError(
+                f'existing variable {name!r} has coords {existing.coord_names}, expected {tuple(coord_names)}'
+            )
+        return existing
+
+    data_var = ds.create.data_var.generic(name, coord_names, **var_params)
+    if template_attrs:
+        data_var.attrs.update(template_attrs)
+    return data_var
 
 
 class _ConcatTimeSource:
@@ -91,6 +255,13 @@ class _ConcatTimeSourceUnstaggered(_ConcatTimeSource):
         return (raw[lo] + raw[hi]) / 2.0
 
 
+@contextlib.contextmanager
+def _grid_target(cfdb_path, dataset_type, cfdb_kwargs):
+    """Grid mode: always a fresh file (unchanged behaviour)."""
+    with cfdb.open_dataset(cfdb_path, 'n', dataset_type=dataset_type, **cfdb_kwargs) as ds:
+        yield ds, True
+
+
 class H5Ingest:
     """
     Abstract base class for converting HDF5/netCDF4 files to cfdb.
@@ -108,6 +279,7 @@ class H5Ingest:
     """
 
     file_glob_pattern = '*'
+    _forecast_writer = None
     """Glob pattern for finding source files in directories. Override in subclasses."""
 
     def __init__(self, input_paths: Union[str, pathlib.Path, List[Union[str, pathlib.Path]]]):
@@ -408,44 +580,31 @@ class H5Ingest:
 
     def resolve_variables(self, variables: Optional[List[str]]) -> List[str]:
         """
-        Resolve user-provided variable names to mapping keys.
-
-        Accepts mapping keys, source variable names, or cfdb short names.
-        Returns a list of mapping keys. If variables is None, returns all
-        available mapping keys.
-
-        When a cfdb_name maps to multiple keys (e.g., both surface and
-        level-interpolated variants of air_temp), all matching keys are returned.
+        Resolve user-provided variable names to mapping keys (see ``resolve_variable_keys``).
         """
-        if variables is None:
-            return list(self.variables.keys())
+        return resolve_variable_keys(self.variables, variables)
 
-        mapping = self.variables
-        cfdb_name_to_keys = {}
-        source_var_to_key = {}
-        for key, info in mapping.items():
-            cfdb_name_to_keys.setdefault(info['cfdb_name'], []).append(key)
-            for sv in info['source_vars']:
-                source_var_to_key[sv] = key
+    def _default_forecast_reference_time(self, filtered_times):
+        """Forecast mode: the run's init when the source records it; the first timestep otherwise."""
+        return np.datetime64(filtered_times[0], 'm')
 
-        resolved = []
-        seen = set()
-        for name in variables:
-            if name in mapping:
-                keys = [name]
-            elif name in cfdb_name_to_keys:
-                keys = cfdb_name_to_keys[name]
-            elif name in source_var_to_key:
-                keys = [source_var_to_key[name]]
-            else:
-                raise ValueError(f'Unknown variable: {name!r}. '
-                                 f'Available: {list(mapping.keys())}')
-            for key in keys:
-                if key not in seen:
-                    resolved.append(key)
-                    seen.add(key)
-
-        return resolved
+    def _forecast_axes(self, filtered_times, forecast_reference_time):
+        """
+        (init, leads) for forecast mode: leads are whole hours since ``init``, must be non-negative
+        and regularly spaced (``forecast.lead_step``).
+        """
+        if forecast_reference_time is None:
+            init = self._default_forecast_reference_time(filtered_times)
+        else:
+            init = np.datetime64(forecast_reference_time, 'm')
+        delta_min = (np.asarray(filtered_times).astype('datetime64[m]') - init).astype('int64')
+        if (delta_min < 0).any():
+            raise ValueError(f'timesteps before the forecast_reference_time {init} cannot be leads')
+        if (delta_min % 60).any():
+            raise ValueError('forecast leads must be whole hours after the forecast_reference_time')
+        leads = (delta_min // 60).astype('int32')
+        _fc.lead_step(leads)
+        return init, leads
 
     def _get_soil_depths(self) -> Optional[np.ndarray]:
         """
@@ -466,15 +625,26 @@ class H5Ingest:
         max_mem: int = 2**27,
         chunk_shape: Optional[Tuple[int, ...]] = None,
         dataset_type: str = 'grid',
+        forecast_reference_time=None,
+        forecast_step_minutes: int = 360,
+        overwrite: bool = False,
         **cfdb_kwargs,
     ):
         """
         Convert source files to a cfdb dataset.
 
         Variables are stored with coordinates appropriate to their type:
-        - Surface variables (height is a float): (time, y, x)
+        - Surface variables (height is a float): (time, height_Xm, y, x)
         - Level-interpolated variables (height='levels'): (time, <vertical_coord>, y, x)
         - Soil variables (height='soil'): (time, depth, y, x)
+
+        Forecast mode (``dataset_type='grid_forecast'``): the source is ONE forecast run and ``time``
+        becomes the pair ``(forecast_reference_time, forecast_period)`` -- see ``cfdb_ingest.forecast``.
+        ``cfdb_path`` may then be an existing dataset (the init is appended) or an open
+        Dataset / EDataset handle (never closed here; the caller pushes). Every (init, level) chunk
+        is written exactly once through a ``ForecastWriter``; that writer buffers one chunk-row
+        ``(n_lead, ny, nx)`` per live (variable, level), so keep forecast-mode ingests of per-file
+        sources to 2-D variables.
 
         Parameters
         ----------
@@ -500,11 +670,20 @@ class H5Ingest:
             For 3D surface variables: (1, ny, nx) is used automatically.
             Defaults to (1, 1, ny, nx) for 4D.
         dataset_type : str
-            Passed to cfdb.open_dataset.
+            'grid' (default) or 'grid_forecast'.
+        forecast_reference_time : str, np.datetime64 or None
+            Forecast mode only: the run's init. Default: the source's own init
+            (``_default_forecast_reference_time``), else the first timestep.
+        forecast_step_minutes : int
+            Forecast mode only: the ``forecast_reference_time`` step baked into a NEW dataset.
+        overwrite : bool
+            Forecast mode only: replace an init that is already complete in the target.
         **cfdb_kwargs
             Extra kwargs for cfdb.open_dataset (e.g., compression).
         """
         self._vertical_coord = vertical_coord
+        forecast = dataset_type == 'grid_forecast'
+        self._forecast_writer = None
 
         var_keys = self.resolve_variables(variables)
 
@@ -559,98 +738,101 @@ class H5Ingest:
         ny = len(filtered_y)
         nx = len(filtered_x)
 
-        # Classify variables into coordinate groups
-        level_vars = {}      # cfdb_name -> [var_key, ...]
-        surface_vars = {}    # cfdb_name -> [var_key, ...]  (vars at a fixed height)
-        soil_vars = {}       # cfdb_name -> [var_key, ...]
-        region_vars = {}     # cfdb_name -> [var_key, ...]  (multi-region WVT, region axis)
-
+        # Classify variables into coordinate groups (surface fields keyed by stored name -> (height, keys))
         sorted_levels = np.array(sorted(target_levels), dtype='float64') if target_levels else None
-
-        for var_key in var_keys:
-            info = self.variables[var_key]
-            cfdb_name = info['cfdb_name']
-            height_spec = info['height']
-
-            # Region-dimensioned fields take priority over their nominal height:
-            # they are 2D-surface quantities (height 0.0) carrying an extra
-            # wvt_regions axis. Gated on a recorded region size, so a region_aware
-            # field in a single-region (3D) file falls through to surface_vars
-            # (current behavior, byte-identical).
-            if self._field_region_size.get(var_key):
-                region_vars.setdefault(cfdb_name, []).append(var_key)
-            elif height_spec == 'levels':
-                level_vars.setdefault(cfdb_name, []).append(var_key)
-            elif height_spec == 'soil':
-                soil_vars.setdefault(cfdb_name, []).append(var_key)
-            else:
-                surface_vars.setdefault(cfdb_name, []).append(var_key)
-
-        # Resolve cfdb_name conflicts between surface and level/soil groups.
-        # When a cfdb_name appears in both groups, suffix the surface variant
-        # with its height to disambiguate (e.g. air_temperature_2m).
-        conflicting = set(surface_vars) & (set(level_vars) | set(soil_vars))
-        for name in conflicting:
-            var_key_list = surface_vars.pop(name)
-            h = float(self.variables[var_key_list[0]]['height'])
-            new_name = f'{name}_{int(h)}m'
-            surface_vars[new_name] = var_key_list
+        level_vars, surface_vars, soil_vars, region_vars = group_variables(
+            self.variables, var_keys, self._field_region_size
+        )
 
         # Collect unique fixed heights needed for surface variables
-        fixed_heights = set()
-        for cfdb_name, var_key_list in surface_vars.items():
-            h = float(self.variables[var_key_list[0]]['height'])
-            fixed_heights.add(h)
+        fixed_heights = {h for h, _ in surface_vars.values()}
 
-        # Default chunk shape
-        chunk_4d = chunk_shape if chunk_shape is not None else (1, 1, ny, nx)
+        # Default chunk shape. In forecast mode the storage chunk is 5-D (one init, all leads, one
+        # level, a spatial tile); the populate paths keep seeing a 4-D "time block" view whose time
+        # extent is the whole lead axis, so they hand the writer whole-lead blocks.
+        if forecast:
+            init, leads = self._forecast_axes(filtered_times, forecast_reference_time)
+            storage_chunk = (tuple(chunk_shape) if chunk_shape is not None
+                             else _fc.forecast_chunk_shape(len(leads), ny, nx))
+            if len(storage_chunk) != 5:
+                raise ValueError(f'forecast-mode chunk_shape must be 5-D (init, lead, z, y, x), got {storage_chunk}')
+            chunk_4d = (storage_chunk[1], storage_chunk[2], storage_chunk[3], storage_chunk[4])
+            time_coord_names = (_fc.FRT, _fc.LEAD)
+            target_cm = _fc.open_target(cfdb_path, dataset_type=dataset_type, **cfdb_kwargs)
+        else:
+            chunk_4d = chunk_shape if chunk_shape is not None else (1, 1, ny, nx)
+            storage_chunk = chunk_4d
+            time_coord_names = ('time',)
+            target_cm = _grid_target(cfdb_path, dataset_type, cfdb_kwargs)
 
         has_multi_level = sorted_levels is not None and level_vars
 
-        with cfdb.open_dataset(cfdb_path, 'n', dataset_type=dataset_type, **cfdb_kwargs) as ds:
-            # Create coordinates
-            ds.create.coord.time(data=filtered_times, step=True)
-            self._create_spatial_coords(ds, filtered_x, filtered_y)
-
-            if has_multi_level:
-                if vertical_coord == 'pressure':
-                    ds.create.coord.pressure(data=sorted_levels)
+        with target_cm as (ds, created):
+            if created:
+                # Create coordinates
+                if forecast:
+                    _fc.create_forecast_coords(ds, init, leads, step_minutes=forecast_step_minutes)
                 else:
-                    ds.create.coord.height(data=sorted_levels)
+                    ds.create.coord.time(data=filtered_times, step=True)
+                self._create_spatial_coords(ds, filtered_x, filtered_y)
 
-            if soil_depths is not None and soil_vars:
-                ds.create.coord.depth(data=soil_depths, axis=None)
+                if has_multi_level:
+                    if vertical_coord == 'pressure':
+                        ds.create.coord.pressure(data=sorted_levels)
+                    else:
+                        ds.create.coord.height(data=sorted_levels)
 
-            # Create named height coordinates for fixed-height surface variables.
-            # Each distinct height gets its own length-1 coordinate (e.g. height_2m).
-            # If there's also a multi-level vertical coord, these get axis=None
-            # to avoid conflicting with the axis='Z' on pressure/height.
-            for h in sorted(fixed_heights):
-                coord_name = f'height_{int(h)}m'
-                axis = None if (has_multi_level or len(fixed_heights) > 1) else 'z'
-                ds.create.coord.generic(
-                    coord_name,
-                    data=np.array([h], dtype='float64'),
-                    axis=axis,
+                if soil_depths is not None and soil_vars:
+                    ds.create.coord.depth(data=soil_depths, axis=None)
+
+                # Create named height coordinates for fixed-height surface variables.
+                # Each distinct height gets its own length-1 coordinate (e.g. height_2m).
+                # If there's also a multi-level vertical coord, these get axis=None
+                # to avoid conflicting with the axis='Z' on pressure/height.
+                for h in sorted(fixed_heights):
+                    coord_name = f'height_{int(h)}m'
+                    axis = None if (has_multi_level or len(fixed_heights) > 1) else 'z'
+                    ds.create.coord.generic(
+                        coord_name,
+                        data=np.array([h], dtype='float64'),
+                        axis=axis,
+                    )
+
+                # Region (multi-region WVT) coordinate: integer source-region index
+                # 1..N. axis=None (categorical, not a physical Z). Created before the
+                # region data-var loop (cfdb requires named coords to pre-exist).
+                if region_vars:
+                    region_coord = ds.create.coord.generic(
+                        'wvt_region',
+                        data=np.arange(1, self._n_wvt_regions + 1, dtype='int64'),
+                        axis=None,
+                    )
+                    region_coord.attrs['long_name'] = 'Water Vapour Tracer Source Region'
+
+                # Set CRS
+                ds.create.crs.from_user_input(self.crs, x_coord=self.x_coord_name, y_coord=self.y_coord_name)
+
+                # Set dataset attributes
+                for key, value in self._get_dataset_attrs().items():
+                    ds.attrs[key] = value
+            else:
+                _fc.validate_target(
+                    ds, x_name=self.x_coord_name, y_name=self.y_coord_name, x=filtered_x, y=filtered_y,
+                    levels=sorted_levels if has_multi_level else None,
+                    depths=soil_depths if (soil_depths is not None and soil_vars) else None,
                 )
+                _fc.append_history(ds, f'{datetime.datetime.now(datetime.timezone.utc).isoformat()} '
+                                       f'{type(self).__name__} appended init {np.datetime64(init, "m")}')
 
-            # Region (multi-region WVT) coordinate: integer source-region index
-            # 1..N. axis=None (categorical, not a physical Z). Created before the
-            # region data-var loop (cfdb requires named coords to pre-exist).
-            if region_vars:
-                region_coord = ds.create.coord.generic(
-                    'wvt_region',
-                    data=np.arange(1, self._n_wvt_regions + 1, dtype='int64'),
-                    axis=None,
+            if forecast:
+                if created:
+                    placed = {'index': 0, 'status': 'new', 'autofilled': 0}
+                else:
+                    placed = _fc.place_init(ds, init, step_minutes=forecast_step_minutes, overwrite=overwrite)
+                _fc.unmark_init_complete(ds, init)
+                self._forecast_writer = _fc.ForecastWriter(
+                    ds, placed['index'], _fc.lead_index_map(ds, leads), ny, nx
                 )
-                region_coord.attrs['long_name'] = 'Water Vapour Tracer Source Region'
-
-            # Set CRS
-            ds.create.crs.from_user_input(self.crs, x_coord=self.x_coord_name, y_coord=self.y_coord_name)
-
-            # Set dataset attributes
-            for key, value in self._get_dataset_attrs().items():
-                ds.attrs[key] = value
 
             # Classify into processing groups
             rechunkit_items = []
@@ -676,27 +858,26 @@ class H5Ingest:
                     batch_items.append(item)
 
             # Level-interpolated variables: (time, <vertical_coord>, y, x)
-            level_coord_names = ('time', vertical_coord, self.y_coord_name, self.x_coord_name)
+            level_coord_names = (*time_coord_names, vertical_coord, self.y_coord_name, self.x_coord_name)
             for cfdb_name, var_key_list in level_vars.items():
-                data_var = self._create_cfdb_data_var(ds, cfdb_name, level_coord_names, chunk_4d)
+                data_var = self._create_cfdb_data_var(ds, cfdb_name, level_coord_names, storage_chunk)
                 for var_key in var_key_list:
                     level_indices = list(range(len(sorted_levels)))
                     _classify((var_key, data_var, level_indices), self.variables[var_key])
 
             # Surface variables: (time, height_Xm, y, x)
-            for cfdb_name, var_key_list in surface_vars.items():
-                h = float(self.variables[var_key_list[0]]['height'])
+            for cfdb_name, (h, var_key_list) in surface_vars.items():
                 coord_name = f'height_{int(h)}m'
-                surface_coord_names = ('time', coord_name, self.y_coord_name, self.x_coord_name)
-                data_var = self._create_cfdb_data_var(ds, cfdb_name, surface_coord_names, chunk_4d)
+                surface_coord_names = (*time_coord_names, coord_name, self.y_coord_name, self.x_coord_name)
+                data_var = self._create_cfdb_data_var(ds, cfdb_name, surface_coord_names, storage_chunk)
                 for var_key in var_key_list:
                     # index 0 of the length-1 height coord
                     _classify((var_key, data_var, [0]), self.variables[var_key])
 
             # Soil variables: (time, depth, y, x)
-            soil_coord_names = ('time', 'depth', self.y_coord_name, self.x_coord_name)
+            soil_coord_names = (*time_coord_names, 'depth', self.y_coord_name, self.x_coord_name)
             for cfdb_name, var_key_list in soil_vars.items():
-                data_var = self._create_cfdb_data_var(ds, cfdb_name, soil_coord_names, chunk_4d)
+                data_var = self._create_cfdb_data_var(ds, cfdb_name, soil_coord_names, storage_chunk)
                 for var_key in var_key_list:
                     depth_indices = list(range(len(soil_depths)))
                     _classify((var_key, data_var, depth_indices), self.variables[var_key])
@@ -704,9 +885,9 @@ class H5Ingest:
             # Region (multi-region WVT) variables: (time, wvt_region, y, x).
             # Mechanically identical to level/soil — the region axis is written
             # via vert_indices=range(N) by the existing populate paths.
-            region_coord_names = ('time', 'wvt_region', self.y_coord_name, self.x_coord_name)
+            region_coord_names = (*time_coord_names, 'wvt_region', self.y_coord_name, self.x_coord_name)
             for cfdb_name, var_key_list in region_vars.items():
-                data_var = self._create_cfdb_data_var(ds, cfdb_name, region_coord_names, chunk_4d)
+                data_var = self._create_cfdb_data_var(ds, cfdb_name, region_coord_names, storage_chunk)
                 for var_key in var_key_list:
                     region_indices = list(range(self._field_region_size[var_key]))
                     _classify((var_key, data_var, region_indices), self.variables[var_key])
@@ -761,6 +942,16 @@ class H5Ingest:
                 self._populate_batch_per_timestep(batch_items, time_mask, spatial_slice, max_mem,
                                                   chunk_4d=chunk_4d,
                                                   filtered_y=filtered_y, filtered_x=filtered_x)
+
+            if forecast:
+                self._forecast_writer.close()
+                chunk_writes = self._forecast_writer.writes
+                self._forecast_writer = None
+                _fc.mark_init_complete(ds, init)
+                return {'init': str(np.datetime64(init, 'm')), 'init_index': placed['index'],
+                        'status': placed['status'], 'autofilled': placed['autofilled'],
+                        'n_leads': int(len(leads)), 'variables': list(var_keys),
+                        'chunk_writes': int(chunk_writes)}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -900,20 +1091,11 @@ class H5Ingest:
         """
         return block
 
-    def _create_cfdb_data_var(self, ds, cfdb_name, coord_names, chunk_shape):
+    def _create_cfdb_data_var(self, ds, cfdb_name, coord_names, chunk_shape, dtype=None, attrs=None):
         """
-        Create a cfdb data variable using the template method for cfdb_name.
-
-        Template methods (e.g., ds.create.data_var.air_temp) auto-set the
-        appropriate dtype, encoding, and CF attributes from cfdb's defaults.
-        Falls back to generic float32 for names without a cfdb template.
+        Create a cfdb data variable (see the module-level ``create_cfdb_data_var``).
         """
-        creator = ds.create.data_var
-        template = getattr(creator, cfdb_name, None)
-        if template is not None:
-            return template(coord_names, chunk_shape=chunk_shape)
-
-        return creator.generic(cfdb_name, coord_names, dtype='float32', chunk_shape=chunk_shape)
+        return create_cfdb_data_var(ds, cfdb_name, coord_names, chunk_shape, dtype=dtype, attrs=attrs)
 
     def _setup_populate(self, var_key, target_levels):
         """Hook called before populating a data variable. Override as needed."""
@@ -1224,8 +1406,7 @@ class H5Ingest:
                 continue
             self._write_data_var(data_var, block[i], t_out, vert_indices, y_write, x_write)
 
-    @staticmethod
-    def _write_data_var(data_var, data, output_time_idx, vert_indices, y_write=None, x_write=None):
+    def _write_data_var(self, data_var, data, output_time_idx, vert_indices, y_write=None, x_write=None):
         """
         Write data for a single timestep at the correct indices.
 
@@ -1237,14 +1418,21 @@ class H5Ingest:
         """
         ys = y_write if y_write is not None else slice(None)
         xs = x_write if x_write is not None else slice(None)
+        writer = self._forecast_writer
+        if writer is not None:
+            if data.ndim == 2:
+                writer.put(data_var, vert_indices[0], int(output_time_idx), data, ys, xs)
+            else:
+                for lev_i, v_idx in enumerate(vert_indices):
+                    writer.put(data_var, v_idx, int(output_time_idx), data[lev_i], ys, xs)
+            return
         if data.ndim == 2:
             data_var[(output_time_idx, vert_indices[0], ys, xs)] = data[np.newaxis, np.newaxis, ...]
         else:
             for lev_i, v_idx in enumerate(vert_indices):
                 data_var[(output_time_idx, v_idx, ys, xs)] = data[lev_i][np.newaxis, np.newaxis, ...]
 
-    @staticmethod
-    def _write_data_var_block(data_var, block, time_slice, vert_indices, y_write=None, x_write=None):
+    def _write_data_var_block(self, data_var, block, time_slice, vert_indices, y_write=None, x_write=None):
         """
         Coalesced write of a multi-timestep block.
 
@@ -1260,6 +1448,14 @@ class H5Ingest:
         """
         ys = y_write if y_write is not None else slice(None)
         xs = x_write if x_write is not None else slice(None)
+        writer = self._forecast_writer
+        if writer is not None:
+            if block.ndim == 3:
+                writer.put(data_var, vert_indices[0], time_slice, block, ys, xs)
+            else:
+                for lev_i, v_idx in enumerate(vert_indices):
+                    writer.put(data_var, v_idx, time_slice, block[:, lev_i], ys, xs)
+            return
         if block.ndim == 3:
             data_var[(time_slice, vert_indices[0], ys, xs)] = block
         else:

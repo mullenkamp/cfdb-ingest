@@ -1,6 +1,15 @@
 # WPS Export
 
-cfdb-ingest can export cfdb datasets to WPS intermediate format files for use with metgrid.exe. This enables a workflow where WRF output is first ingested into cfdb, then exported to WPS format for driving a new subdomain in a different coordinate system.
+cfdb-ingest can export cfdb datasets to WPS intermediate format files for use with metgrid.exe. Two
+workflows use it: WRF output ingested into cfdb and exported to drive a new subdomain in a different
+coordinate system, and an [IFS forecast cycle](ifs-ingestion.md) ingested into a `grid_forecast`
+dataset and exported to force a WRF forecast.
+
+Variables are matched by their stored cfdb-vars names after stripping any height suffix
+(`air_temperature`, `air_temperature_2m` and the short `air_temp` all resolve alike), 4-D surface
+variables `(time, height_Xm, y, x)` are handled, relative humidity is written in percent from the
+stored 0-1 fraction, and `SKINTEMP` comes from `skin_temperature` (IFS) or `soil_temperature` (WRF `TSK`)
+-- a dataset holding both is refused rather than first-matched.
 
 ## The WPS Preset
 
@@ -67,7 +76,19 @@ cfdb-ingest wrf /path/to/wrfout/ output.cfdb \
 cfdb-to-int output.cfdb -s 2023-02-10 -e 2023-02-10_06 -h 6
 ```
 
-This produces files named `WRF:2023-02-10_00`, `WRF:2023-02-10_06`, etc.
+This produces files named `WRF:2023-02-10_00`, `WRF:2023-02-10_06`, etc. The prefix may include a
+directory (`-p /run/WRF`).
+
+### Forecast datasets: one init
+
+For a `grid_forecast` dataset select the init; one file is written per lead, named by the valid time:
+
+```bash
+cfdb-to-int nz_ifs.cfdb --init 2026-09-13T00 -h 3 -p IFS     # IFS:2026-09-13_00, IFS:2026-09-13_03, ...
+```
+
+`--start-date` / `--end-date` then filter by valid time. An init the dataset does not mark complete is
+refused before any file is written.
 
 ### Step 3: Run metgrid.exe
 
@@ -102,10 +123,11 @@ cfdb-to-int [OPTIONS] CFDB_PATH
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--start-date` | `-s` | Starting date-time to convert (required) |
-| `--end-date` | `-e` | Ending date-time to convert (required) |
+| `--start-date` | `-s` | First valid time to convert (default: the first available) |
+| `--end-date` | `-e` | Last valid time to convert (default: the last available) |
 | `--hour-interval` | `-h` | Interval in hours between records (default: 6) |
-| `--prefix` | `-p` | Output file prefix (default: `WRF`) |
+| `--prefix` | `-p` | Output file prefix, may include a directory (default: `WRF`) |
+| `--init` | `-i` | `grid_forecast` datasets: the forecast init to export (required there) |
 
 ## Python API
 
@@ -120,7 +142,13 @@ convert_cfdb_to_int(
     end_date=datetime(2023, 2, 10, 6),
     hour_interval=6,
 )
+
+# a forecast dataset: one init, every lead
+convert_cfdb_to_int('nz_ifs.cfdb', output_prefix='IFS', init='2026-09-13T00', hour_interval=3)
 ```
+
+Reads are chunk-aligned: a `grid` dataset is read one (time, level) slab at a time, a `grid_forecast`
+one (init, level) chunk-row at a time.
 
 ## Implementation Notes
 
