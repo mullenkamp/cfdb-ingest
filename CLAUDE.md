@@ -44,6 +44,10 @@ uv run pytest cfdb_ingest/tests/test_era5.py::TestConvertSurface::test_2m_variab
   - `cfdb_ingest/ifs_synthetic.py` (public module, not under tests/) -- generates a synthetic IFS cycle as real GRIB2 (eccodes) with every production quirk (dateline seam, CCSDS, `soilLayer` indices, `sithick` bitmap, 0 h-only orography, accumulated fields); closed-form values exported for assertions. Generated into a session temp dir by the `ifs_cycle_*` fixtures (deterministic, sub-second) -- nothing binary is committed. Public so `ifs-download` can build the same cycles in its tests.
   - `test_ifs.py`, `test_forecast.py`, `test_wrf_forecast.py`, `test_cfdb_to_int.py`, `test_base_helpers.py` -- forecast mode, the exporter (round-trips through `wps_int_reader.py`, a minimal WPS intermediate-format reader), and the shared helpers
 
+## 0.4.2 (release note)
+
+- `IfsIngest` pass 1 now **refuses** three things it used to guess at, ahead of IFS Cycle 50r2 (e-suite Q4 2026, operational Q2 2027 -- its GRIB2-migration sample shows the encodings): a mapped source variable whose GRIB `units` differ from `IFS_SOURCE_UNITS` (50r2 carries `sd`/`tp` in kg m-2 under the same shortNames; the m-based transforms would be 1000x off); the same `(shortName, category, level, step)` twice (a field disseminated in two encodings); a mapped source on a level type outside `_CATEGORY` + `_SURFACE_LEVEL_TYPES` (50r2's `snowLayer` with layers 1..N would otherwise collapse to "surface, level 0"). Unmapped gap-filler messages are still ignored. Mixed inits are now detected per message, before the duplicate check.
+
 ## 0.4.1 (release note)
 
 - `cfdb_ingest.ifs_synthetic` -- the synthetic IFS GRIB2 cycle generator moved out of `tests/` (which the wheel does not ship) so downstream packages can use it.

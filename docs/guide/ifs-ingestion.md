@@ -96,6 +96,11 @@ required_messages(IFS_WPS_PRESET_KEYS)
 `category` is `pl` (every pressure level), `soil` (every layer) or `sfc`; `invariant=True` marks a
 source that exists in the 0 h file only.
 
+The ingest refuses, rather than guesses at, three upstream changes (0.4.2): a source variable in
+other GRIB `units` than `cfdb_ingest.ifs.IFS_SOURCE_UNITS` lists, the same field/level/step twice,
+and a source on a level type it cannot place (`snowLayer` in IFS Cycle 50r2). Each raises a
+`ValueError` naming the file and message; the fix is a mapping change, never a silent conversion.
+
 Synthetic cycles for tests come from `cfdb_ingest.ifs_synthetic.write_cycle(out_dir, init, steps,
 levels_hpa)` -- real GRIB2 with the production quirks (dateline seam, CCSDS packing, `soilLayer`
 indices, `sithick` bitmap, 0 h-only orography) and closed-form values for assertions.

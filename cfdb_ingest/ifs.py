@@ -208,7 +208,44 @@ _TRANSFORMS = {
     'accumulation_to_mean_flux': _t_accumulation_to_mean_flux,
 }
 
+# GRIB ``typeOfLevel`` -> catalogue category. A source variable on any OTHER level type is refused:
+# IFS Cycle 50r2 (e-suite Q4 2026) introduces ``snowLayer`` with layers 1..N for ``sd``/``rsn``/``tsn``,
+# and mapping those to "surface, level 0" would silently keep one layer.
 _CATEGORY = {'isobaricInhPa': 'pl', 'soilLayer': 'soil'}
+_SURFACE_LEVEL_TYPES = ('surface', 'heightAboveGround', 'meanSea', 'entireAtmosphere', 'mostUnstableParcel')
+
+# The GRIB ``units`` every source variable is read in (the 0.25 deg open data, 2026-09). The transforms
+# assume these, so a message in other units is refused instead of being converted wrongly -- 50r2's
+# sample carries ``sd`` and ``tp`` in kg m-2 under the SAME shortNames (x1000 against the m-based rows).
+IFS_SOURCE_UNITS = {
+    't': 'K',
+    'u': 'm s**-1',
+    'v': 'm s**-1',
+    'q': 'kg kg**-1',
+    'gh': 'gpm',
+    '2t': 'K',
+    '2d': 'K',
+    '10u': 'm s**-1',
+    '10v': 'm s**-1',
+    '100u': 'm s**-1',
+    '100v': 'm s**-1',
+    '10fg': 'm s**-1',
+    'msl': 'Pa',
+    'sp': 'Pa',
+    'skt': 'K',
+    'lsm': '(0 - 1)',
+    'sithick': 'm',
+    'sd': 'm of water equivalent',
+    'rsn': 'kg m**-3',
+    'tp': 'm',
+    'ssrd': 'J m**-2',
+    'strd': 'J m**-2',
+    'tcwv': 'kg m**-2',
+    'mucape': 'J kg**-1',
+    'z': 'm**2 s**-2',
+    'sot': 'K',
+    'vsw': 'm**3 m**-3',
+}
 
 
 def _require_eccodes():
@@ -328,13 +365,33 @@ class IfsIngest:
                         break
                     try:
                         short = ec.codes_get(h, 'shortName')
-                        cat = _CATEGORY.get(ec.codes_get(h, 'typeOfLevel'), 'sfc')
+                        level_type = ec.codes_get(h, 'typeOfLevel')
+                        mapped = short in IFS_SOURCE_UNITS
+                        if level_type in _CATEGORY:
+                            cat = _CATEGORY[level_type]
+                        elif level_type in _SURFACE_LEVEL_TYPES or not mapped:
+                            cat = 'sfc'
+                        else:
+                            raise ValueError(
+                                f'{path.name}: {short} is on level type {level_type!r}, which IfsIngest does not '
+                                f'know how to place (expected one of {list(_CATEGORY) + list(_SURFACE_LEVEL_TYPES)}); '
+                                f'refusing rather than guessing'
+                            )
+                        if mapped:
+                            units = ec.codes_get(h, 'units')
+                            if units != IFS_SOURCE_UNITS[short]:
+                                raise ValueError(
+                                    f'{path.name}: {short} is in {units!r}, the mapping expects {IFS_SOURCE_UNITS[short]!r} '
+                                    f'(paramId {ec.codes_get(h, "paramId")}); refusing rather than mis-scaling'
+                                )
                         level = float(ec.codes_get(h, 'level')) if cat != 'sfc' else 0.0
                         step = int(ec.codes_get(h, 'endStep'))
                         offset = int(ec.codes_get(h, 'offset'))
                         date = int(ec.codes_get(h, 'dataDate'))
                         time = int(ec.codes_get(h, 'dataTime'))
                         inits.add((date, time))
+                        if len(inits) != 1:
+                            raise ValueError(f'input files mix forecast inits: {sorted(inits)}')
                         if grid is None:
                             grid = {
                                 k: ec.codes_get(h, k)
@@ -350,7 +407,14 @@ class IfsIngest:
                             }
                     finally:
                         ec.codes_release(h)
-                    catalog.setdefault((short, cat), {}).setdefault(level, {})[step] = (path, offset)
+                    by_step = catalog.setdefault((short, cat), {}).setdefault(level, {})
+                    if step in by_step:
+                        prev = by_step[step]
+                        raise ValueError(
+                            f'{short} ({cat}, level {level:g}, step {step}) appears twice: {prev[0].name}@{prev[1]} and '
+                            f'{path.name}@{offset}; one encoding per field, please'
+                        )
+                    by_step[step] = (path, offset)
         if grid is None:
             raise ValueError('no GRIB messages found')
         if len(inits) != 1:
