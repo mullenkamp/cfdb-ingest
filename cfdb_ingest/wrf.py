@@ -65,6 +65,17 @@ WRF_VARIABLE_MAPPING = {
         'transform': 'accumulation_increment',
         'height': 0.0,
     },
+    # Same quantity as RAIN (precipitation over the output interval) from WRF's own windowed
+    # accumulators (namelist prec_acc_dt = history interval): each frame already holds the increment
+    # since the previous frame, so it needs no previous-frame state -- the source for an init ingested
+    # one file at a time. Lead 0 is 0 (RAIN gives NaN there). Not valid on a two-way-nested PARENT
+    # domain, whose PREC_ACC_* the child's feedback overwrites; use it on the innermost domain.
+    'PREC_ACC': {
+        'cfdb_name': 'precip',
+        'source_vars': ['PREC_ACC_NC', 'PREC_ACC_C'],
+        'transform': 'sum',
+        'height': 0.0,
+    },
     'WIND10': {
         'cfdb_name': 'wind_speed',
         'source_vars': ['U10', 'V10'],
@@ -1296,7 +1307,23 @@ class WrfIngest(H5Ingest):
         'precipitable_water_tracer': '_block_precipitable_water_tracer',
         'vimf_u': '_block_vimf_u',
         'vimf_v': '_block_vimf_v',
+        'sum': '_block_sum',
     }
+
+    def _check_var_keys(self, var_keys):
+        if 'RAIN' in var_keys and 'PREC_ACC' in var_keys:
+            raise ValueError(
+                "'RAIN' and 'PREC_ACC' both write cfdb 'precip'; request one of them "
+                "(PREC_ACC for inits ingested file by file, RAIN for a whole run)"
+            )
+
+    def _block_sum(self, sources, y_sl, x_sl, block_cache):
+        """Elementwise sum of every source (e.g. PREC_ACC_NC + PREC_ACC_C). Shape (N, ny, nx)."""
+        total = None
+        for name in sorted(sources):
+            arr = np.asarray(sources[name], dtype='float32')
+            total = arr.copy() if total is None else total + arr
+        return total
 
     def _get_block_transform(self, transform_name):
         """Return a bound block-transform method for ``transform_name``, or None."""

@@ -37,6 +37,7 @@ Key features:
 - **Auto pressure level detection** (ERA5) -- pressure levels are read directly from source files
 - **Split or combined output** (ERA5) -- create one cfdb per variable or combine into a single dataset
 - **Forecast datasets** -- WRF runs and IFS cycles stored as `grid_forecast` (init × lead), appended one init at a time with every chunk written once
+- **Incremental inits** -- a running forecast ingested one daily file at a time (`leads=`, `mark_complete=False`, `forecast.missing_chunks`), and the S3 archive protocol shared with `ifs-download` (`pip install 'cfdb-ingest[archive]'`)
 - **WPS intermediate file export** -- convert cfdb datasets (`grid`, or one init of a `grid_forecast`) to WPS intermediate format for metgrid.exe
 - **Spatial and temporal filtering** -- subset by bounding box and/or date range
 - **Multi-file support** -- seamlessly spans multiple input files

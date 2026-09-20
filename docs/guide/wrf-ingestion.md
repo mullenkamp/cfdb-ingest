@@ -125,6 +125,14 @@ each interval rather than a running total. Several details are handled automatic
 - **Negative increments** -- small negative differences (which can occur with nudging or two-way
   nesting feedback) are clipped to zero.
 
+`PREC_ACC` (0.5.0) stores the same quantity -- precipitation over the output interval, cfdb `precip`
+-- from WRF's own windowed accumulators `PREC_ACC_NC + PREC_ACC_C` (namelist `prec_acc_dt` set to the
+history interval). Each frame already holds the increment since the previous frame, so it needs no
+previous-frame state: it is the source to use when an init is ingested one file at a time, and it
+gives 0 rather than NaN at lead 0. Not valid on a two-way-nested *parent* domain, whose `PREC_ACC_*`
+the child's feedback overwrites -- use it on the innermost domain. `RAIN` and `PREC_ACC` cannot be
+requested together (both write `precip`).
+
 ### Column-integrated and moisture-transport variables
 
 Precipitable water and vertically integrated moisture flux are available as surface (`height_0m`)
@@ -168,7 +176,20 @@ wrf_next.convert('forecasts.cfdb', variables=['T2', 'RAIN', 'U10', 'V10'], datas
                  forecast_reference_time='2026-09-13T12')
 ```
 
-The target may also be an open cfdb `Dataset` / `EDataset` handle. Every (init, variable, level) chunk-row is buffered and written once, so keep forecast-mode ingests to 2-D variables (each buffered row is `n_lead × ny × nx`). Relative humidity is a 0-1 fraction. See [Forecast Datasets](forecast-datasets.md).
+The target may also be an open cfdb `Dataset` / `EDataset` handle. Every (init, variable, level) lead-span is buffered and written once, so keep forecast-mode ingests to 2-D variables (each buffered span is `n_lead_in_call × ny × nx`). Relative humidity is a 0-1 fraction. See [Forecast Datasets](forecast-datasets.md).
+
+An init can also be ingested **one file at a time** as a running forecast produces them:
+
+```python
+axis = range(0, 145)
+WrfIngest(day1).convert(ds, variables=['T2', 'PREC_ACC', 'WIND10'], dataset_type='grid_forecast',
+                        leads=axis, chunk_shape=(1, 1, 1, ny, nx), mark_complete=False)
+WrfIngest(day2).convert(ds, variables=['T2', 'PREC_ACC', 'WIND10'], dataset_type='grid_forecast',
+                        leads=axis, chunk_shape=(1, 1, 1, ny, nx), mark_complete=False)
+# ... until forecast.missing_chunks(ds, init) == [], then mark (forecast_archive.push_and_mark)
+```
+
+`leads=` fixes the full axis at creation, `mark_complete=False` keeps the init a back-fill target, one lead per chunk keeps every call to its own chunks, and `PREC_ACC` (not `RAIN`) keeps precipitation stateless across files. Details in [Forecast Datasets](forecast-datasets.md#incremental-inits-050).
 
 ### Custom chunk shape
 
@@ -238,6 +259,8 @@ cfdb-ingest wrf [OPTIONS] INPUT_PATHS... CFDB_PATH
 | `--init` | | Forecast mode: the run's init (ISO); default `SIMULATION_START_DATE` / `START_DATE` |
 | `--forecast-step-minutes` | | Forecast mode: init step baked into a new dataset (default 360) |
 | `--overwrite` | | Forecast mode: replace an init the dataset already holds complete |
+| `--leads` | | Forecast mode: the FULL lead axis (hours) for a NEW dataset as `start:stop:step` (stop inclusive, e.g. `0:144:1`) when this call holds part of the run |
+| `--no-mark-complete` | | Forecast mode: a partial call -- leave the init unmarked |
 
 ### Examples
 

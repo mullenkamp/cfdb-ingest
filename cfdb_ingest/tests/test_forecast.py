@@ -212,3 +212,10 @@ def test_validate_target(tmp_path):
         g.create.coord.time(data=np.array(['2026-01-01'], dtype='datetime64[m]'))
         with pytest.raises(ValueError, match="expected 'grid_forecast'"):
             fc.validate_target(g, x_name='longitude', y_name='latitude', x=LON, y=LAT)
+
+
+def test_writer_refuses_spatially_partial_blocks(tmp_path):
+    with _make(tmp_path / 'p.cfdb') as ds:
+        w = fc.ForecastWriter(ds, 0, fc.lead_index_map(ds, LEADS), len(LAT), len(LON))
+        with pytest.raises(NotImplementedError, match='full-extent'):
+            w.put(ds['air_temperature_2m'], 0, 0, np.zeros((len(LAT), 2), 'float32'), slice(None), slice(0, 2))

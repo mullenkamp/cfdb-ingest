@@ -133,16 +133,27 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/8d/f8/f40ad6af0eb32d0120e01174f0bcf96abfe933ab665a1f730e27a28bed18/cfdb-0.9.7-py3-none-any.whl", hash = "sha256:5dce9f6b14e135c479ae75956132f2ba471bbcf07407f1d473491d79c0f4a1fe", size = 82116, upload-time = "2026-08-25T06:42:36.797Z" },
 ]
 
+[package.optional-dependencies]
+ebooklet = [
+    { name = "ebooklet" },
+]
+
 [[package]]
 name = "cfdb-ingest"
 source = { editable = "." }
 dependencies = [
     { name = "cfdb" },
     { name = "cfdb-vars" },
+    { name = "typer" },
+    { name = "typing-extensions" },
     { name = "wrf-to-int" },
 ]
 
 [package.optional-dependencies]
+archive = [
+    { name = "cfdb", extra = ["ebooklet"] },
+    { name = "ebooklet" },
+]
 ifs = [
     { name = "eccodes" },
     { name = "eccodeslib" },
@@ -162,12 +173,16 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cfdb", specifier = ">=0.9.7" },
+    { name = "cfdb", extras = ["ebooklet"], marker = "extra == 'archive'", specifier = ">=0.9.7" },
     { name = "cfdb-vars", specifier = ">=0.2.4" },
+    { name = "ebooklet", marker = "extra == 'archive'", specifier = ">=0.10.5" },
     { name = "eccodes", marker = "extra == 'ifs'", specifier = ">=2.38" },
     { name = "eccodeslib", marker = "extra == 'ifs'", specifier = ">=2.38" },
+    { name = "typer", specifier = ">=0.12" },
+    { name = "typing-extensions", specifier = ">=4.15.0" },
     { name = "wrf-to-int", specifier = ">=0.1.1" },
 ]
-provides-extras = ["ifs"]
+provides-extras = ["archive", "ifs"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -477,6 +492,22 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/43/fa/6d96a0978d19e17b68d634497769987b16c8f4cd0a7a05048bec693caa6b/decorator-5.2.1.tar.gz", hash = "sha256:65f266143752f734b0a7cc83c46f4618af75b8c5911b00ccb61d0ac9b6da0360", size = 56711, upload-time = "2025-02-24T04:41:34.073Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4e/8c/f3147f5c4b73e7550fe5f9352eaa956ae838d5c51eb58e7a25b9f3e2643b/decorator-5.2.1-py3-none-any.whl", hash = "sha256:d316bb415a2d9e2d2b3abcc4084c6502fc09240e292cd76a76afc106a1c8e04a", size = 9190, upload-time = "2025-02-24T04:41:32.565Z" },
+]
+
+[[package]]
+name = "ebooklet"
+version = "0.10.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "booklet" },
+    { name = "msgspec" },
+    { name = "portalocker" },
+    { name = "s3func" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b3/33/f41536b10d853994bd1c74539f4234640e4d92bd7558ac3d8f54b33ffcfa/ebooklet-0.10.5.tar.gz", hash = "sha256:d66c287e5f56da8accaca7c8d17e54dc4a04a874ab501aad03aa4b7236ec77ed", size = 68481, upload-time = "2026-09-08T04:19:00.127Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b6/32/11be14fa6a229e61053760d5126046574b967db82cbe5b0e60ba7171cff3/ebooklet-0.10.5-py3-none-any.whl", hash = "sha256:8cb7d814225d8985fc8b4e076cc62352ae4695036f1a93b98ab3d03a1983314f", size = 71925, upload-time = "2026-09-08T04:18:58.466Z" },
 ]
 
 [[package]]
@@ -1767,6 +1798,19 @@ wheels = [
 ]
 
 [[package]]
+name = "s3func"
+version = "0.9.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "orjson" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d1/4f/e13d59b11e5e89c5b2f4c37f1a29ca65441e74f410c8054ab7b01fb1cc5e/s3func-0.9.6.tar.gz", hash = "sha256:03376e7d900129b27e53227fbaa9602b06ada483cfbe3bf8231178d78d856585", size = 59324, upload-time = "2026-08-08T19:33:06.17Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c8/e2/866bc04e973769cdeb9685cc5ad4a0202a7f6e7396fcf92fe169b335cbb5/s3func-0.9.6-py3-none-any.whl", hash = "sha256:0a24a1bf4de7fff8248271c5f283f936a0b892028d1cf127b5570a6d89cf9285", size = 68534, upload-time = "2026-08-08T19:33:04.305Z" },
+]
+
+[[package]]
 name = "scipy"
 version = "1.15.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2120,6 +2164,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/72/94/1a15dd82efb362ac84269196e94cf00f187f7ed21c242792a923cdb1c61f/typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466", size = 109391, upload-time = "2025-08-25T13:49:26.313Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/18/67/36e9267722cc04a6b9f15c7f3441c2363321a3ea07da7ae0c0707beb2a9c/typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548", size = 44614, upload-time = "2025-08-25T13:49:24.86Z" },
+]
+
+[[package]]
+name = "urllib3"
+version = "2.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e3/05/b17359e1cefb4f909b5e40b1b90a496d987258916dbbf88e842c729f510e/urllib3-2.8.0.tar.gz", hash = "sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63", size = 458972, upload-time = "2026-09-15T19:29:36.253Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl", hash = "sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3", size = 135717, upload-time = "2026-09-15T19:29:34.577Z" },
 ]
 
 [[package]]

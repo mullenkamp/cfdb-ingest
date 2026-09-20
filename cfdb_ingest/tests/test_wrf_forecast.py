@@ -88,6 +88,7 @@ def test_second_init_appends_with_autofill(tmp_path):
         'n_leads': 24,
         'variables': VARS,
         'chunk_writes': 4,
+        'complete': True,
     }
     with cfdb.open_dataset(str(p)) as f:
         assert len(f[fc.FRT].data) == 5

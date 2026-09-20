@@ -32,7 +32,9 @@ uv run pytest cfdb_ingest/tests/test_era5.py::TestConvertSurface::test_2m_variab
   - `wrf.py` -- `WrfIngest(H5Ingest)` for WRF wrfout files. CRS parsing from MAP_PROJ, wind rotation via COSALPHA/SINALPHA, 3D eta-to-height/pressure interpolation, 53 variable mappings with ~30 transforms.
   - `era5.py` -- `Era5Ingest(H5Ingest)` for NCAR ERA5 NetCDF files. One-variable-per-file handling with `_var_file_map`/`_var_time_map`. EPSG:4326 lat/lon grid. 94 variable mappings. Z disambiguation (pressure-level vs invariant). Split/combined output modes.
   - `ifs.py` -- `IfsIngest` for ECMWF IFS open-data forecast GRIB2 (one cycle per instance; standalone, no h5py machinery). Two-pass read (headers, then per (variable, level) decode/clip) into a `grid_forecast` dataset via `ForecastWriter`. 31 variable mappings; eccodes is the optional `ifs` extra (`eccodeslib` for CCSDS packing).
-  - `forecast.py` -- the `grid_forecast` rules shared by every source: `(forecast_reference_time, forecast_period, level, y, x)` layout, explicit init step in minutes, lead `units`, `open_target` (path or open handle; remote-backed paths refused), `place_init` (new / backfill / overwrite), completion marker `attrs['complete_inits']`, `forecast_chunk_shape`, and `ForecastWriter` (one chunk-row buffered per (variable, level), written once).
+  - `forecast_archive.py` -- the S3 archive protocol (extra `archive`): open/refuse-create, retention, two-commit `push_and_mark`, sidecar, flock, SIGTERM, `break_locks`.
+  - `wrf_synthetic.py` -- deterministic synthetic wrfout generator for tests (public, like `ifs_synthetic`).
+  - `forecast.py` -- the `grid_forecast` rules shared by every source: `(forecast_reference_time, forecast_period, level, y, x)` layout, explicit init step in minutes, lead `units`, `open_target` (path or open handle; remote-backed paths refused), `place_init` (new / backfill / overwrite), completion marker `attrs['complete_inits']`, `forecast_chunk_shape`, and `ForecastWriter` (one lead-span buffered per (variable, level), written once), `missing_chunks` / `init_index` (0.5.0).
   - `thermo.py` -- RH diagnostics (Thompson RSLF from q/t; Clausius-Clapeyron from T/Td). **Relative humidity is a 0-1 fraction everywhere in cfdb** (cfdb-vars >= 0.2.4: precision 0.001, units '1'); the WPS exporter multiplies by 100.
   - `cli.py` -- Typer CLI with `wrf` (incl. `--forecast`), `era5`, `ifs`, and `cfdb-to-int` (incl. `--init`) commands.
   - `cfdb_to_int.py` -- cfdb to WPS intermediate file conversion, for `grid` and `grid_forecast` (one init) datasets. Matches variables by canonical stored name (height suffix stripped), handles 4-D surface variables, refuses two candidates for one WPS field, reads chunk-aligned.
@@ -43,6 +45,31 @@ uv run pytest cfdb_ingest/tests/test_era5.py::TestConvertSurface::test_2m_variab
   - `create_era5_test_data.py` -- generates synthetic ERA5 test files via h5py
   - `cfdb_ingest/ifs_synthetic.py` (public module, not under tests/) -- generates a synthetic IFS cycle as real GRIB2 (eccodes) with every production quirk (dateline seam, CCSDS, `soilLayer` indices, `sithick` bitmap, 0 h-only orography, accumulated fields); closed-form values exported for assertions. Generated into a session temp dir by the `ifs_cycle_*` fixtures (deterministic, sub-second) -- nothing binary is committed. Public so `ifs-download` can build the same cycles in its tests.
   - `test_ifs.py`, `test_forecast.py`, `test_wrf_forecast.py`, `test_cfdb_to_int.py`, `test_base_helpers.py` -- forecast mode, the exporter (round-trips through `wps_int_reader.py`, a minimal WPS intermediate-format reader), and the shared helpers
+
+## 0.5.0 (release note)
+
+- **Incremental forecast inits.** `convert(..., leads=)` bakes the FULL `forecast_period` axis into a new
+  `grid_forecast` dataset when the creating call holds only part of the run (`--leads 0:144:1`);
+  `convert(..., mark_complete=False)` (`--no-mark-complete`) leaves the init unmarked so the next call is a
+  back-fill and no `complete_inits`-gated reader sees a partial init as whole. `unmark_init_complete` now
+  creates the marker on a dataset that had none (seeded with the inits that hold chunks). The
+  `ForecastWriter` buffers the call's lead-span, not the whole axis (98 MB -> 16 MB per live variable for
+  a daily file on the 3 km domain) and flushes only contiguous runs of FILLED leads -- a source coarser than
+  the axis leaves the gaps absent, never NaN chunks (which `missing_chunks` could not see); spatially partial
+  blocks are refused. Result dict gains `'complete'`.
+- `forecast.missing_chunks(ds, init)` -- every absent chunk of an init, probed by key presence (no fetch);
+  the completeness check for incremental writers and the sweep a remote reader runs after `load()`.
+  `forecast.init_index(ds, init)` matches by value.
+- `WRF_VARIABLE_MAPPING['PREC_ACC']` -- `precip` from `PREC_ACC_NC + PREC_ACC_C` (new `sum` transform):
+  stateless per-frame increments (namelist `prec_acc_dt` = history interval), the precipitation source for
+  file-by-file ingests; innermost domain only. Refused together with `RAIN`.
+- `cfdb_ingest.forecast_archive` (extra `archive`) -- the S3 archive protocol lifted from `ifs-download`
+  0.1: `open_target`, `refuse_create`, `inits_to_drop`/`apply_retention`, `push_twice`/`push_and_mark`
+  (two commits), sidecar, `run_lock`, SIGTERM handler, and `break_locks` (all tickets; `force_lock=True`
+  is age-gated to 2 h). `ifs-download` still carries its own copy until its next release.
+- `cfdb_ingest.wrf_synthetic` -- a deterministic wrfout generator (`write_wrfout`, `write_run`,
+  closed forms in `expected`) with `SIMULATION_START_DATE`, `PREC_ACC_*`, consistent `RAINNC/RAINC`
+  (optionally bucketed), for downstream tests.
 
 ## 0.4.2 (release note)
 

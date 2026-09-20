@@ -620,6 +620,8 @@ class H5Ingest:
         forecast_reference_time=None,
         forecast_step_minutes: int = 360,
         overwrite: bool = False,
+        leads=None,
+        mark_complete: bool = True,
         **cfdb_kwargs,
     ):
         """
@@ -670,14 +672,26 @@ class H5Ingest:
             Forecast mode only: the ``forecast_reference_time`` step baked into a NEW dataset.
         overwrite : bool
             Forecast mode only: replace an init that is already complete in the target.
+        leads : sequence of int or None
+            Forecast mode only: the FULL ``forecast_period`` axis (hours) to bake into a NEW dataset,
+            when this call supplies only part of the run (an init built up file by file). Default:
+            this call's leads. On an existing dataset it must equal the stored axis.
+        mark_complete : bool
+            Forecast mode only: record the init in ``complete_inits`` at the end (default). Pass
+            ``False`` for a partial call; the init then stays a back-fill target until the caller has
+            checked ``forecast.missing_chunks`` and marks it.
         **cfdb_kwargs
             Extra kwargs for cfdb.open_dataset (e.g., compression).
         """
         self._vertical_coord = vertical_coord
         forecast = dataset_type == 'grid_forecast'
         self._forecast_writer = None
+        leads_arg = leads
+        if not forecast and (leads is not None or not mark_complete):
+            raise ValueError("'leads' and 'mark_complete' apply to dataset_type='grid_forecast' only")
 
         var_keys = self.resolve_variables(variables)
+        self._check_var_keys(var_keys)
 
         has_level_interp = any(self.variables[k]['height'] == 'levels' for k in var_keys)
         if has_level_interp and target_levels is None:
@@ -744,8 +758,9 @@ class H5Ingest:
         # extent is the whole lead axis, so they hand the writer whole-lead blocks.
         if forecast:
             init, leads = self._forecast_axes(filtered_times, forecast_reference_time)
+            axis_leads = leads if leads_arg is None else _fc.check_axis_leads(leads_arg, leads)
             storage_chunk = (tuple(chunk_shape) if chunk_shape is not None
-                             else _fc.forecast_chunk_shape(len(leads), ny, nx))
+                             else _fc.forecast_chunk_shape(len(axis_leads), ny, nx))
             if len(storage_chunk) != 5:
                 raise ValueError(f'forecast-mode chunk_shape must be 5-D (init, lead, z, y, x), got {storage_chunk}')
             chunk_4d = (storage_chunk[1], storage_chunk[2], storage_chunk[3], storage_chunk[4])
@@ -763,7 +778,7 @@ class H5Ingest:
             if created:
                 # Create coordinates
                 if forecast:
-                    _fc.create_forecast_coords(ds, init, leads, step_minutes=forecast_step_minutes)
+                    _fc.create_forecast_coords(ds, init, axis_leads, step_minutes=forecast_step_minutes)
                 else:
                     ds.create.coord.time(data=filtered_times, step=True)
                 self._create_spatial_coords(ds, filtered_x, filtered_y)
@@ -820,6 +835,13 @@ class H5Ingest:
                 if created:
                     placed = {'index': 0, 'status': 'new', 'autofilled': 0}
                 else:
+                    if leads_arg is not None:
+                        stored = np.asarray(ds[_fc.LEAD].data)
+                        if len(stored) != len(axis_leads) or not np.array_equal(stored, axis_leads):
+                            raise ValueError(
+                                f'leads={np.asarray(leads_arg).tolist()} does not match the stored {_fc.LEAD} '
+                                f'axis {stored.tolist()}; the lead axis is fixed at creation'
+                            )
                     placed = _fc.place_init(ds, init, step_minutes=forecast_step_minutes, overwrite=overwrite)
                 _fc.unmark_init_complete(ds, init)
                 self._forecast_writer = _fc.ForecastWriter(
@@ -939,11 +961,12 @@ class H5Ingest:
                 self._forecast_writer.close()
                 chunk_writes = self._forecast_writer.writes
                 self._forecast_writer = None
-                _fc.mark_init_complete(ds, init)
+                if mark_complete:
+                    _fc.mark_init_complete(ds, init)
                 return {'init': str(np.datetime64(init, 'm')), 'init_index': placed['index'],
                         'status': placed['status'], 'autofilled': placed['autofilled'],
                         'n_leads': int(len(leads)), 'variables': list(var_keys),
-                        'chunk_writes': int(chunk_writes)}
+                        'chunk_writes': int(chunk_writes), 'complete': bool(mark_complete)}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -1043,6 +1066,10 @@ class H5Ingest:
         x_offset = int(np.searchsorted(target_x_r, file_x_r[x_idx[0]]))
 
         return file_y_slice, file_x_slice, y_offset, x_offset
+
+    def _check_var_keys(self, var_keys) -> None:
+        """Source-specific refusals of variable combinations (override; base accepts everything)."""
+        return None
 
     def _get_block_transform(self, transform_name):
         """

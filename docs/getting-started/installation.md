@@ -18,3 +18,9 @@ The IFS (GRIB2) source needs the `ifs` extra, which brings in `eccodes` and the 
 ```bash
 pip install 'cfdb-ingest[ifs]'
 ```
+
+The S3 archive protocol (`cfdb_ingest.forecast_archive`: `open_edataset`, pushes, remote locks) needs the `archive` extra:
+
+```bash
+pip install 'cfdb-ingest[archive]'
+```

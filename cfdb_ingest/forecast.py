@@ -20,9 +20,20 @@ Two conventions decided once and baked into a dataset at creation:
   dtype, so ``init + lead`` is only meaningful once the unit is read back.
 
 Chunk policy (cfdb): the write loop mirrors the chunk shape. ``ForecastWriter`` buffers exactly one
-chunk-row per (variable, level) -- ``(n_lead, ny, nx)`` -- and flushes it the moment its last lead
-arrives, so no chunk is written twice within one ingest call and nothing larger than one chunk-row
-per live (variable, level) is ever held.
+lead-span per (variable, level) -- ``(n_lead_in_this_call, ny, nx)`` -- and flushes it the moment its
+last lead arrives, so no chunk is written twice within one ingest call and nothing larger than one
+span per live (variable, level) is ever held.
+
+Incremental inits (since 0.5.0): an init may be built up over several ``convert()`` calls -- e.g.
+one call per daily wrfout file as a running forecast produces them. Three rules make that safe:
+
+- the lead axis is fixed at creation, so create it with the FULL run (``convert(..., leads=...)``)
+  rather than the leads of the first call; every later call maps its subset onto it by value;
+- a partial call passes ``mark_complete=False`` and leaves the init unmarked; ``place_init`` then
+  treats it as a back-fill, and only the caller that has verified ``missing_chunks()`` is empty marks it;
+- with a one-lead chunk (``chunk_shape=(1, 1, 1, ny, nx)``) a call touches exactly the chunks of the
+  leads it supplies -- the writer flushes contiguous runs of FILLED leads only, never the gaps -- so
+  appends never rewrite an earlier call's chunks, whatever the output cadence.
 """
 
 import contextlib
@@ -32,6 +43,7 @@ from typing import Optional, Union
 
 import cfdb
 import numpy as np
+from cfdb import indexers as _indexers
 
 FRT = 'forecast_reference_time'
 LEAD = 'forecast_period'
@@ -171,6 +183,25 @@ def create_forecast_coords(ds, init, leads, *, step_minutes: int, lead_units: st
     lead.attrs['units'] = lead_units
 
 
+def check_axis_leads(axis_leads, call_leads) -> np.ndarray:
+    """
+    The full lead axis a NEW dataset is created with, validated against the leads of the creating
+    call: int32, strictly increasing, regularly spaced (``lead_step``), and a superset of
+    ``call_leads`` -- the creating call's data must land on the axis it creates.
+    """
+    axis = np.asarray(axis_leads, dtype='int32')
+    if axis.ndim != 1 or axis.size == 0:
+        raise ValueError('leads must be a non-empty 1-D sequence of hours')
+    if axis.size > 1 and not (np.diff(axis) > 0).all():
+        raise ValueError(f'leads must be strictly increasing, got {axis.tolist()}')
+    lead_step(axis)
+    call = np.asarray(call_leads, dtype='int32')
+    absent = np.setdiff1d(call, axis)
+    if absent.size:
+        raise ValueError(f'this call supplies leads {absent.tolist()} that are not on leads={axis.tolist()}')
+    return axis
+
+
 def lead_index_map(ds, leads) -> np.ndarray:
     """
     Position of each incoming lead on the stored ``forecast_period`` axis. Every incoming lead
@@ -222,7 +253,18 @@ def mark_init_complete(ds, init) -> None:
 
 
 def unmark_init_complete(ds, init) -> None:
+    """
+    Remove ``init`` from the marker. On a dataset that has no marker yet the marker is CREATED,
+    seeded with every other init that holds chunks (the pre-marker notion of complete), so that from
+    now on ``place_init`` reads the marker and this init is a back-fill target -- a partial call
+    (``mark_complete=False``) must leave a dataset whose marker exists and excludes the init.
+    """
     key = str(np.datetime64(init, 'm'))
+    if COMPLETE_INITS_ATTR not in ds.attrs.data:
+        stored = np.asarray(ds[FRT].data).astype('datetime64[m]')
+        seeded = [str(i) for idx, i in enumerate(stored) if str(i) != key and _init_has_chunks(ds, idx)]
+        ds.attrs[COMPLETE_INITS_ATTR] = sorted(seeded)
+        return
     inits = complete_inits(ds)
     if key in inits:  # only touch the attrs record when there is something to remove
         ds.attrs[COMPLETE_INITS_ATTR] = [i for i in inits if i != key]
@@ -243,6 +285,40 @@ def _init_has_chunks(ds, init_idx: int) -> bool:
         if dv.get_chunk(sel, missing_none=True) is not None:
             return True
     return False
+
+
+def init_index(ds, init) -> int:
+    """Position of ``init`` on the stored axis, matched by VALUE (never 'the last slot')."""
+    init64 = np.datetime64(init, 'm')
+    stored = np.asarray(ds[FRT].data).astype('datetime64[m]')
+    hits = np.where(stored == init64)[0]
+    if not hits.size:
+        raise ValueError(f'{FRT} {init64} is not on the stored axis')
+    return int(hits[0])
+
+
+def missing_chunks(ds, init) -> list:
+    """
+    Every chunk of ``init`` that is absent from the store, as ``(var_name, chunk_start)`` pairs
+    (``chunk_start`` in absolute index space, i.e. the tuple in the chunk key).
+
+    Probes KEY PRESENCE only -- ``key in blt`` -- which on an EDataset consults the remote index and
+    the local file without fetching anything (``get_chunk`` would download every chunk it probed). An
+    empty list is the condition for marking an init complete when it was written over several calls.
+    """
+    idx = init_index(ds, init)
+    missing = []
+    for name in ds.data_var_names:
+        dv = ds[name]
+        if FRT not in dv.coord_names:
+            continue
+        sel = tuple(idx if c == FRT else slice(None) for c in dv.coord_names)
+        slices = _indexers.index_combo_all(sel, dv.get_coord_origins(), dv.shape)
+        for key in _indexers.slices_to_keys(slices, name, dv.chunk_shape):
+            if key not in dv._blt:
+                start = tuple(int(v) for v in key.rsplit('!', 1)[-1].split('.'))  # '{var}!{i.j.k...}'
+                missing.append((name, start))
+    return missing
 
 
 def place_init(ds, init, *, step_minutes: int, overwrite: bool = False) -> dict:
@@ -315,6 +391,15 @@ def forecast_chunk_shape(
     return (1, int(n_lead), 1, int(ty), int(tx))
 
 
+def _runs(mask) -> list:
+    """``[(start, stop), ...]`` of the contiguous True runs of a boolean mask."""
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return []
+    edges = np.flatnonzero(np.diff(np.concatenate(([False], mask, [False]))))
+    return [(int(a), int(b)) for a, b in zip(edges[::2], edges[1::2])]
+
+
 class ForecastWriter:
     """
     The only thing that writes forecast data variables.
@@ -322,12 +407,14 @@ class ForecastWriter:
     Blocks arrive per source file / per rechunkit block, indexed by OUTPUT time index ``t``
     (position in the ingest's filtered time axis). ``lead_index[t]`` is that time's position on the
     stored ``forecast_period`` axis, so placement is by lead value. Each (variable, level) gets one
-    ``(n_lead_stored, ny, nx)`` buffer -- one chunk-row, the write unit -- which is written with a
-    single ``set`` and discarded as soon as every expected lead has arrived. ``close()`` writes any
-    buffer that never completed (a source that stops short), still once.
+    ``(n_lead_in_this_call, ny, nx)`` buffer covering the span ``[lo, hi)`` of stored positions this
+    call supplies -- the write unit -- which is written with a single ``set`` and discarded as soon as
+    every expected lead has arrived. ``close()`` writes any buffer that never completed (a source that
+    stops short), still once.
 
-    Memory: one chunk-row per (variable, level) that is live at the same time. Per-file sources that
-    interleave variables (WRF's batch path) keep every batch variable's rows live until the last file;
+    Memory: one span per (variable, level) that is live at the same time (a 24-lead daily file on a
+    3 km domain is ~16 MB per variable; the full 145-lead axis would be ~98 MB). Per-file sources that
+    interleave variables (WRF's batch path) keep every batch variable's span live until the last file;
     keep forecast-mode WRF ingests to 2-D variables for that reason.
     """
 
@@ -336,17 +423,23 @@ class ForecastWriter:
         self.init_idx = int(init_idx)
         self.lead_index = np.asarray(lead_index, dtype='int64')
         self.n_lead_stored = len(ds[LEAD].data)
+        self.lo = int(self.lead_index.min())
+        self.hi = int(self.lead_index.max()) + 1
         self.ny = int(ny)
         self.nx = int(nx)
         self._buffers = {}  # (var name, level_idx) -> [ndarray, filled mask]
-        self.writes = 0  # number of chunk-row writes issued (tests assert one per (var, level))
+        self.writes = 0  # number of run writes issued (one per (var, level) when the call's leads are contiguous)
+
+    @property
+    def span(self) -> int:
+        return self.hi - self.lo
 
     def _buffer(self, data_var, level_idx: int):
         key = (data_var.name, int(level_idx))
         buf = self._buffers.get(key)
         if buf is None:
-            arr = np.full((self.n_lead_stored, self.ny, self.nx), np.nan, dtype='float32')
-            buf = [arr, np.zeros(self.n_lead_stored, dtype=bool), data_var]
+            arr = np.full((self.span, self.ny, self.nx), np.nan, dtype='float32')
+            buf = [arr, np.zeros(self.span, dtype=bool), data_var]
             self._buffers[key] = buf
         return key, buf
 
@@ -364,6 +457,11 @@ class ForecastWriter:
         output time indices, or ``(ny_sub, nx_sub)`` for a single int index.
         """
         block = np.asarray(block)
+        if ys != slice(None) or xs != slice(None):
+            # ``filled`` tracks leads only: a spatially partial block would flush after its first tile
+            # and the next tile's flush would overwrite it with NaN. Only heterogeneous-grid sources
+            # produce such blocks, and a forecast run is one grid (review ifs-forecast-cycle-code-2).
+            raise NotImplementedError('ForecastWriter takes full-extent spatial blocks only (heterogeneous grids are not supported in forecast mode)')
         if isinstance(t_index, (int, np.integer)):
             t_idx = np.array([int(t_index)])
             block = block[np.newaxis, ...]
@@ -373,7 +471,7 @@ class ForecastWriter:
             t_idx = np.asarray(t_index, dtype='int64')
         if len(t_idx) != block.shape[0]:
             raise ValueError(f'block has {block.shape[0]} timesteps for {len(t_idx)} indices')
-        positions = self.lead_index[t_idx]
+        positions = self.lead_index[t_idx] - self.lo
         key, (arr, filled, _) = self._buffer(data_var, level_idx)
         arr[positions, ys, xs] = block
         filled[positions] = True
@@ -381,14 +479,16 @@ class ForecastWriter:
             self._flush_key(key)
 
     def _flush_key(self, key) -> None:
-        # Write the span of leads this ingest supplies. For a run that covers the whole stored axis
-        # (the normal case) that is the full chunk-row; a partial re-ingest (e.g. a start_date
-        # filter with overwrite=True) leaves the leads it did not supply untouched.
-        arr, _, data_var = self._buffers.pop(key)
+        # Write ONLY the leads this call filled, as contiguous runs -- never the NaN gaps between them.
+        # A source coarser than the stored axis (3-hourly frames on an hourly axis) fills every third
+        # position; writing the whole [lo, hi) span would store NaN chunks in the gaps, which
+        # ``missing_chunks`` (key presence) could no longer tell from data, and which would clobber a
+        # sibling call that supplied those leads. (Found by review round ifs-forecast-cycle-code-1.)
+        arr, filled, data_var = self._buffers.pop(key)
         level_idx = key[1]
-        lo, hi = int(self.lead_index.min()), int(self.lead_index.max()) + 1
-        data_var[(self.init_idx, slice(lo, hi), level_idx, slice(None), slice(None))] = arr[lo:hi]
-        self.writes += 1
+        for start, stop in _runs(filled):
+            data_var[(self.init_idx, slice(self.lo + start, self.lo + stop), level_idx, slice(None), slice(None))] = arr[start:stop]
+            self.writes += 1
 
     def flush(self, data_var=None) -> None:
         """Write every pending buffer (for one variable, or all)."""

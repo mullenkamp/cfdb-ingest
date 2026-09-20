@@ -273,6 +273,32 @@ class TestForecastCli:
         result = runner.invoke(app, ['wrf', str(WRF_FILE_1), str(out), '-v', 'T2', '--forecast', '--init', '2023-02-12T00', '--overwrite'])
         assert result.exit_code == 0, result.output
 
+    def test_wrf_forecast_incremental_options(self, tmp_path):
+        import cfdb
+        import numpy as np
+        from cfdb_ingest import forecast as fc
+        from cfdb_ingest import wrf_synthetic as syn
+
+        files = syn.write_run(tmp_path / 'run', '2026-09-19T00', 48, 6, 5)
+        out = tmp_path / 'f.cfdb'
+        common = ['wrf', str(out), '-v', 'T2,PREC_ACC', '--forecast', '--leads', '0:48:1', '-c', '1,1,1,6,5']
+        result = runner.invoke(app, [common[0], str(files[0]), *common[1:], '--no-mark-complete'])
+        assert result.exit_code == 0, result.output
+        assert "'complete': False" in result.output
+        with cfdb.open_dataset(str(out)) as ds:
+            np.testing.assert_array_equal(ds[fc.LEAD].data, np.arange(49))
+            assert fc.complete_inits(ds) == []
+        result = runner.invoke(app, [common[0], str(files[1]), str(files[2]), *common[1:]])
+        assert result.exit_code == 0, result.output
+        assert "'status': 'backfill'" in result.output and "'complete': True" in result.output
+        with cfdb.open_dataset(str(out)) as ds:
+            assert fc.missing_chunks(ds, '2026-09-19T00') == []
+        # the two options need --forecast; --leads must be start:stop:step
+        result = runner.invoke(app, ['wrf', str(files[0]), str(tmp_path / 'g.cfdb'), '-v', 'T2', '--leads', '0:48:1'])
+        assert result.exit_code != 0
+        result = runner.invoke(app, ['wrf', str(files[0]), str(tmp_path / 'g.cfdb'), '-v', 'T2', '--forecast', '--leads', '0-48'])
+        assert result.exit_code != 0
+
     def test_ifs_and_cfdb_to_int_init(self, tmp_path, monkeypatch, ifs_cycle_dir):
         out = tmp_path / 'ifs.cfdb'
         result = runner.invoke(app, ['ifs', str(ifs_cycle_dir), str(out), '--preset', 'wps', '-b', '160,-50,190,-30', '--max-lead-hours', '6'])

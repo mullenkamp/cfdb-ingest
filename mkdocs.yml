@@ -74,6 +74,7 @@ nav:
         - ERA5 Ingestion: guide/era5-ingestion.md
         - IFS Ingestion: guide/ifs-ingestion.md
         - Forecast Datasets: guide/forecast-datasets.md
+        - Forecast Archive: guide/forecast-archive.md
         - WPS Export: guide/wps-export.md
     - Reference:
         - WRF Variables: reference/wrf-variables.md

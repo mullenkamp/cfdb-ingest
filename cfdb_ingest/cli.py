@@ -27,6 +27,16 @@ WPS_DEFAULT_PRESSURE_LEVELS_PA = [
 ]
 
 
+def _parse_leads(spec):
+    """``start:stop:step`` (stop inclusive) -> list of int hours; None passes through."""
+    if spec is None:
+        return None
+    parts = [int(x) for x in spec.split(':')]
+    if len(parts) != 3 or parts[2] <= 0:
+        raise typer.BadParameter(f'--leads must be start:stop:step, got {spec!r}')
+    return list(range(parts[0], parts[1] + 1, parts[2]))
+
+
 @app.command()
 def wrf(
     input_paths: Annotated[List[Path], typer.Argument(help="One or more wrfout file paths.")],
@@ -45,6 +55,8 @@ def wrf(
     init: Annotated[Optional[str], typer.Option("--init", help="Forecast mode: the run's init (ISO). Default: SIMULATION_START_DATE / START_DATE.")] = None,
     forecast_step_minutes: Annotated[int, typer.Option("--forecast-step-minutes", help="Forecast mode: init step baked into a NEW dataset.")] = 360,
     overwrite: Annotated[bool, typer.Option("--overwrite", help="Forecast mode: replace an init the dataset already holds complete.")] = False,
+    leads: Annotated[Optional[str], typer.Option("--leads", help="Forecast mode: the FULL lead axis (hours) for a NEW dataset as start:stop:step (stop inclusive), e.g. 0:144:1, when this call holds only part of the run.")] = None,
+    no_mark_complete: Annotated[bool, typer.Option("--no-mark-complete", help="Forecast mode: a partial call -- leave the init unmarked (see cfdb_ingest.forecast.missing_chunks).")] = False,
 ):
     """Convert WRF output files to cfdb."""
     from cfdb_ingest.wrf import WrfIngest
@@ -81,7 +93,11 @@ def wrf(
 
     if forecast:
         cfdb_kwargs.update(dataset_type='grid_forecast', forecast_reference_time=init,
-                           forecast_step_minutes=forecast_step_minutes, overwrite=overwrite)
+                           forecast_step_minutes=forecast_step_minutes, overwrite=overwrite,
+                           leads=_parse_leads(leads), mark_complete=not no_mark_complete)
+    elif leads is not None or no_mark_complete:
+        print("Error: --leads and --no-mark-complete require --forecast", file=__import__('sys').stderr)
+        raise typer.Exit(code=1)
 
     result = ingest.convert(
         cfdb_path=cfdb_path,
