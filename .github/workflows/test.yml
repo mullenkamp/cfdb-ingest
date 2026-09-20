@@ -36,7 +36,7 @@ jobs:
       # 2. Sync dependencies
       # uv will automatically detect the Python version installed above
       - name: Install dependencies
-        run: uv sync --extra ifs
+        run: uv sync --all-extras   # ifs (eccodes) and archive (ebooklet): the forecast_archive tests need the latter
 
       # 3. Run tests
       - name: Run tests

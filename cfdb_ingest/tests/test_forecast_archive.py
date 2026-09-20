@@ -15,9 +15,9 @@ import pytest
 from cfdb import dtypes
 
 from cfdb_ingest import forecast as fc
-from cfdb_ingest import forecast_archive as fa
 
-pytest.importorskip('ebooklet')
+pytest.importorskip('ebooklet')  # the `archive` extra; must precede the module import below
+fa = pytest.importorskip('cfdb_ingest.forecast_archive')
 
 A, B, C = '2026-09-13T00:00', '2026-09-13T12:00', '2026-09-14T12:00'
 LEADS = np.array([0, 3, 6], dtype='int32')

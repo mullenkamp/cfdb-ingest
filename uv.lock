@@ -153,6 +153,7 @@ dependencies = [
 archive = [
     { name = "cfdb", extra = ["ebooklet"] },
     { name = "ebooklet" },
+    { name = "urllib3" },
 ]
 ifs = [
     { name = "eccodes" },
@@ -180,6 +181,7 @@ requires-dist = [
     { name = "eccodeslib", marker = "extra == 'ifs'", specifier = ">=2.38" },
     { name = "typer", specifier = ">=0.12" },
     { name = "typing-extensions", specifier = ">=4.15.0" },
+    { name = "urllib3", marker = "extra == 'archive'", specifier = ">=2.2" },
     { name = "wrf-to-int", specifier = ">=0.1.1" },
 ]
 provides-extras = ["archive", "ifs"]
