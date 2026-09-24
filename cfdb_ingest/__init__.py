@@ -1,6 +1,6 @@
 """File format conversions to cfdb"""
 
-__version__ = '0.5.0'
+__version__ = '0.5.1'
 
 from cfdb_ingest.base import H5Ingest
 from cfdb_ingest.wrf import WrfIngest

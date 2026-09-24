@@ -184,7 +184,7 @@ cfdb-ingest era5 [OPTIONS] INPUT_PATHS... OUTPUT_PATH
 | `--bbox` | `-b` | Bounding box: `min_lon,min_lat,max_lon,max_lat` |
 | `--target-levels` | `-l` | Comma-separated pressure levels in Pa (auto-detected if omitted) |
 | `--chunk-shape` | `-c` | Output chunk shape: `time,z,y,x` (e.g. `1,1,50,50`) |
-| `--compression` | | Compression algorithm: `zstd` or `lz4` |
+| `--compression` | | cfdb compression, for new datasets: `zstd_shuffle`, `zstd`, `lz4_shuffle` or `lz4` (default: cfdb's own, `zstd_shuffle` from cfdb 0.10) |
 
 ### Examples
 

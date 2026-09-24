@@ -254,7 +254,7 @@ cfdb-ingest wrf [OPTIONS] INPUT_PATHS... CFDB_PATH
 | `--vertical-coord` | | Vertical coordinate: `height` (default) or `pressure` |
 | `--chunk-shape` | `-c` | Output chunk shape: `time,z,y,x` (e.g. `1,1,50,50`) |
 | `--max-mem` | | Read buffer size in bytes (default: 536 MiB) |
-| `--compression` | | Compression algorithm: `zstd` or `lz4` (default: `zstd`) |
+| `--compression` | | cfdb compression, for new datasets: `zstd_shuffle`, `zstd`, `lz4_shuffle` or `lz4` (default: cfdb's own, `zstd_shuffle` from cfdb 0.10) |
 | `--forecast` | | Treat the files as ONE forecast run and write a `grid_forecast` dataset (appends to an existing one) |
 | `--init` | | Forecast mode: the run's init (ISO); default `SIMULATION_START_DATE` / `START_DATE` |
 | `--forecast-step-minutes` | | Forecast mode: init step baked into a new dataset (default 360) |
