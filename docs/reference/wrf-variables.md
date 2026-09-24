@@ -32,8 +32,8 @@ Fixed height above ground, stored as `(time, height_Xm, y, x)`:
 | `U10` | `u_wind` | 10 m | U10, V10 | wind rotation |
 | `V10` | `v_wind` | 10 m | U10, V10 | wind rotation |
 | `VORT10` | `vorticity` | 10 m | U10, V10 | relative vorticity |
-| `RAIN` | `precip` | 0 m | RAINNC, RAINC | accumulation increment |
-| `PREC_ACC` | `precip` | 0 m | PREC_ACC_NC, PREC_ACC_C | sum (WRF's own per-interval accumulators, `prec_acc_dt` = history interval; stateless, so an init can be ingested file by file; innermost domain only) |
+| `RAIN` | `precip` | 0 m | RAINNC, RAINC | accumulation increment (one run per conversion, 0.6.0) |
+| `PREC_ACC` | `precip` | 0 m | PREC_ACC_NC, PREC_ACC_C | sum, negatives clipped to 0 (0.6.0) (WRF's own per-interval accumulators, `prec_acc_dt` = history interval; stateless, so an init can be ingested file by file; innermost domain only; `time_label='start'` labels by interval start) |
 | `RAIN_TR` | `precip_tr` | 0 m | TR_RAINNC, TR_RAINC | accumulation increment |
 | `SWDOWN` | `shortwave_radiation` | 0 m | SWDOWN | direct |
 | `GLW` | `longwave_radiation` | 0 m | GLW | direct |

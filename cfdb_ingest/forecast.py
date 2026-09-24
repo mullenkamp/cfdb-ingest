@@ -45,6 +45,8 @@ import cfdb
 import numpy as np
 from cfdb import indexers as _indexers
 
+from cfdb_ingest.checks import check_encodable
+
 FRT = 'forecast_reference_time'
 LEAD = 'forecast_period'
 COMPLETE_INITS_ATTR = 'complete_inits'
@@ -106,7 +108,33 @@ def open_target(target, *, dataset_type: str = 'grid_forecast', **cfdb_kwargs):
         ds.close()
 
 
-def validate_target(
+def _crs_summary(crs) -> str:
+    """A short, warning-free description of a CRS (projection, ellipsoid axes)."""
+    e = crs.ellipsoid
+    axes = f'a={e.semi_major_metre:g} m, b={e.semi_minor_metre:g} m' if e is not None else 'no ellipsoid'
+    return f'{crs.name} ({axes})'
+
+
+def check_crs(ds, crs) -> None:
+    """
+    The target's stored CRS must equal the incoming one. cfdb-ingest < 0.6.0 wrote WRF Lambert /
+    polar / Mercator grids on the WGS84 ellipsoid (km-scale misplacement); >= 0.6.0 uses the WPS
+    sphere, so outputs of the two must never be mixed in one dataset. Checked before the x/y values,
+    so the remedy is named rather than a bare coordinate mismatch.
+    """
+    stored = ds.crs
+    if stored is None:
+        raise ValueError('target has no CRS; refusing to append georeferenced data to it')
+    if not stored.equals(crs, ignore_axis_order=True):
+        raise ValueError(
+            f'target CRS differs from the incoming data (target: {_crs_summary(stored)}; incoming: '
+            f'{_crs_summary(crs)}). cfdb-ingest < 0.6.0 wrote WRF Lambert/polar/Mercator grids on the '
+            f'WGS84 ellipsoid (km-scale error); >= 0.6.0 uses the WPS sphere (R = 6370000 m). Outputs of '
+            f'the two cannot be mixed -- rebuild the target with cfdb-ingest >= 0.6.0.'
+        )
+
+
+def validate_spatial(
     ds,
     *,
     x_name: str,
@@ -116,15 +144,7 @@ def validate_target(
     levels: Optional[np.ndarray] = None,
     depths: Optional[np.ndarray] = None,
 ) -> None:
-    """
-    An existing target must be a ``grid_forecast`` with the forecast axis pair and the same spatial
-    (and level / depth) coordinates as the incoming data. Raises ValueError naming the first mismatch.
-    """
-    if ds.dataset_type != 'grid_forecast':
-        raise ValueError(f"target dataset_type is {ds.dataset_type!r}, expected 'grid_forecast'")
-    for name in (FRT, LEAD, x_name, y_name):
-        if name not in ds.coord_names:
-            raise ValueError(f'target lacks the {name!r} coordinate')
+    """The target's spatial (and level / depth) coordinates must equal the incoming data's."""
     for name, values in ((x_name, x), (y_name, y), ('pressure', levels), ('depth', depths)):
         if values is None:
             continue
@@ -136,6 +156,32 @@ def validate_target(
                 f'target {name!r} coordinate does not match the incoming data '
                 f'({len(stored)} vs {len(values)} values; first {stored[:3]} vs {np.asarray(values)[:3]})'
             )
+
+
+def validate_target(
+    ds,
+    *,
+    x_name: str,
+    y_name: str,
+    x: np.ndarray,
+    y: np.ndarray,
+    levels: Optional[np.ndarray] = None,
+    depths: Optional[np.ndarray] = None,
+    crs=None,
+) -> None:
+    """
+    An existing target must be a ``grid_forecast`` with the forecast axis pair, the incoming CRS (when
+    ``crs`` is given) and the same spatial (and level / depth) coordinates as the incoming data.
+    Raises ValueError naming the first mismatch.
+    """
+    if ds.dataset_type != 'grid_forecast':
+        raise ValueError(f"target dataset_type is {ds.dataset_type!r}, expected 'grid_forecast'")
+    for name in (FRT, LEAD, x_name, y_name):
+        if name not in ds.coord_names:
+            raise ValueError(f'target lacks the {name!r} coordinate')
+    if crs is not None:
+        check_crs(ds, crs)
+    validate_spatial(ds, x_name=x_name, y_name=y_name, x=x, y=y, levels=levels, depths=depths)
 
 
 ######################################################
@@ -471,6 +517,7 @@ class ForecastWriter:
             t_idx = np.asarray(t_index, dtype='int64')
         if len(t_idx) != block.shape[0]:
             raise ValueError(f'block has {block.shape[0]} timesteps for {len(t_idx)} indices')
+        check_encodable(data_var, block)
         positions = self.lead_index[t_idx] - self.lo
         key, (arr, filled, _) = self._buffer(data_var, level_idx)
         arr[positions, ys, xs] = block

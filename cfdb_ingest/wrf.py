@@ -2,6 +2,7 @@
 WRF output file converter for cfdb.
 """
 import pathlib
+import warnings
 from typing import Union, List, Tuple, Dict, Optional
 
 import h5py
@@ -9,6 +10,21 @@ import numpy as np
 import pyproj
 
 from cfdb_ingest.base import H5Ingest
+
+
+# WRF/WPS map projections are computed on a sphere of this radius (WPS geogrid/src/constants_module.F:
+# ``EARTH_RADIUS_M = 6370000.``), which is what XLAT/XLONG were derived on. A CRS without it defaults
+# to the WGS84 ellipsoid and misplaces cells by kilometres on NZ domains (cfdb-ingest < 0.6.0).
+WPS_EARTH_RADIUS_M = 6370000.0
+
+# Global attributes that must agree across every input file of one conversion (a d02 file slipped into a
+# d03 list, or a different bucket/accumulation configuration, would otherwise be read with the first
+# file's values). Only keys present in the first file are compared.
+_WRF_CONSISTENT_ATTRS = (
+    'MAP_PROJ', 'TRUELAT1', 'TRUELAT2', 'STAND_LON', 'MOAD_CEN_LAT', 'CEN_LAT', 'CEN_LON',
+    'POLE_LAT', 'POLE_LON', 'DX', 'DY', 'WEST-EAST_GRID_DIMENSION', 'SOUTH-NORTH_GRID_DIMENSION',
+    'BUCKET_MM', 'PREC_ACC_DT',
+)
 
 
 def _wrf_attr(attrs, key):
@@ -19,6 +35,16 @@ def _wrf_attr(attrs, key):
     if isinstance(val, bytes):
         return val.decode()
     return val
+
+
+def _wrf_run_start(attrs):
+    """The run's init from SIMULATION_START_DATE (else START_DATE) as datetime64[m], or None."""
+    for key in ('SIMULATION_START_DATE', 'START_DATE'):
+        if key in attrs:
+            val = _wrf_attr(attrs, key).strip()
+            if val:
+                return np.datetime64(val.replace('_', 'T'), 'm')
+    return None
 
 
 WRF_VARIABLE_MAPPING = {
@@ -64,17 +90,21 @@ WRF_VARIABLE_MAPPING = {
         'source_vars': ['RAINNC', 'RAINC'],
         'transform': 'accumulation_increment',
         'height': 0.0,
+        'accumulated': 'increment',
     },
     # Same quantity as RAIN (precipitation over the output interval) from WRF's own windowed
     # accumulators (namelist prec_acc_dt = history interval): each frame already holds the increment
     # since the previous frame, so it needs no previous-frame state -- the source for an init ingested
     # one file at a time. Lead 0 is 0 (RAIN gives NaN there). Not valid on a two-way-nested PARENT
     # domain, whose PREC_ACC_* the child's feedback overwrites; use it on the innermost domain.
+    # Negatives (float noise from WRF's bucket arithmetic, and offline backfills of it) are clipped to 0,
+    # as RAIN's increments are (since 0.6.0).
     'PREC_ACC': {
         'cfdb_name': 'precip',
         'source_vars': ['PREC_ACC_NC', 'PREC_ACC_C'],
-        'transform': 'sum',
+        'transform': 'sum_nonneg',
         'height': 0.0,
+        'accumulated': 'window',
     },
     'WIND10': {
         'cfdb_name': 'wind_speed',
@@ -329,6 +359,7 @@ WRF_VARIABLE_MAPPING = {
         'transform': 'accumulation_increment',
         'height': 0.0,
         'region_aware': True,
+        'accumulated': 'increment',
     },
     'VIMF_U': {
         'cfdb_name': 'vimf_u',
@@ -447,9 +478,19 @@ class WrfIngest(H5Ingest):
 
     file_glob_pattern = 'wrfout*'
 
+    # Largest accepted distance (m) between the fitted x/y lattice and the file's own XLAT/XLONG, in
+    # both the lattice residual and the round trip back to lat/lon. Calibrated 2026-09-24 on 114 real
+    # Lambert wrfout files (DX 1-27 km, every local run): healthy 1.6-4.7 m (float32 XLAT/XLONG; worst on
+    # 12 km d01), so 25 m leaves ~5x headroom; a WGS84 construction is off by 1-8 km.
+    xy_tolerance_m = 25.0
+
     def _init_source_metadata(self):
         """
         Override to also load wind rotation fields and WRF source attributes.
+
+        The grid, CRS and physics attributes come from the first file; every other file's header is
+        checked against it (``_WRF_CONSISTENT_ATTRS``) and its run start is recorded per file, because
+        one conversion may span several independent runs (a stitched hindcast).
         """
         with h5py.File(self.input_paths[0], 'r') as h5:
             self.crs = self._parse_crs(h5)
@@ -467,23 +508,113 @@ class WrfIngest(H5Ingest):
             self._source_title = _wrf_attr(h5.attrs, 'TITLE').strip()
             # The run's init, for forecast mode: SIMULATION_START_DATE is the true init of a
             # restarted run; START_DATE is the start of this segment.
-            self._simulation_start = None
-            for key in ('SIMULATION_START_DATE', 'START_DATE'):
-                if key in h5.attrs:
-                    val = _wrf_attr(h5.attrs, key).strip()
-                    if val:
-                        self._simulation_start = np.datetime64(val.replace('_', 'T'), 'm')
-                        break
+            self._simulation_start = _wrf_run_start(h5.attrs)
             self._wrf_params = {}
             for key in _WRF_DATASET_ATTRS:
                 if key in h5.attrs:
                     self._wrf_params[key] = _wrf_attr(h5.attrs, key)
+            ref_attrs = {key: _wrf_attr(h5.attrs, key) for key in _WRF_CONSISTENT_ATTRS if key in h5.attrs}
+            self._prec_acc_dt = float(ref_attrs['PREC_ACC_DT']) if 'PREC_ACC_DT' in ref_attrs else None
+
+        # Per-file run start (aligned with self.input_paths) and a header consistency check.
+        self._file_run_starts = [self._simulation_start]
+        for path in self.input_paths[1:]:
+            with h5py.File(path, 'r') as h5:
+                self._file_run_starts.append(_wrf_run_start(h5.attrs))
+                extra = sorted(k for k in _WRF_CONSISTENT_ATTRS if k in h5.attrs and k not in ref_attrs)
+                if extra:
+                    raise ValueError(
+                        f'{path.name}: global attribute(s) {extra} are absent from {self.input_paths[0].name}; '
+                        f'all files of one conversion must share one grid and configuration')
+                for key, ref in ref_attrs.items():
+                    val = _wrf_attr(h5.attrs, key) if key in h5.attrs else None
+                    same = val is not None and (val == ref if isinstance(ref, str) else np.isclose(val, ref, rtol=1e-6, atol=0.0))
+                    if not same:
+                        raise ValueError(
+                            f'{path.name}: global attribute {key}={val!r} differs from {ref!r} in '
+                            f'{self.input_paths[0].name}; all files of one conversion must share one grid '
+                            f'and configuration (a file from another domain or run setup?)'
+                        )
+
+        self._path_run_start = {str(p): r for p, r in zip(self.input_paths, self._file_run_starts)}
 
         self.x = spatial['x']
         self.y = spatial['y']
         self._heterogeneous_grids = False
         self._dx = float(self.x[1] - self.x[0])
         self._dy = float(self.y[1] - self.y[0])
+
+    # convert(extend=..., time_label='start', squeeze_height=...) are implemented for WRF only.
+    _supports_grid_extend = True
+
+    def _label_shift(self, var_keys):
+        """
+        The interval to subtract from WRF's frame times to label each accumulation by its START.
+
+        WRF stamps an accumulation over (t - dt, t] at t. PREC_ACC's dt is PREC_ACC_DT (checked equal
+        across files) and must equal the frame spacing, so each frame is one output interval; RAIN's
+        increments span the frame spacing. Only accumulations can be relabelled: every field of one
+        conversion shares one time axis.
+        """
+        kinds = {k: self.variables[k].get('accumulated') for k in var_keys}
+        others = sorted(k for k, a in kinds.items() if not a)
+        if others:
+            raise ValueError(f"time_label='start' applies to accumulations only; {others} are instantaneous "
+                             f'and share the one time axis -- convert them in a separate call/dataset')
+        # The frame spacing is the smallest step between frames: a missing file leaves a larger gap,
+        # which is not a different spacing (extend mode refuses a window with missing frames itself).
+        diffs = np.diff(self.times)
+        step = int(diffs.min() / np.timedelta64(1, 'm')) if len(diffs) else None
+        shifts = set()
+        for key, kind in kinds.items():
+            if kind == 'window':
+                dt = self._prec_acc_dt
+                if dt is None or dt <= 0:
+                    raise ValueError(f'{key}: PREC_ACC_DT is missing or not positive; the accumulation window is unknown')
+                if step is not None and int(dt) != step:
+                    raise ValueError(f'PREC_ACC_DT={dt:g} min but frames are {step} min apart; each PREC_ACC frame '
+                                     f'must be one output interval')
+                shifts.add(int(dt))
+            else:
+                if step is None:
+                    raise ValueError(f'{key}: one frame only, so its accumulation interval is unknown')
+                shifts.add(step)
+        if len(shifts) != 1:
+            raise ValueError(f'the requested accumulations have different intervals {sorted(shifts)} min')
+        return np.timedelta64(shifts.pop(), 'm')
+
+    def _time_run_starts(self):
+        """The run start (SIMULATION_START_DATE) of the file supplying each of ``self.times`` (NaT if unknown)."""
+        out = np.full(len(self.times), np.datetime64('NaT'), dtype='datetime64[m]')
+        for (path, times, g0), run in zip(self._file_time_map, self._file_run_starts):
+            if run is None:
+                continue
+            u = self._raw_to_unique[g0:g0 + len(times)]
+            out[u[u >= 0]] = run
+        return out
+
+    def _label_frames(self, shift, var_keys):
+        """
+        Interval-start labels for ``self.times`` and a mask of the frames that can carry one.
+
+        A frame whose window starts before ITS OWN file's run start is a lead-0 frame (WRF's
+        zero-initialised accumulator, or an increment with no prior) and is dropped; PREC_ACC frames must
+        lie on their own run's ``SIMULATION_START_DATE + k * dt`` grid, else the window WRF reset does
+        not match the label. Evaluated per file: one band of a stitched hindcast spans several runs.
+        """
+        labels = self.times - shift
+        run = self._time_run_starts()
+        known = ~np.isnat(run)
+        keep = ~(known & (labels < run))
+        if any(self.variables[k].get('accumulated') == 'window' for k in var_keys):
+            dt = int(shift / np.timedelta64(1, 'm'))
+            since = ((self.times - run) / np.timedelta64(1, 'm'))
+            off = known & keep & (np.mod(np.where(known, since, 0), dt) != 0)
+            if off.any():
+                bad = self.times[off][:3]
+                raise ValueError(f'frames {[str(b) for b in bad]} are not on their run\'s SIMULATION_START_DATE + k*{dt} '
+                                 f'min grid; the accumulation window does not match an interval label')
+        return labels, keep
 
     def _default_forecast_reference_time(self, filtered_times):
         """Forecast mode: the run's init from SIMULATION_START_DATE / START_DATE, else the first timestep."""
@@ -493,13 +624,20 @@ class WrfIngest(H5Ingest):
 
     def _parse_crs(self, h5):
         """
-        Extract CRS from WRF global attributes.
+        Extract the CRS from WRF global attributes, on the WPS sphere.
 
         Supports MAP_PROJ values:
         - 1: Lambert Conformal Conic
         - 2: Polar Stereographic
         - 3: Mercator
         - 6: Lat-Lon (EPSG:4326)
+
+        Projections 1-3 use the WPS projection parameters (TRUELAT1/2, STAND_LON) on a sphere of
+        ``WPS_EARTH_RADIUS_M``, the earth model XLAT/XLONG were computed on. The Lambert latitude of
+        origin is a convention: WPS anchors its grid at a known corner and has no such parameter, and
+        any value gives the same geometry with shifted y. MOAD_CEN_LAT (the outermost domain's centre)
+        is used so that every nest of one run shares one CRS. The hemisphere of the polar projection
+        follows the sign of TRUELAT1, as WPS ``map_set`` does.
         """
         attrs = h5.attrs
         map_proj = _wrf_attr(attrs, 'MAP_PROJ')
@@ -508,27 +646,35 @@ class WrfIngest(H5Ingest):
             truelat1 = _wrf_attr(attrs, 'TRUELAT1')
             truelat2 = _wrf_attr(attrs, 'TRUELAT2')
             stand_lon = _wrf_attr(attrs, 'STAND_LON')
-            cen_lat = _wrf_attr(attrs, 'CEN_LAT')
+            if 'MOAD_CEN_LAT' in attrs:
+                lat_0 = _wrf_attr(attrs, 'MOAD_CEN_LAT')
+            else:
+                lat_0 = _wrf_attr(attrs, 'CEN_LAT')
+                warnings.warn('MOAD_CEN_LAT absent: using CEN_LAT as the Lambert latitude of origin, so '
+                              'nests of this run will not share one CRS')
             return pyproj.CRS.from_cf({
                 'grid_mapping_name': 'lambert_conformal_conic',
                 'standard_parallel': [truelat1, truelat2],
                 'longitude_of_central_meridian': stand_lon,
-                'latitude_of_projection_origin': cen_lat,
+                'latitude_of_projection_origin': lat_0,
                 'false_easting': 0.0,
                 'false_northing': 0.0,
+                'earth_radius': WPS_EARTH_RADIUS_M,
             })
 
         elif map_proj == 2:
             truelat1 = _wrf_attr(attrs, 'TRUELAT1')
             stand_lon = _wrf_attr(attrs, 'STAND_LON')
-            cen_lat = _wrf_attr(attrs, 'CEN_LAT')
             return pyproj.CRS.from_cf({
                 'grid_mapping_name': 'polar_stereographic',
                 'straight_vertical_longitude_from_pole': stand_lon,
-                'latitude_of_projection_origin': 90.0 if cen_lat > 0 else -90.0,
+                # pyproj takes the pole from the sign of standard_parallel (lat_ts) whatever this says;
+                # set consistently for readers of the CF attributes.
+                'latitude_of_projection_origin': -90.0 if truelat1 < 0 else 90.0,
                 'standard_parallel': truelat1,
                 'false_easting': 0.0,
                 'false_northing': 0.0,
+                'earth_radius': WPS_EARTH_RADIUS_M,
             })
 
         elif map_proj == 3:
@@ -540,6 +686,7 @@ class WrfIngest(H5Ingest):
                 'standard_parallel': truelat1,
                 'false_easting': 0.0,
                 'false_northing': 0.0,
+                'earth_radius': WPS_EARTH_RADIUS_M,
             })
 
         elif map_proj == 6:
@@ -565,9 +712,12 @@ class WrfIngest(H5Ingest):
         """
         Compute projected x/y coordinate arrays from WRF grid info.
 
-        Uses DX, DY grid spacing and CEN_LAT, CEN_LON to derive 1D coordinate
-        arrays in the projected CRS. For MAP_PROJ=6 (lat-lon), uses XLAT/XLONG
-        directly.
+        For MAP_PROJ=6 (lat-lon), uses XLAT/XLONG directly. Otherwise the file's own cell centres
+        (XLAT/XLONG) are projected through ``self.crs`` and a regular DX/DY lattice is fitted to them,
+        then checked against them both ways (lattice residual, and the lattice projected back to
+        lat/lon) within ``xy_tolerance_m``; a failure means the projection attributes do not describe
+        the grid, and is refused rather than written. Without XLAT/XLONG the lattice is laid around
+        CEN_LAT/CEN_LON (unverified, with a warning).
         """
         attrs = h5.attrs
         map_proj = _wrf_attr(attrs, 'MAP_PROJ')
@@ -580,21 +730,56 @@ class WrfIngest(H5Ingest):
                 'y': xlat[:, 0].astype('float64'),
             }
 
-        dx = _wrf_attr(attrs, 'DX')
-        dy = _wrf_attr(attrs, 'DY')
-        cen_lat = _wrf_attr(attrs, 'CEN_LAT')
-        cen_lon = _wrf_attr(attrs, 'CEN_LON')
+        dx = float(_wrf_attr(attrs, 'DX'))
+        dy = float(_wrf_attr(attrs, 'DY'))
+        to_xy = pyproj.Transformer.from_crs('EPSG:4326', self.crs, always_xy=True)
 
-        ny = _wrf_attr(attrs, 'SOUTH-NORTH_PATCH_END_UNSTAG') - _wrf_attr(attrs, 'SOUTH-NORTH_PATCH_START_UNSTAG') + 1
-        nx = _wrf_attr(attrs, 'WEST-EAST_PATCH_END_UNSTAG') - _wrf_attr(attrs, 'WEST-EAST_PATCH_START_UNSTAG') + 1
+        if 'XLAT' not in h5 or 'XLONG' not in h5:
+            warnings.warn(f'{pathlib.Path(h5.filename).name}: XLAT/XLONG absent, so x/y are laid out '
+                          f'around CEN_LAT/CEN_LON and not verified against the cell centres')
+            ny = _wrf_attr(attrs, 'SOUTH-NORTH_PATCH_END_UNSTAG') - _wrf_attr(attrs, 'SOUTH-NORTH_PATCH_START_UNSTAG') + 1
+            nx = _wrf_attr(attrs, 'WEST-EAST_PATCH_END_UNSTAG') - _wrf_attr(attrs, 'WEST-EAST_PATCH_START_UNSTAG') + 1
+            center_x, center_y = to_xy.transform(_wrf_attr(attrs, 'CEN_LON'), _wrf_attr(attrs, 'CEN_LAT'))
+            x = center_x + (np.arange(nx) - (nx - 1) / 2.0) * dx
+            y = center_y + (np.arange(ny) - (ny - 1) / 2.0) * dy
+            return {'x': x, 'y': y}
 
-        transformer = pyproj.Transformer.from_crs('EPSG:4326', self.crs, always_xy=True)
-        center_x, center_y = transformer.transform(cen_lon, cen_lat)
+        xlat_ds, xlong_ds = h5['XLAT'], h5['XLONG']
+        if xlat_ds.ndim == 3:
+            xlat = xlat_ds[0].astype('float64')
+            xlong = xlong_ds[0].astype('float64')
+            if xlat_ds.shape[0] > 1 and not (np.allclose(xlat_ds[-1], xlat, atol=1e-4) and
+                                             np.allclose(xlong_ds[-1], xlong, atol=1e-4)):
+                raise ValueError(f'{pathlib.Path(h5.filename).name}: XLAT/XLONG vary in time (a moving '
+                                 f'nest), which cfdb-ingest does not support')
+        else:
+            xlat = xlat_ds[:].astype('float64')
+            xlong = xlong_ds[:].astype('float64')
 
-        center_i = (nx - 1) / 2.0
-        center_j = (ny - 1) / 2.0
-        x = center_x + (np.arange(nx) - center_i) * dx
-        y = center_y + (np.arange(ny) - center_j) * dy
+        ny, nx = xlat.shape
+        xp, yp = to_xy.transform(xlong, xlat)
+        ii = np.arange(nx)[None, :]
+        jj = np.arange(ny)[:, None]
+        x0 = float(np.mean(xp - ii * dx))
+        y0 = float(np.mean(yp - jj * dy))
+        x = x0 + np.arange(nx) * dx
+        y = y0 + np.arange(ny) * dy
+
+        residual = max(float(np.max(np.abs(xp - x[None, :]))), float(np.max(np.abs(yp - y[:, None]))))
+        lon_back, lat_back = pyproj.Transformer.from_crs(self.crs, 'EPSG:4326', always_xy=True).transform(
+            np.broadcast_to(x[None, :], (ny, nx)), np.broadcast_to(y[:, None], (ny, nx)))
+        round_trip = float(np.max(pyproj.Geod(a=WPS_EARTH_RADIUS_M, b=WPS_EARTH_RADIUS_M).inv(
+            lon_back, lat_back, xlong, xlat)[2]))
+        err = max(residual, round_trip)
+        if not np.isfinite(err) or err > self.xy_tolerance_m:
+            raise ValueError(
+                f'WRF grid check failed for {pathlib.Path(h5.filename).name}: a DX={dx:g}/DY={dy:g} lattice '
+                f'in the WPS-sphere MAP_PROJ={map_proj} CRS is {err:.1f} m from XLAT/XLONG (lattice residual '
+                f'{residual:.1f} m, round trip {round_trip:.1f} m; tolerance {self.xy_tolerance_m:g} m). The '
+                f"file's projection attributes do not describe its grid; refusing rather than writing "
+                f'misplaced coordinates.'
+            )
+        self._xy_fit_error_m = err
 
         return {'x': x, 'y': y}
 
@@ -1308,6 +1493,7 @@ class WrfIngest(H5Ingest):
         'vimf_u': '_block_vimf_u',
         'vimf_v': '_block_vimf_v',
         'sum': '_block_sum',
+        'sum_nonneg': '_block_sum_nonneg',
     }
 
     def _check_var_keys(self, var_keys):
@@ -1317,12 +1503,43 @@ class WrfIngest(H5Ingest):
                 "(PREC_ACC for inits ingested file by file, RAIN for a whole run)"
             )
 
+    def _check_window(self, var_keys, time_mask):
+        """
+        Differenced running totals (RAIN, RAIN_TR) are only valid within one run: at a cold-start seam the
+        totals restart from zero, the difference goes negative and is clipped to 0, so the first interval
+        of every later run would be stored as 0 mm (measured: 99.9 % of wet cells at a real seam). Refused
+        when the frames of THIS window come from more than one run (files outside the window do not
+        matter). Restart-chained runs keep one SIMULATION_START_DATE and are unaffected.
+        """
+        increments = [k for k in var_keys if self.variables.get(k, {}).get('transform') == 'accumulation_increment']
+        if not increments:
+            return
+        runs = self._time_run_starts()[time_mask]
+        runs = sorted({str(r) for r in runs[~np.isnat(runs)]})
+        if len(runs) > 1:
+            raise ValueError(
+                f'{increments} difference accumulated totals, which restart at every cold start, but the '
+                f'requested window spans {len(runs)} runs (SIMULATION_START_DATE {runs[0]} .. {runs[-1]}); the '
+                f'first interval of each later run would be stored as 0. Use PREC_ACC (WRF\'s windowed '
+                f'accumulator), or convert one run at a time.'
+            )
+
+    def _run_start_of_path(self, path):
+        """SIMULATION_START_DATE of an input file (None if unknown)."""
+        return self._path_run_start.get(str(path))
+
     def _block_sum(self, sources, y_sl, x_sl, block_cache):
         """Elementwise sum of every source (e.g. PREC_ACC_NC + PREC_ACC_C). Shape (N, ny, nx)."""
         total = None
         for name in sorted(sources):
             arr = np.asarray(sources[name], dtype='float32')
             total = arr.copy() if total is None else total + arr
+        return total
+
+    def _block_sum_nonneg(self, sources, y_sl, x_sl, block_cache):
+        """``_block_sum`` with negatives set to 0 (NaN kept): precipitation accumulators cannot be negative."""
+        total = self._block_sum(sources, y_sl, x_sl, block_cache)
+        np.maximum(total, 0.0, out=total, where=~np.isnan(total))
         return total
 
     def _get_block_transform(self, transform_name):

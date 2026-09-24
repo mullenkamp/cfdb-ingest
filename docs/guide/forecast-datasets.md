@@ -54,6 +54,9 @@ domain is ~0.7 MB per chunk; ~145 chunks per (init, variable).
 - `status='overwrite'`: the init is complete and `overwrite=True` was passed; otherwise a complete init
   is immutable.
 - Inits before the axis origin are refused (no prepending history); off-grid inits are refused, never snapped.
+- The target's CRS must equal the incoming one (0.6.0): an archive written by cfdb-ingest < 0.6.0 carries
+  a WGS84-based WRF CRS (km-scale misplacement) and is refused with a "rebuild" message, before the
+  `x`/`y` comparison.
 
 Completion is recorded in `ds.attrs['complete_inits']` when every variable of an init has been
 written; `cfdb-to-int --init` refuses inits without it, so a crashed ingest cannot feed WRF a

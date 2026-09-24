@@ -628,6 +628,7 @@ class IfsIngest:
                     y=lat_out,
                     levels=levels_pa if has_levels else None,
                     depths=self.soil_depths if has_soil else None,
+                    crs=self.crs,
                 )
                 placed = fc.place_init(ds, self.init, step_minutes=int(ds[fc.FRT].step or 360), overwrite=overwrite)
                 fc.append_history(

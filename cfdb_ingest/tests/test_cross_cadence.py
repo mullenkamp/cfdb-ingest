@@ -110,13 +110,15 @@ def make_wrfout_files(tmp_path):
     (3,  20,  7),    # chunk_t and file_t coprime
     (8,  12,  1),    # smallest chunks (default-equivalent)
 ])
-def test_no_write_amplification_single_source(make_wrfout_files, tmp_path, file_t, n_files, chunk_t):
+@pytest.mark.parametrize('drop_first', [False, True])
+def test_no_write_amplification_single_source(make_wrfout_files, tmp_path, file_t, n_files, chunk_t, drop_first):
     """A chunk-aligned converter must never leave obsolete chunk versions."""
     files = make_wrfout_files(file_t=file_t, n_files=n_files)
     out = tmp_path / f'{uuid.uuid4().hex}.cfdb'
     w = WrfIngest(files)
     ny, nx = len(w.y), len(w.x)
-    w.convert(out, variables=['T2'], chunk_shape=(chunk_t, 1, ny, nx))
+    w.convert(out, variables=['T2'], chunk_shape=(chunk_t, 1, ny, nx),
+              start_date=str(w.times[1]) if drop_first else None)
 
     with cfdb.open_dataset(out, 'w') as ds:
         pruned = ds.prune()
@@ -136,7 +138,8 @@ def test_no_write_amplification_single_source(make_wrfout_files, tmp_path, file_
     (24,  4, 24),    # perfectly aligned baseline
     (3,  20,  7),    # chunk_t and file_t coprime
 ])
-def test_no_write_amplification_multi_source(make_wrfout_files, tmp_path, file_t, n_files, chunk_t):
+@pytest.mark.parametrize('drop_first', [False, True])
+def test_no_write_amplification_multi_source(make_wrfout_files, tmp_path, file_t, n_files, chunk_t, drop_first):
     """
     Same sentinel for the multi-source rechunker path. Uses RH2 (T2 + Q2 + PSFC)
     to exercise the path. The synthetic fixture only has T2; we extend it to
@@ -157,7 +160,8 @@ def test_no_write_amplification_multi_source(make_wrfout_files, tmp_path, file_t
     out = tmp_path / f'{uuid.uuid4().hex}.cfdb'
     w = WrfIngest(files)
     ny, nx = len(w.y), len(w.x)
-    w.convert(out, variables=['RH2'], chunk_shape=(chunk_t, 1, ny, nx))
+    w.convert(out, variables=['RH2'], chunk_shape=(chunk_t, 1, ny, nx),
+              start_date=str(w.times[1]) if drop_first else None)
 
     with cfdb.open_dataset(out, 'w') as ds:
         pruned = ds.prune()
@@ -172,7 +176,8 @@ def test_no_write_amplification_multi_source(make_wrfout_files, tmp_path, file_t
     (8,  11, 24),
     (24,  4, 24),
 ])
-def test_no_write_amplification_accumulation(make_wrfout_files, tmp_path, file_t, n_files, chunk_t):
+@pytest.mark.parametrize('drop_first', [False, True])
+def test_no_write_amplification_accumulation(make_wrfout_files, tmp_path, file_t, n_files, chunk_t, drop_first):
     """
     accumulation_increment (RAIN with RAINNC+RAINC) must also write each cfdb
     chunk exactly once. Augments synthetic WRF files with cumulative RAINNC and
@@ -197,7 +202,8 @@ def test_no_write_amplification_accumulation(make_wrfout_files, tmp_path, file_t
     out = tmp_path / f'{uuid.uuid4().hex}.cfdb'
     w = WrfIngest(files)
     ny, nx = len(w.y), len(w.x)
-    w.convert(out, variables=['RAIN'], chunk_shape=(chunk_t, 1, ny, nx))
+    w.convert(out, variables=['RAIN'], chunk_shape=(chunk_t, 1, ny, nx),
+              start_date=str(w.times[1]) if drop_first else None)
 
     with cfdb.open_dataset(out, 'w') as ds:
         pruned = ds.prune()

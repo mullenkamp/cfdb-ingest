@@ -34,6 +34,8 @@ uv run pytest cfdb_ingest/tests/test_era5.py::TestConvertSurface::test_2m_variab
   - `ifs.py` -- `IfsIngest` for ECMWF IFS open-data forecast GRIB2 (one cycle per instance; standalone, no h5py machinery). Two-pass read (headers, then per (variable, level) decode/clip) into a `grid_forecast` dataset via `ForecastWriter`. 31 variable mappings; eccodes is the optional `ifs` extra (`eccodeslib` for CCSDS packing).
   - `forecast_archive.py` -- the S3 archive protocol (extra `archive`): open/refuse-create, retention, two-commit `push_and_mark`, sidecar, flock, SIGTERM, `break_locks`.
   - `wrf_synthetic.py` -- deterministic synthetic wrfout generator for tests (public, like `ifs_synthetic`).
+  - `grid.py` (0.6.0) -- the rules for growing one `grid` dataset over many `convert(..., extend=True)` calls: `validate_target`, `place_times` (append / prepend across placeholder gaps / overwrite; refuses non-consecutive, off-step, both-ends), `time_anchor`, `time_bands` (bands on the absolute chunk grid), `missing_chunks`. Time axis has an explicit numeric step; a gap is a placeholder (cfdb auto-fill); frames missing from a window are unwritten slots reported in `convert`'s result. No completeness tracking: re-runs are idempotent overwrites.
+  - `checks.py` (0.6.0) -- `check_encodable`: refuses values a packed dtype cannot store (cfdb would store them as missing); called by every write path (base writers, `ForecastWriter.put`).
   - `forecast.py` -- the `grid_forecast` rules shared by every source: `(forecast_reference_time, forecast_period, level, y, x)` layout, explicit init step in minutes, lead `units`, `open_target` (path or open handle; remote-backed paths refused), `place_init` (new / backfill / overwrite), completion marker `attrs['complete_inits']`, `forecast_chunk_shape`, and `ForecastWriter` (one lead-span buffered per (variable, level), written once), `missing_chunks` / `init_index` (0.5.0).
   - `thermo.py` -- RH diagnostics (Thompson RSLF from q/t; Clausius-Clapeyron from T/Td). **Relative humidity is a 0-1 fraction everywhere in cfdb** (cfdb-vars >= 0.2.4: precision 0.001, units '1'); the WPS exporter multiplies by 100.
   - `cli.py` -- Typer CLI with `wrf` (incl. `--forecast`), `era5`, `ifs`, and `cfdb-to-int` (incl. `--init`) commands.
@@ -45,6 +47,51 @@ uv run pytest cfdb_ingest/tests/test_era5.py::TestConvertSurface::test_2m_variab
   - `create_era5_test_data.py` -- generates synthetic ERA5 test files via h5py
   - `cfdb_ingest/ifs_synthetic.py` (public module, not under tests/) -- generates a synthetic IFS cycle as real GRIB2 (eccodes) with every production quirk (dateline seam, CCSDS, `soilLayer` indices, `sithick` bitmap, 0 h-only orography, accumulated fields); closed-form values exported for assertions. Generated into a session temp dir by the `ifs_cycle_*` fixtures (deterministic, sub-second) -- nothing binary is committed. Public so `ifs-download` can build the same cycles in its tests.
   - `test_ifs.py`, `test_forecast.py`, `test_wrf_forecast.py`, `test_cfdb_to_int.py`, `test_base_helpers.py` -- forecast mode, the exporter (round-trips through `wps_int_reader.py`, a minimal WPS intermediate-format reader), and the shared helpers
+
+## 0.6.0 (release note)
+
+**Behaviour changes (defaults):**
+- **WRF CRS on the WPS sphere.** Lambert / polar / Mercator grids use the WPS projection parameters on a
+  6 370 000 m sphere (WPS `EARTH_RADIUS_M`), not the WGS84 ellipsoid; the Lambert origin is `MOAD_CEN_LAT`
+  (a convention: WPS has no such parameter; it makes every nest of a run share one CRS). `x`/`y` are the
+  file's `XLAT`/`XLONG` projected and fitted to the `DX`/`DY` lattice, asserted within `xy_tolerance_m`
+  (25 m; healthy 1.6-4.7 m over 114 real files). < 0.6.0 outputs are off by up to 2.5 km (3 km d03) to
+  ~8 km (12 km d01): their `x`/`y`/CRS values change, and appending to them (forecast archive or grid
+  extend) is refused with a "rebuild" message (`forecast.check_crs`, run before the `x`/`y` comparison).
+  Moving nests are refused; missing `XLAT`/`XLONG` falls back to `CEN_LAT`/`CEN_LON` with a warning.
+- Every input file's grid header (projection, `DX`/`DY`, dimensions, `BUCKET_MM`, `PREC_ACC_DT`) must match
+  the first file's; each file's `SIMULATION_START_DATE` is recorded (`_file_run_starts`).
+- `PREC_ACC` negatives are clipped to 0 (transform `sum_nonneg`), as `RAIN`'s increments are.
+- **Refused:** values outside a packed variable's storable range, checked in the variable's decoded dtype
+  (cfdb stored them as NaN silently; `checks.check_encodable`), and `RAIN`/`RAIN_TR` over a window whose
+  frames come from more than one run (the first interval of each later run became 0). A RAIN window
+  starting at a run's first frame is not seeded from the previous run (NaN there).
+- `RAIN` differences consecutive KEPT frames: where two overlapping input files disagree at a duplicated
+  time, the increment after it is taken against the copy that was stored (0.5.1: against the later file's
+  copy). Identical for non-overlapping or byte-identical inputs.
+- ERA5 multi-source variables (`VIMF_U`/`VIMF_V`) match each source's frames by time, so per-variable file
+  lists that sort differently pair correctly; sources covering different times are refused.
+- Coordinate VALUES change for Lambert grids: besides the km-scale ellipsoid fix, `y` shifts by the
+  `MOAD_CEN_LAT` origin (356 km on the v33 d03, whose `CEN_LAT` is 3.2 degrees south of it).
+- Grid `convert` returns a status dict (was `None`).
+
+**Fix:** cross-file write blocks are aligned to the OUTPUT chunk grid (`_TimeMappedSource`, `_time_plan`),
+so every output chunk is written once per call; before, a `start_date` dropping leading frames rewrote the
+first chunk once per timestep and later chunks twice (values were right; file size and re-uploads were
+not). Frames outside the window are no longer read, and each source's own HDF5 chunking is kept, so every
+source chunk is decompressed once (measured on 36 real d03 files: 6 720 reads, one per chunk; 322 output
+chunks, one write each; 3.0 GB peak per 840-h band).
+
+**New (opt-in, WRF grid mode only; other sources refuse):**
+- `extend=True` -- write into / grow an existing dataset in bands (`cfdb_ingest.grid`), in any order, across
+  placeholder gaps; frames missing from a window stay unwritten and are listed in `missing_frames`;
+  existing variables keep their chunk shape and encoding (checked before anything is written).
+- `time_label='start'` -- accumulations labelled by interval start (`frame - PREC_ACC_DT`); lead-0 frames
+  dropped per file; `time.attrs['time_label']`, `cell_methods`.
+- `squeeze_height=True` -- surface fields as `(time, y, x)`; 3-D `chunk_shape`.
+- `wrf_synthetic` writes `PREC_ACC_DT`. Requires cfdb-vars >= 0.2.5 (CF standard names corrected, e.g.
+  `precipitation` -> `lwe_thickness_of_precipitation_amount`).
+- No CLI flags for the new options yet.
 
 ## 0.5.0 (release note)
 

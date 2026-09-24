@@ -46,6 +46,29 @@ wrf.convert(
 )
 ```
 
+### Projection and coordinates (0.6.0)
+
+Lambert (MAP_PROJ 1), polar-stereographic (2) and Mercator (3) grids are stored with 1-D projected `x`/`y`
+(metres) and a CRS built from the file's own metadata on **WRF's earth model**: the WPS projection
+parameters (`TRUELAT1/2`, `STAND_LON`) on a sphere of 6 370 000 m (WPS `constants_module.F`,
+`EARTH_RADIUS_M`), which is what `XLAT`/`XLONG` were computed on. The Lambert latitude of origin is a
+convention -- WPS anchors its grid at a known corner and has no such parameter; any value gives the same
+geometry with shifted `y` -- and cfdb-ingest uses `MOAD_CEN_LAT` (the outermost domain's centre), so every
+nest of one run shares one CRS. The polar hemisphere follows the sign of `TRUELAT1`, as WPS does.
+
+`x`/`y` are the file's own cell centres (`XLAT`/`XLONG`) projected through that CRS and fitted to a regular
+`DX`/`DY` lattice, then checked both ways within `WrfIngest.xy_tolerance_m` (25 m; healthy files measure
+1.6-4.7 m, the float32 precision of `XLAT`/`XLONG`). A file whose projection attributes do not describe its
+grid is refused rather than written with misplaced coordinates. Without `XLAT`/`XLONG` the lattice is laid
+around `CEN_LAT`/`CEN_LON` with a warning. Every input file's grid header (projection, `DX`/`DY`,
+dimensions, `BUCKET_MM`, `PREC_ACC_DT`) must match the first file's.
+
+!!! warning "Outputs of cfdb-ingest < 0.6.0"
+    Earlier versions built these CRSs on the WGS84 ellipsoid, placing cells up to several km (2.5 km on a
+    3 km NZ d03, 5-8 km on 12-27 km domains) from where WRF computed them, and gave each nest its own
+    origin. Appending new output to such a dataset (grid `extend` or a forecast archive) is refused with a
+    "rebuild" message; rebuild those datasets from the wrfout.
+
 ### 3D level interpolation (height)
 
 ```python
@@ -88,6 +111,10 @@ wrf.convert(
 # exists on levels; a name present at two heights, e.g. 10 m and 100 m winds, is suffixed at both)
 ```
 
+`squeeze_height=True` (0.6.0, grid mode, surface variables only) stores surface fields as `(time, y, x)`
+without the length-1 height axis; the height moves to a `height` attribute (e.g. `'0 m'`), and
+`chunk_shape` may be given as 3-D `(time, y, x)`.
+
 ### Soil variables
 
 Soil moisture and temperature are stored on a `depth` coordinate derived from WRF's DZS (soil layer thicknesses):
@@ -124,6 +151,11 @@ each interval rather than a running total. Several details are handled automatic
   `RAINNC + BUCKET_MM * I_RAINNC` before differencing.
 - **Negative increments** -- small negative differences (which can occur with nudging or two-way
   nesting feedback) are clipped to zero.
+- **One run only** (0.6.0) -- the running totals restart at every cold start, so differencing across
+  runs (different `SIMULATION_START_DATE`) would store the first interval of each later run as 0. A window
+  whose frames come from more than one run is refused (files outside the window don't matter); a window
+  starting at a run's first frame gets NaN there, not a difference against the previous run. Use
+  `PREC_ACC` for a record stitched from independent runs.
 
 `PREC_ACC` (0.5.0) stores the same quantity -- precipitation over the output interval, cfdb `precip`
 -- from WRF's own windowed accumulators `PREC_ACC_NC + PREC_ACC_C` (namelist `prec_acc_dt` set to the
@@ -131,7 +163,28 @@ history interval). Each frame already holds the increment since the previous fra
 previous-frame state: it is the source to use when an init is ingested one file at a time, and it
 gives 0 rather than NaN at lead 0. Not valid on a two-way-nested *parent* domain, whose `PREC_ACC_*`
 the child's feedback overwrites -- use it on the innermost domain. `RAIN` and `PREC_ACC` cannot be
-requested together (both write `precip`).
+requested together (both write `precip`). Since 0.6.0 negative `PREC_ACC` values (float noise, e.g. from
+offline backfills of bucket differences) are clipped to 0, as `RAIN`'s increments are.
+
+Both are labelled, by default, with WRF's frame time -- the END of the interval they accumulate. For an
+interval-start convention, see [Interval-start labels](#interval-start-labels-060).
+
+### Interval-start labels (0.6.0)
+
+`convert(..., time_label='start')` labels each accumulation by the start of its interval: a `PREC_ACC`
+frame at `t` (precipitation over `(t - PREC_ACC_DT, t]`) is stored at `t - PREC_ACC_DT`. It applies to
+accumulations only (`PREC_ACC`, `RAIN`, `RAIN_TR`) -- all fields of one conversion share one time axis, so
+mixing in an instantaneous field is refused -- and to grid mode only. Details:
+
+- `PREC_ACC_DT` must equal the frame spacing, so each frame is one output interval.
+- `start_date` / `end_date` select the **labels**: the window `[b0, b1)` is `start_date=b0,
+  end_date=b1 - 1h`, and needs the input frame at `b1` (usually the next file's first frame).
+- A frame whose interval starts before **its own file's** `SIMULATION_START_DATE` (a run's lead-0 frame,
+  WRF's zero-initialised accumulator) is dropped, and `PREC_ACC` frames must lie on their run's
+  `SIMULATION_START_DATE + k * PREC_ACC_DT` grid. Both are evaluated per file, because one conversion of a
+  stitched hindcast spans several runs.
+- The dataset records `time.attrs['time_label'] = 'interval_start'` and `interval_minutes`, and the
+  variable `cell_methods = 'time: sum (interval: 60 minutes)'`.
 
 ### Column-integrated and moisture-transport variables
 
@@ -203,6 +256,58 @@ wrf.convert(
     chunk_shape=(1, 1, 50, 50),  # (time, z, y, x)
 )
 ```
+
+With `squeeze_height=True` a 3-D `(time, y, x)` chunk shape is accepted (a 3-D shape without it is
+refused). Every output chunk is written exactly once per call, also when `start_date` drops leading
+frames (0.6.0: write blocks are aligned to the output chunk grid; before, a dropped first frame rewrote
+the first chunk once per timestep).
+
+Values a variable's packed dtype cannot store (e.g. more than 654.35 mm in an hour for `precipitation`,
+uint16 at 0.01 mm) are refused before writing (0.6.0); cfdb would otherwise store them as missing.
+
+### Building a long dataset in bands (0.6.0)
+
+`convert(..., extend=True)` (grid mode, WRF) writes into an existing dataset -- or creates it -- instead of
+replacing it, so a decades-long record can be built in time bands, and extended forward or backward later.
+`cfdb_path` may be a path or an open cfdb `Dataset` / `EDataset` handle.
+
+```python
+import cfdb
+import numpy as np
+from cfdb_ingest import WrfIngest, grid
+
+KW = dict(variables=['PREC_ACC'], extend=True, time_label='start', squeeze_height=True,
+          chunk_shape=(840, 24, 24))
+with cfdb.open_dataset('precip.cfdb') as ds:          # after the first band exists
+    bands = grid.time_bands(grid.time_anchor(ds), '1980-01-01', '1990-07-01', 840, 60)
+for b0, b1 in bands:
+    files = ...  # the wrfout files holding frames (b0, b1]
+    r = WrfIngest(files).convert('precip.cfdb', start_date=str(b0), end_date=str(b1 - np.timedelta64(1, 'h')), **KW)
+    if r['missing_frames']:
+        print(b0, 'missing', len(r['missing_frames']))   # re-run this band once the files exist
+```
+
+- **Time axis.** Created with an explicit numeric step (never `step=True`, which stores no step for a
+  one-frame axis). A window may extend either end of the stored axis -- across a gap too: cfdb auto-fills
+  the skipped slots as placeholders, never written and read as missing -- or overwrite stored times (a
+  placeholder, an interior band, a re-run), in any order. A window extending both ends at once, or off the
+  stored step grid, is refused, as is a target whose time axis has no step. The step is the accumulation
+  interval with `time_label='start'`, else the smallest spacing of all input frames.
+- **Missing frames are written as missing and reported.** The window covers every step from `start_date` to
+  `end_date` (default: the first and last frame present); frames absent from the input are left unwritten
+  (read as missing) and listed in the result's `missing_frames`. Re-run the window once the files exist --
+  writes are idempotent overwrites -- to fill them. Chunks may therefore be partly written; nothing tracks
+  completeness, so check the values where it matters (e.g. no missing values in a published range).
+  `RAIN` (differenced totals) is refused across a hole, which would span several intervals.
+- **Chunks.** Bands are aligned to the dataset's absolute time index 0 (its first time at creation), not the
+  calendar: use `grid.time_bands(grid.time_anchor(ds), ...)`. Every output chunk is written once per call.
+  An existing variable keeps its chunk shape and encoding (a mismatch is refused before anything is
+  written; `chunk_shape=None` uses the stored one). The CRS, `x`/`y`, time step and time labelling must
+  match the target. `grid.missing_chunks(ds, start, end)` lists chunks never written (key presence, no fetch).
+- **Re-runs** overwrite and are idempotent, but the store is log-structured: run `ds.prune()` afterwards to
+  reclaim the old chunk versions.
+- `convert` returns `{'status', 'time_index', 'n_times', 'n_new', 'gap_filled', 'missing_frames',
+  'variables'}` in grid mode.
 
 ### Inspecting metadata before conversion
 

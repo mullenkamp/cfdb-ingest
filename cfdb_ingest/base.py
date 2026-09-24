@@ -17,6 +17,8 @@ from cfdb.utils import get_var_params
 from cfdb_vars import short_name_map
 import cfdb_ingest
 from cfdb_ingest import forecast as _fc
+from cfdb_ingest import grid as _grid
+from cfdb_ingest.checks import check_encodable
 
 _HEIGHT_SUFFIX = re.compile(r'_(\d+)m$')
 _FULL_TO_SHORT = {full: short for short, full in short_name_map.items()}
@@ -128,19 +130,8 @@ def group_variables(mapping: Dict[str, dict], var_keys: List[str],
     return level_vars, surface_vars, soil_vars, region_vars
 
 
-def create_cfdb_data_var(ds, cfdb_name: str, coord_names: Tuple[str, ...], chunk_shape: Tuple[int, ...],
-                         dtype=None, attrs: Optional[dict] = None):
-    """
-    Create (or, in append mode, reuse) a cfdb data variable.
-
-    The cfdb-vars template -- dtype encoding and CF attributes -- is looked up by the BASE name
-    (height suffix stripped, short or full spelling), and the variable is stored under
-    ``full_name + suffix``. ``dtype`` overrides the template encoding (attrs are kept); ``attrs``
-    are applied on top (and are the only attrs for names cfdb-vars does not know).
-
-    If the resolved name already exists (appending an init to an existing forecast dataset) the
-    existing variable is returned after checking its coordinates match.
-    """
+def _resolve_var_template(cfdb_name: str, chunk_shape, dtype=None):
+    """``(stored_name, var_params, template_attrs)`` for ``cfdb_name`` -- the naming of ``create_cfdb_data_var``."""
     base, suffix = split_height_suffix(cfdb_name)
     base = _FULL_TO_SHORT.get(base, base)     # accept either spelling; templates are keyed by short name
     kwargs = {'chunk_shape': chunk_shape}
@@ -152,7 +143,29 @@ def create_cfdb_data_var(ds, cfdb_name: str, coord_names: Tuple[str, ...], chunk
     else:
         stored_base, var_params, template_attrs = base, dict(kwargs), {}
         var_params.setdefault('dtype', 'float32')
-    name = stored_base + suffix
+    return stored_base + suffix, var_params, template_attrs
+
+
+def stored_var_name(cfdb_name: str) -> str:
+    """The name ``create_cfdb_data_var`` stores ``cfdb_name`` under."""
+    return _resolve_var_template(cfdb_name, None)[0]
+
+
+def create_cfdb_data_var(ds, cfdb_name: str, coord_names: Tuple[str, ...], chunk_shape: Tuple[int, ...],
+                         dtype=None, attrs: Optional[dict] = None, strict: bool = False):
+    """
+    Create (or, in append mode, reuse) a cfdb data variable.
+
+    The cfdb-vars template -- dtype encoding and CF attributes -- is looked up by the BASE name
+    (height suffix stripped, short or full spelling), and the variable is stored under
+    ``full_name + suffix``. ``dtype`` overrides the template encoding (attrs are kept); ``attrs``
+    are applied on top (and are the only attrs for names cfdb-vars does not know).
+
+    If the resolved name already exists (appending an init to an existing forecast dataset) the
+    existing variable is returned after checking its coordinates match -- and with ``strict`` (grid
+    extend mode) its stored encoding too, so a changed template cannot mix two encodings in one variable.
+    """
+    name, var_params, template_attrs = _resolve_var_template(cfdb_name, chunk_shape, dtype)
     if attrs:
         template_attrs = {**template_attrs, **attrs}
 
@@ -162,6 +175,12 @@ def create_cfdb_data_var(ds, cfdb_name: str, coord_names: Tuple[str, ...], chunk
             raise ValueError(
                 f'existing variable {name!r} has coords {existing.coord_names}, expected {tuple(coord_names)}'
             )
+        if strict:
+            want = cfdb.dtypes.dtype(var_params['dtype']).to_dict()
+            have = existing.dtype.to_dict()
+            if want != have:
+                raise ValueError(f'existing variable {name!r} is encoded as {have}; incoming data would be '
+                                 f'{want}. Rebuild the target, or pass the stored dtype.')
         return existing
 
     data_var = ds.create.data_var.generic(name, coord_names, **var_params)
@@ -247,6 +266,53 @@ class _ConcatTimeSourceUnstaggered(_ConcatTimeSource):
         return (raw[lo] + raw[hi]) / 2.0
 
 
+def _check_existing_var(data_var, chunk_shape) -> None:
+    """Extend mode: an existing variable must keep its chunk shape (when one is requested)."""
+    if chunk_shape is not None and tuple(data_var.chunk_shape) != tuple(chunk_shape):
+        raise ValueError(f'existing {data_var.name!r}: chunk_shape {tuple(data_var.chunk_shape)} != requested '
+                         f'{tuple(chunk_shape)}; extend with the target\'s chunk shape (or pass chunk_shape=None)')
+
+
+class _TimeMappedSource:
+    """
+    A virtual time axis over a concatenated source, for a rechunker whose blocks must line up with the
+    OUTPUT dataset's time chunks.
+
+    Row ``v`` of this source is raw row ``raw_of[v]`` of ``inner`` (the files concatenated), or a pad row
+    of zeros when ``raw_of[v] == -1``. ``raw_of`` lists the kept frames in output order, preceded by
+    ``pad`` pad rows, where ``pad`` is the output's first absolute time index modulo the chunk length --
+    so a rechunker block of ``chunk_t`` rows starting at a multiple of ``chunk_t`` covers exactly one
+    output chunk. Pad rows are never written, and frames outside the requested window are never read.
+    """
+
+    def __init__(self, inner, raw_of):
+        self._inner = inner
+        self._raw_of = np.asarray(raw_of, dtype='int64')
+        self.shape = (len(self._raw_of),) + tuple(inner.shape[1:])
+        self.dtype = inner.dtype
+        # Keep the source's own chunking, time included: a time-chunked source (ERA5: 12-24 frames per
+        # HDF5 chunk) is then read a whole chunk at a time, not one frame (= one decompression) per call.
+        sc = inner.source_chunks
+        self.source_chunks = None if sc is None else tuple(sc)
+
+    def __call__(self, slices):
+        t = slices[0]
+        rest = tuple(slices[1:])
+        rows = self._raw_of[t.start:t.stop]
+        out = np.zeros((len(rows),) + tuple(s.stop - s.start for s in rest), dtype=self.dtype)
+        i = 0
+        while i < len(rows):
+            if rows[i] < 0:
+                i += 1
+                continue
+            j = i + 1
+            while j < len(rows) and rows[j] == rows[j - 1] + 1:
+                j += 1
+            out[i:j] = self._inner((slice(int(rows[i]), int(rows[j - 1]) + 1),) + rest)
+            i = j
+        return out
+
+
 @contextlib.contextmanager
 def _grid_target(cfdb_path, dataset_type, cfdb_kwargs):
     """Grid mode: always a fresh file (unchanged behaviour)."""
@@ -272,6 +338,8 @@ class H5Ingest:
 
     file_glob_pattern = '*'
     _forecast_writer = None
+    # convert(extend=..., time_label='start', squeeze_height=...) -- opt-in, implemented per source.
+    _supports_grid_extend = False
     """Glob pattern for finding source files in directories. Override in subclasses."""
 
     def __init__(self, input_paths: Union[str, pathlib.Path, List[Union[str, pathlib.Path]]]):
@@ -622,6 +690,9 @@ class H5Ingest:
         overwrite: bool = False,
         leads=None,
         mark_complete: bool = True,
+        extend: bool = False,
+        time_label: str = 'end',
+        squeeze_height: bool = False,
         **cfdb_kwargs,
     ):
         """
@@ -680,18 +751,45 @@ class H5Ingest:
             Forecast mode only: record the init in ``complete_inits`` at the end (default). Pass
             ``False`` for a partial call; the init then stays a back-fill target until the caller has
             checked ``forecast.missing_chunks`` and marks it.
+        extend : bool
+            Grid mode only (WRF; since 0.6.0): write into an existing dataset (or create it) instead of
+            replacing it -- a long record built in time bands. The window may extend either end of the
+            stored axis (across a gap: cfdb auto-fills placeholder slots) or overwrite stored times
+            (placeholders, re-runs); ``cfdb_path`` may be a path or an open Dataset / EDataset handle.
+            Every output chunk is written once per call. A window whose frames are only partly present
+            in the input files is refused. See ``cfdb_ingest.grid``.
+        time_label : {'end', 'start'}
+            ``'end'`` (default): WRF's frame times. ``'start'`` (grid mode, accumulations only; since
+            0.6.0): label each accumulated interval by its start (``frame - PREC_ACC_DT`` for PREC_ACC).
+            ``start_date``/``end_date`` then select these labels; a run's lead-0 frame is dropped.
+        squeeze_height : bool
+            Grid mode only (since 0.6.0): store surface fields as ``(time, y, x)`` without the length-1
+            ``height_Xm`` axis (the height moves to a ``height`` attribute). ``chunk_shape`` may then be
+            3-D ``(time, y, x)``. Surface variables only.
         **cfdb_kwargs
             Extra kwargs for cfdb.open_dataset (e.g., compression).
         """
         self._vertical_coord = vertical_coord
         forecast = dataset_type == 'grid_forecast'
         self._forecast_writer = None
+        self._grid_t_offset = 0
+        self._grid_abs_t0 = 0
         leads_arg = leads
         if not forecast and (leads is not None or not mark_complete):
             raise ValueError("'leads' and 'mark_complete' apply to dataset_type='grid_forecast' only")
 
         var_keys = self.resolve_variables(variables)
         self._check_var_keys(var_keys)
+
+        if time_label not in ('end', 'start'):
+            raise ValueError(f"time_label must be 'end' or 'start', got {time_label!r}")
+        grid_opts = [name for name, on in (('extend', extend), ("time_label='start'", time_label == 'start'),
+                                           ('squeeze_height', squeeze_height)) if on]
+        if grid_opts and forecast:
+            raise ValueError(f'{grid_opts} apply to grid mode only (forecast leads are valid times)')
+        if grid_opts and not self._supports_grid_extend:
+            raise ValueError(f'{grid_opts} are implemented for WRF sources only ({type(self).__name__})')
+        label_shift = self._label_shift(var_keys) if time_label == 'start' else None
 
         has_level_interp = any(self.variables[k]['height'] == 'levels' for k in var_keys)
         if has_level_interp and target_levels is None:
@@ -728,8 +826,33 @@ class H5Ingest:
                     f'outputs are required (the fallback path cannot reconstruct per-region values).'
                 )
 
-        # Filter time
-        time_mask, filtered_times = self._filter_time(start_date, end_date)
+        # Filter time. Interval-start mode selects on the labels (lead-0 frames dropped).
+        if label_shift is not None:
+            labels, keep = self._label_frames(label_shift, var_keys)
+            time_mask, filtered_times = self._filter_time(start_date, end_date, labels=labels)
+            time_mask &= keep
+            filtered_times = labels[time_mask]
+        else:
+            time_mask, filtered_times = self._filter_time(start_date, end_date)
+
+        self._check_window(var_keys, time_mask)
+        all_labels = labels if label_shift is not None else self.times
+
+        # Output slots. Default: the kept frames, compacted. Extend mode: every step of the window, so a frame
+        # missing from the input is an unwritten slot (read as missing; filled by re-running the window once
+        # the file exists) and is reported in the result, rather than shifting later frames forward.
+        step_minutes = None
+        missing_frames = np.array([], dtype='datetime64[m]')
+        if extend:
+            step_minutes = self._grid_step_minutes(label_shift)
+            filtered_times, missing_frames = self._window_slots(filtered_times, start_date, end_date, step_minutes)
+            if missing_frames.size and any(
+                    self.variables[k].get('transform') == 'accumulation_increment' for k in var_keys):
+                raise ValueError(
+                    f'{missing_frames.size} frames of the window are missing from the input (first '
+                    f'{[str(m) for m in missing_frames[:3]]}); a differenced accumulation (RAIN) across the hole '
+                    f'would span several intervals. Supply the files, or split the window at the hole.')
+        self._set_output_slots(time_mask, all_labels, filtered_times)
 
         # Filter space
         if bbox is not None:
@@ -767,10 +890,30 @@ class H5Ingest:
             time_coord_names = (_fc.FRT, _fc.LEAD)
             target_cm = _fc.open_target(cfdb_path, dataset_type=dataset_type, **cfdb_kwargs)
         else:
-            chunk_4d = chunk_shape if chunk_shape is not None else (1, 1, ny, nx)
-            storage_chunk = chunk_4d
+            if squeeze_height:
+                if level_vars or soil_vars or region_vars:
+                    raise ValueError('squeeze_height applies to surface variables only; convert level, soil and '
+                                     'region fields in a separate call')
+                if chunk_shape is None:
+                    storage_chunk = (1, ny, nx)
+                elif len(chunk_shape) == 3:
+                    storage_chunk = tuple(chunk_shape)
+                elif len(chunk_shape) == 4:
+                    storage_chunk = (chunk_shape[0], chunk_shape[2], chunk_shape[3])
+                else:
+                    raise ValueError(f'chunk_shape must be 3-D (time, y, x) with squeeze_height, got {chunk_shape}')
+                chunk_4d = (storage_chunk[0], 1, storage_chunk[1], storage_chunk[2])
+            else:
+                if chunk_shape is not None and len(chunk_shape) != 4:
+                    raise ValueError(f'grid-mode chunk_shape must be 4-D (time, z, y, x) '
+                                     f'(3-D needs squeeze_height=True), got {chunk_shape}')
+                chunk_4d = chunk_shape if chunk_shape is not None else (1, 1, ny, nx)
+                storage_chunk = chunk_4d
             time_coord_names = ('time',)
-            target_cm = _grid_target(cfdb_path, dataset_type, cfdb_kwargs)
+            if extend:
+                target_cm = _fc.open_target(cfdb_path, dataset_type=dataset_type, **cfdb_kwargs)
+            else:
+                target_cm = _grid_target(cfdb_path, dataset_type, cfdb_kwargs)
 
         has_multi_level = sorted_levels is not None and level_vars
 
@@ -779,8 +922,14 @@ class H5Ingest:
                 # Create coordinates
                 if forecast:
                     _fc.create_forecast_coords(ds, init, axis_leads, step_minutes=forecast_step_minutes)
+                elif extend:
+                    # An explicit numeric step, never step=True: see cfdb_ingest.grid.
+                    ds.create.coord.time(data=filtered_times, step=int(step_minutes))
                 else:
                     ds.create.coord.time(data=filtered_times, step=True)
+                if label_shift is not None:
+                    ds['time'].attrs[_grid.TIME_LABEL_ATTR] = 'interval_start'
+                    ds['time'].attrs['interval_minutes'] = int(label_shift / np.timedelta64(1, 'm'))
                 self._create_spatial_coords(ds, filtered_x, filtered_y)
 
                 if has_multi_level:
@@ -796,7 +945,7 @@ class H5Ingest:
                 # Each distinct height gets its own length-1 coordinate (e.g. height_2m).
                 # If there's also a multi-level vertical coord, these get axis=None
                 # to avoid conflicting with the axis='Z' on pressure/height.
-                for h in sorted(fixed_heights):
+                for h in (() if squeeze_height else sorted(fixed_heights)):
                     coord_name = f'height_{int(h)}m'
                     axis = None if (has_multi_level or len(fixed_heights) > 1) else 'z'
                     ds.create.coord.generic(
@@ -822,14 +971,43 @@ class H5Ingest:
                 # Set dataset attributes
                 for key, value in self._get_dataset_attrs().items():
                     ds.attrs[key] = value
-            else:
+            elif forecast:
                 _fc.validate_target(
                     ds, x_name=self.x_coord_name, y_name=self.y_coord_name, x=filtered_x, y=filtered_y,
                     levels=sorted_levels if has_multi_level else None,
                     depths=soil_depths if (soil_depths is not None and soil_vars) else None,
+                    crs=self.crs,
                 )
                 _fc.append_history(ds, f'{datetime.datetime.now(datetime.timezone.utc).isoformat()} '
                                        f'{type(self).__name__} appended init {np.datetime64(init, "m")}')
+            else:
+                _grid.validate_target(
+                    ds, crs=self.crs, x_name=self.x_coord_name, y_name=self.y_coord_name, x=filtered_x,
+                    y=filtered_y, levels=sorted_levels if has_multi_level else None,
+                    depths=soil_depths if (soil_depths is not None and soil_vars) else None,
+                    step_minutes=step_minutes, time_label=time_label,
+                )
+
+            if extend:
+                if created:
+                    placed = {'status': 'new', 'index': 0, 'n_new': len(filtered_times), 'gap_filled': 0,
+                              'abs_start': 0}
+                else:
+                    # Refuse a variable mismatch before the time axis is touched.
+                    for cfdb_name in surface_vars:
+                        if stored_var_name(cfdb_name) in ds.data_var_names:
+                            coords = ((*time_coord_names, self.y_coord_name, self.x_coord_name) if squeeze_height else
+                                      (*time_coord_names, f'height_{int(surface_vars[cfdb_name][0])}m',
+                                       self.y_coord_name, self.x_coord_name))
+                            existing = self._create_cfdb_data_var(ds, cfdb_name, coords, storage_chunk, strict=True)
+                            _check_existing_var(existing, storage_chunk if chunk_shape is not None else None)
+                    placed = _grid.place_times(ds, filtered_times, step_minutes=step_minutes)
+                    _fc.append_history(
+                        ds, f'{datetime.datetime.now(datetime.timezone.utc).isoformat()} {type(self).__name__} '
+                            f'{placed["status"]} {filtered_times[0]}..{filtered_times[-1]} '
+                            f'({self.input_paths[0].name} .. {self.input_paths[-1].name})')
+                self._grid_t_offset = placed['index']
+                self._grid_abs_t0 = placed['abs_start']
 
             if forecast:
                 if created:
@@ -879,14 +1057,30 @@ class H5Ingest:
                     level_indices = list(range(len(sorted_levels)))
                     _classify((var_key, data_var, level_indices), self.variables[var_key])
 
-            # Surface variables: (time, height_Xm, y, x)
+            # Surface variables: (time, height_Xm, y, x), or (time, y, x) with squeeze_height
             for cfdb_name, (h, var_key_list) in surface_vars.items():
                 coord_name = f'height_{int(h)}m'
-                surface_coord_names = (*time_coord_names, coord_name, self.y_coord_name, self.x_coord_name)
-                data_var = self._create_cfdb_data_var(ds, cfdb_name, surface_coord_names, storage_chunk)
+                if squeeze_height:
+                    surface_coord_names = (*time_coord_names, self.y_coord_name, self.x_coord_name)
+                else:
+                    surface_coord_names = (*time_coord_names, coord_name, self.y_coord_name, self.x_coord_name)
+                existed = stored_var_name(cfdb_name) in ds.data_var_names
+                data_var = self._create_cfdb_data_var(ds, cfdb_name, surface_coord_names, storage_chunk,
+                                                      strict=extend)
+                if extend and existed:
+                    _check_existing_var(data_var, storage_chunk if chunk_shape is not None else None)
+                if extend:
+                    # Align every write to the variable's REAL time chunk (stored one when it existed).
+                    chunk_4d = (data_var.chunk_shape[0],) + tuple(chunk_4d[1:])
+                if not existed:
+                    if squeeze_height:
+                        data_var.attrs['height'] = f'{h:g} m'
+                    if label_shift is not None:
+                        data_var.attrs['cell_methods'] = (
+                            f'time: sum (interval: {int(label_shift / np.timedelta64(1, "m"))} minutes)')
                 for var_key in var_key_list:
-                    # index 0 of the length-1 height coord
-                    _classify((var_key, data_var, [0]), self.variables[var_key])
+                    # index 0 of the length-1 height coord; None = no middle axis (squeeze_height)
+                    _classify((var_key, data_var, None if squeeze_height else [0]), self.variables[var_key])
 
             # Soil variables: (time, depth, y, x)
             soil_coord_names = (*time_coord_names, 'depth', self.y_coord_name, self.x_coord_name)
@@ -968,25 +1162,96 @@ class H5Ingest:
                         'n_leads': int(len(leads)), 'variables': list(var_keys),
                         'chunk_writes': int(chunk_writes), 'complete': bool(mark_complete)}
 
+            result = {'status': placed['status'] if extend else 'new',
+                      'time_index': (int(self._grid_t_offset), int(self._grid_t_offset) + len(filtered_times)),
+                      'n_times': int(len(filtered_times)),
+                      'n_new': int(placed['n_new']) if extend else int(len(filtered_times)),
+                      'gap_filled': int(placed['gap_filled']) if extend else 0,
+                      'missing_frames': [str(m) for m in missing_frames],
+                      'variables': list(var_keys)}
+            self._grid_t_offset = 0
+            self._grid_abs_t0 = 0
+            return result
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _filter_time(self, start_date, end_date):
+    def _filter_time(self, start_date, end_date, labels=None):
         """
-        Return a boolean mask and the filtered times array.
+        Return a boolean mask and the filtered times array. ``labels`` (aligned with ``self.times``)
+        are the output time values when they differ from the frame times (interval-start labels).
         """
-        mask = np.ones(len(self.times), dtype=bool)
+        times = self.times if labels is None else labels
+        mask = np.ones(len(times), dtype=bool)
 
         if start_date is not None:
             start = np.datetime64(start_date)
-            mask &= self.times >= start
+            mask &= times >= start
 
         if end_date is not None:
             end = np.datetime64(end_date)
-            mask &= self.times <= end
+            mask &= times <= end
 
-        return mask, self.times[mask]
+        return mask, times[mask]
+
+    def _check_window(self, var_keys, time_mask) -> None:
+        """Source-specific refusals that depend on the frames of the requested window (override)."""
+        return None
+
+    def _run_start_of_path(self, path):
+        """The run (init) an input file belongs to, where the source records one (override); None if unknown."""
+        return None
+
+    def _grid_step_minutes(self, label_shift):
+        """
+        Extend mode: the time step (minutes) of the output axis -- the accumulation interval with
+        interval-start labels, else the smallest spacing of ALL input frames (a missing file only widens
+        some gaps). Never inferred from the window alone: two frames around a hole would read as one step.
+        """
+        if label_shift is not None:
+            return int(label_shift / np.timedelta64(1, 'm'))
+        d = np.diff(self.times)
+        if len(d):
+            return int(d.min() / np.timedelta64(1, 'm'))
+        raise ValueError('cannot determine the time step from one frame; pass more frames '
+                         "(or use time_label='start' for accumulations)")
+
+    @staticmethod
+    def _window_slots(filtered_times, start_date, end_date, step_minutes):
+        """
+        Extend mode: every time of the window [start_date, end_date] (default: first..last frame present)
+        at the step, and those absent from the input. Refused: no frame at all, or frames off the step grid
+        of the window.
+        """
+        if len(filtered_times) == 0:
+            raise ValueError(f'no input frames in the window {start_date} .. {end_date}')
+        step = np.timedelta64(int(step_minutes), 'm')
+        present = np.asarray(filtered_times).astype('datetime64[m]')
+        lo = np.datetime64(start_date, 'm') if start_date is not None else present[0]
+        hi = np.datetime64(end_date, 'm') if end_date is not None else present[-1]
+        window = np.arange(lo, hi + step, step)
+        off = np.setdiff1d(present, window)
+        if off.size:
+            raise ValueError(f'frames {[str(o) for o in off[:3]]} are off the {step_minutes}-min grid of the '
+                             f'window starting {lo}')
+        return window, np.setdiff1d(window, present)
+
+    def _set_output_slots(self, time_mask, labels, out_times):
+        """
+        Map each kept unique time to its output slot (``self._out_index``, -1 = not written) and each slot to
+        its unique time (``self._slot_u``, -1 = no frame). Every populate path writes through these.
+        """
+        kept = np.flatnonzero(time_mask)
+        out_times = np.asarray(out_times).astype('datetime64[m]')
+        pos = np.searchsorted(out_times, np.asarray(labels)[kept].astype('datetime64[m]'))
+        if kept.size and (pos.max() >= len(out_times) or not np.array_equal(out_times[pos], np.asarray(labels)[kept])):
+            raise RuntimeError('kept frames do not map onto the output time slots')
+        out_index = np.full(len(time_mask), -1, dtype='int64')
+        out_index[kept] = pos
+        slot_u = np.full(len(out_times), -1, dtype='int64')
+        slot_u[pos] = kept
+        self._out_index, self._slot_u = out_index, slot_u
 
     def _bbox_to_indices(self, bbox):
         """
@@ -1110,11 +1375,11 @@ class H5Ingest:
         """
         return block
 
-    def _create_cfdb_data_var(self, ds, cfdb_name, coord_names, chunk_shape, dtype=None, attrs=None):
+    def _create_cfdb_data_var(self, ds, cfdb_name, coord_names, chunk_shape, dtype=None, attrs=None, strict=False):
         """
         Create a cfdb data variable (see the module-level ``create_cfdb_data_var``).
         """
-        return create_cfdb_data_var(ds, cfdb_name, coord_names, chunk_shape, dtype=dtype, attrs=attrs)
+        return create_cfdb_data_var(ds, cfdb_name, coord_names, chunk_shape, dtype=dtype, attrs=attrs, strict=strict)
 
     def _setup_populate(self, var_key, target_levels):
         """Hook called before populating a data variable. Override as needed."""
@@ -1200,23 +1465,16 @@ class H5Ingest:
         if not paths:
             return
 
-        # output_map: unique_time_idx -> output_time_idx (compacted by time_mask)
-        output_map = {}
-        out_idx = 0
-        for u_idx in range(len(time_mask)):
-            if time_mask[u_idx]:
-                output_map[u_idx] = out_idx
-                out_idx += 1
-
         # raw_to_unique: maps each raw global time index (concatenated across
         # files) to a unique time index, or -1 for duplicates from overlapping
         # files. Reuses ``self._raw_to_unique`` when paths match input_paths.
         raw_to_unique = self._get_raw_to_unique(paths)
+        raw_of, pad = self._time_plan(raw_to_unique, time_mask, target_t)
 
         with ExitStack() as stack:
             h5_files = [stack.enter_context(h5py.File(p, 'r')) for p in paths]
             file_lens = [int(h5[src_var].shape[0]) for h5 in h5_files]
-            source = self._make_source(src_var, h5_files, file_lens)
+            source = _TimeMappedSource(self._make_source(src_var, h5_files, file_lens), raw_of)
             source_chunks = source.source_chunks or rechunkit.guess_chunk_shape(
                 source.shape, source.dtype.itemsize, max_mem,
             )
@@ -1267,16 +1525,40 @@ class H5Ingest:
                     block = block_fn({src_var: block}, y_sl, x_sl, {})
                 if level_pick is not None:
                     block = block[:, level_pick]
-                n_block = write_slices[0].stop - write_slices[0].start
-                t_outs = [None] * n_block
-                for i in range(n_block):
-                    raw = write_slices[0].start + i
-                    u = int(raw_to_unique[raw])
-                    if u != -1 and u in output_map:
-                        t_outs[i] = output_map[u]
+                t_outs = self._plan_t_outs(raw_of, pad, write_slices[0].start, write_slices[0].stop)
                 self._write_block_from_t_outs(
                     data_var, block, t_outs, vert_indices, None, None,
                 )
+
+    # Absolute index (in the target's time-chunk grid) of output time 0, and the write offset of output
+    # time 0 into the target's time axis. Both 0 for a fresh dataset; set by grid extend mode.
+    _grid_abs_t0 = 0
+    _grid_t_offset = 0
+
+    def _time_plan(self, raw_to_unique, time_mask, chunk_t):
+        """
+        Virtual time rows for a cross-file rechunk, aligned to the target's chunk grid.
+
+        Returns ``(raw_of, pad)``: ``raw_of[v]`` is the raw (concatenated-files) row of virtual row ``v``,
+        or -1 for a pad row / a kept time absent from these files; output time ``k`` is virtual row
+        ``pad + k``. ``pad`` puts output time 0 at its position within its target chunk, so every
+        rechunker block (``chunk_t`` rows from a multiple of ``chunk_t``) is exactly one output chunk
+        and each chunk is written once -- also when leading frames are filtered out or the output is
+        written at an offset into an existing axis (possibly with a negative origin after a prepend).
+        """
+        unique_to_raw = np.full(len(time_mask), -1, dtype='int64')
+        raws = np.flatnonzero(raw_to_unique >= 0)
+        unique_to_raw[raw_to_unique[raws]] = raws
+        slot_u = self._slot_u
+        raw_slots = np.where(slot_u >= 0, unique_to_raw[np.maximum(slot_u, 0)], -1)
+        pad = int(self._grid_abs_t0 % chunk_t) if chunk_t > 1 else 0
+        raw_of = np.concatenate([np.full(pad, -1, dtype='int64'), raw_slots])
+        return raw_of, pad
+
+    @staticmethod
+    def _plan_t_outs(raw_of, pad, v_start, v_stop):
+        """Output time index for each virtual row in [v_start, v_stop), or None (pad / absent frame)."""
+        return [(v - pad) if (v >= pad and raw_of[v] >= 0) else None for v in range(v_start, v_stop)]
 
     def _get_raw_to_unique(self, paths):
         """
@@ -1318,12 +1600,7 @@ class H5Ingest:
         src_var = self.variables[var_key]['source_vars'][0]
         y_sl, x_sl = spatial_slice
 
-        output_map = {}
-        out_idx = 0
-        for u_idx in range(len(time_mask)):
-            if time_mask[u_idx]:
-                output_map[u_idx] = out_idx
-                out_idx += 1
+        output_map = {int(u): int(self._out_index[u]) for u in np.flatnonzero(time_mask)}
 
         target_t = chunk_4d[0] if chunk_4d is not None else 1
 
@@ -1409,21 +1686,25 @@ class H5Ingest:
         writes otherwise.
         """
         n_block = len(t_outs)
-        if n_block == 0:
-            return
-        if t_outs[0] is not None and all(
-            t_outs[i] is not None and t_outs[i] == t_outs[0] + i
-            for i in range(n_block)
-        ):
-            self._write_data_var_block(
-                data_var, block, slice(t_outs[0], t_outs[0] + n_block),
-                vert_indices, y_write, x_write,
-            )
-            return
-        for i, t_out in enumerate(t_outs):
-            if t_out is None:
+        i = 0
+        while i < n_block:
+            if t_outs[i] is None:
+                i += 1
                 continue
-            self._write_data_var(data_var, block[i], t_out, vert_indices, y_write, x_write)
+            j = i + 1
+            while j < n_block and t_outs[j] is not None and t_outs[j] == t_outs[j - 1] + 1:
+                j += 1
+            # One coalesced write per run of consecutive output indices: a block aligned to the output
+            # chunk grid (see _time_plan) then touches each output chunk exactly once, including a
+            # leading pad (the run starts part-way into the chunk).
+            if j - i == 1:
+                self._write_data_var(data_var, block[i], t_outs[i], vert_indices, y_write, x_write)
+            else:
+                self._write_data_var_block(
+                    data_var, block[i:j], slice(t_outs[i], t_outs[i] + (j - i)),
+                    vert_indices, y_write, x_write,
+                )
+            i = j
 
     def _write_data_var(self, data_var, data, output_time_idx, vert_indices, y_write=None, x_write=None):
         """
@@ -1445,7 +1726,11 @@ class H5Ingest:
                 for lev_i, v_idx in enumerate(vert_indices):
                     writer.put(data_var, v_idx, int(output_time_idx), data[lev_i], ys, xs)
             return
-        if data.ndim == 2:
+        check_encodable(data_var, data)
+        output_time_idx = output_time_idx + self._grid_t_offset
+        if vert_indices is None:
+            data_var[(output_time_idx, ys, xs)] = data[np.newaxis, ...]
+        elif data.ndim == 2:
             data_var[(output_time_idx, vert_indices[0], ys, xs)] = data[np.newaxis, np.newaxis, ...]
         else:
             for lev_i, v_idx in enumerate(vert_indices):
@@ -1475,7 +1760,12 @@ class H5Ingest:
                 for lev_i, v_idx in enumerate(vert_indices):
                     writer.put(data_var, v_idx, time_slice, block[:, lev_i], ys, xs)
             return
-        if block.ndim == 3:
+        check_encodable(data_var, block)
+        if self._grid_t_offset:
+            time_slice = slice(time_slice.start + self._grid_t_offset, time_slice.stop + self._grid_t_offset)
+        if vert_indices is None:
+            data_var[(time_slice, ys, xs)] = block
+        elif block.ndim == 3:
             data_var[(time_slice, vert_indices[0], ys, xs)] = block
         else:
             for lev_i, v_idx in enumerate(vert_indices):
@@ -1609,14 +1899,6 @@ class H5Ingest:
             if not paths:
                 raise ValueError(f'No source files found for {sv!r}')
 
-        # Pre-compute unique_time_idx -> output_time_idx mapping.
-        output_map = {}
-        out_idx = 0
-        for u_idx in range(len(time_mask)):
-            if time_mask[u_idx]:
-                output_map[u_idx] = out_idx
-                out_idx += 1
-
         target_t = chunk_4d[0] if chunk_4d is not None else 1
 
         # Resolve block transform callables once per item.
@@ -1633,8 +1915,18 @@ class H5Ingest:
 
         # raw_to_unique mapping for the time axis. All source vars are assumed
         # to have synchronised time coverage (validated below by shape match).
-        ref_paths = paths_per_src[all_sources[0]]
-        raw_to_unique = self._get_raw_to_unique(ref_paths)
+        # Each source var maps output times to ITS OWN files' rows (ERA5 has per-variable file sets, which
+        # need not sort in the same order); all must cover the same times, or the combined value is undefined.
+        plans = {sv: self._time_plan(self._get_raw_to_unique(paths_per_src[sv]), time_mask, target_t)
+                 for sv in all_sources}
+        raw_of, pad = plans[all_sources[0]]
+        for sv in all_sources[1:]:
+            if not np.array_equal(plans[sv][0] >= 0, raw_of >= 0):
+                missing = self.times[self._slot_u[(plans[sv][0][pad:] >= 0) != (raw_of[pad:] >= 0)]][:3]
+                raise ValueError(
+                    f'source variables {all_sources[0]!r} and {sv!r} cover different times (e.g. {missing.tolist()}); '
+                    f'{[k for k, _, _ in items]} combine them frame by frame, so every source needs every frame'
+                )
 
         y_sl, x_sl = spatial_slice
 
@@ -1656,7 +1948,7 @@ class H5Ingest:
             for sv in all_sources:
                 h5_files = [h5_by_path[p] for p in paths_per_src[sv]]
                 file_lens = [int(h5[sv].shape[0]) for h5 in h5_files]
-                src = self._make_source(sv, h5_files, file_lens)
+                src = _TimeMappedSource(self._make_source(sv, h5_files, file_lens), plans[sv][0])
                 sources[sv] = src
                 if ref_shape is None:
                     ref_shape = src.shape
@@ -1705,13 +1997,7 @@ class H5Ingest:
                     for sv, b in data_blocks.items()
                 }
 
-                n_block = write_slices[0].stop - write_slices[0].start
-                t_outs = [None] * n_block
-                for i in range(n_block):
-                    raw = write_slices[0].start + i
-                    u = int(raw_to_unique[raw])
-                    if u != -1 and u in output_map:
-                        t_outs[i] = output_map[u]
+                t_outs = self._plan_t_outs(raw_of, pad, write_slices[0].start, write_slices[0].stop)
 
                 block_cache = {}
                 for var_key, data_var, vert_indices, fn in item_transforms:
@@ -1739,12 +2025,7 @@ class H5Ingest:
                 all_sources.add(src)
         all_sources = sorted(all_sources)
 
-        output_map = {}
-        out_idx = 0
-        for u_idx in range(len(time_mask)):
-            if time_mask[u_idx]:
-                output_map[u_idx] = out_idx
-                out_idx += 1
+        output_map = {int(u): int(self._out_index[u]) for u in np.flatnonzero(time_mask)}
 
         target_t = chunk_4d[0] if chunk_4d is not None else 1
 
@@ -1871,14 +2152,8 @@ class H5Ingest:
         use_bucket = bucket_mm > 0.0 and len(bucket_vars) > 0
         all_sources = source_vars + bucket_vars
 
-        output_map = {}
-        out_idx = 0
-        for u_idx in range(len(time_mask)):
-            if time_mask[u_idx]:
-                output_map[u_idx] = out_idx
-                out_idx += 1
-
         raw_to_unique = self._get_raw_to_unique(paths)
+        raw_of, pad = self._time_plan(raw_to_unique, time_mask, target_t)
 
         y_sl, x_sl = spatial_slice
         self._prev_accum_total = None
@@ -1887,12 +2162,14 @@ class H5Ingest:
             h5_files = [stack.enter_context(h5py.File(p, 'r')) for p in paths]
 
             sources = {}
+            raw_sources = {}
             ref_shape = None
             ref_dtype = None
             ref_source_chunks = None
             for sv in all_sources:
                 file_lens = [int(h5[sv].shape[0]) for h5 in h5_files]
-                src = self._make_source(sv, h5_files, file_lens)
+                raw_sources[sv] = self._make_source(sv, h5_files, file_lens)
+                src = _TimeMappedSource(raw_sources[sv], raw_of)
                 sources[sv] = src
                 if ref_shape is None:
                     ref_shape = src.shape
@@ -1929,6 +2206,28 @@ class H5Ingest:
 
             source_callables = {sv: src.__call__ for sv, src in sources.items()}
 
+            def _cumulative(blocks):
+                total = sum(blocks[sv].astype('float64') for sv in source_vars)
+                if use_bucket:
+                    total = total + bucket_mm * sum(blocks[bv].astype('float64') for bv in bucket_vars)
+                return total
+
+            # Seed the increment of the first kept frame from the frame before the window (read on its
+            # own: frames outside the window are otherwise never read). None -> NaN, as before, when
+            # the first kept frame is the first frame of the input.
+            real_rows = raw_of[raw_of >= 0]
+            cum = np.cumsum([0] + [int(h5[source_vars[0]].shape[0]) for h5 in h5_files])
+            file_of = lambda r: paths[int(np.searchsorted(cum, r, side='right')) - 1]  # noqa: E731
+            if (len(real_rows) and real_rows[0] > 0 and self._run_start_of_path(file_of(real_rows[0] - 1))
+                    == self._run_start_of_path(file_of(real_rows[0]))):
+                r_prev = int(real_rows[0]) - 1
+                prev_blocks = {
+                    sv: self._post_block_transform(
+                        raw_sources[sv]((slice(r_prev, r_prev + 1),) + tuple(sel[1:])), sv, len(ref_shape))
+                    for sv in all_sources
+                }
+                self._prev_accum_total = _cumulative(prev_blocks)[0]
+
             for write_slices, data_blocks in self._multi_rechunker(
                 source_callables, ref_shape, ref_dtype, ref_source_chunks,
                 target_chunks, max_mem, sel,
@@ -1942,33 +2241,26 @@ class H5Ingest:
 
                 # Cumulative total for this block, with optional bucket-counter
                 # reconstruction.
-                total = sum(blocks[sv].astype('float64') for sv in source_vars)
-                if use_bucket:
-                    bucket_sum = sum(blocks[bv].astype('float64') for bv in bucket_vars)
-                    total = total + bucket_mm * bucket_sum
+                total = _cumulative(blocks)
 
-                # Increment along time axis. First timestep of the very first
-                # block has no prior → NaN; otherwise diff against the previous
-                # block's saved last timestep. Negative increments are clipped
-                # to 0 (precip can't go negative; nudging/feedback occasionally
-                # reduces parent-grid accumulators).
-                n_block = total.shape[0]
-                diff = np.empty_like(total)
-                if self._prev_accum_total is None:
-                    diff[0] = np.nan
-                else:
-                    diff[0] = total[0] - self._prev_accum_total
-                if n_block > 1:
-                    diff[1:] = total[1:] - total[:-1]
-                self._prev_accum_total = total[-1].copy()
-                np.maximum(diff, 0.0, out=diff, where=~np.isnan(diff))
+                # Increment between consecutive kept frames (pad rows skipped). The first kept frame
+                # of the input has no prior -> NaN; otherwise diff against the previous kept frame,
+                # carried across blocks. Negative increments are clipped to 0 (precip can't go
+                # negative; nudging/feedback occasionally reduces parent-grid accumulators).
+                v0, v1 = write_slices[0].start, write_slices[0].stop
+                real = raw_of[v0:v1] >= 0
+                diff = np.zeros_like(total)
+                if real.any():
+                    t_real = total[real]
+                    d = np.empty_like(t_real)
+                    d[0] = np.nan if self._prev_accum_total is None else t_real[0] - self._prev_accum_total
+                    if len(t_real) > 1:
+                        d[1:] = t_real[1:] - t_real[:-1]
+                    self._prev_accum_total = t_real[-1].copy()
+                    np.maximum(d, 0.0, out=d, where=~np.isnan(d))
+                    diff[real] = d
 
-                t_outs = [None] * n_block
-                for i in range(n_block):
-                    raw = write_slices[0].start + i
-                    u = int(raw_to_unique[raw])
-                    if u != -1 and u in output_map:
-                        t_outs[i] = output_map[u]
+                t_outs = self._plan_t_outs(raw_of, pad, v0, v1)
 
                 self._write_block_from_t_outs(
                     data_var, diff.astype('float32'), t_outs, vert_indices, None, None,
@@ -1989,7 +2281,6 @@ class H5Ingest:
         cfdb chunk once per timestep.
         """
         raw_offset = 0
-        output_time_idx = 0
 
         # We calculate the required max memory for the HDF5 chunk cache to prevent chunk-thrashing.
         # This implicitly acts as our "block read" by letting the C-library manage the block buffer
@@ -2025,8 +2316,7 @@ class H5Ingest:
 
                     data = self._read_variable(h5, var_key, local_t, file_spatial_slice)
                     buffer.append(data)
-                    buffer_t_outs.append(output_time_idx)
-                    output_time_idx += 1
+                    buffer_t_outs.append(int(self._out_index[u_idx]))
 
                 self._flush_buffered(data_var, buffer, buffer_t_outs, vert_indices, y_write, x_write)
 
@@ -2056,7 +2346,6 @@ class H5Ingest:
         are not rewritten once per timestep.
         """
         raw_offset = 0
-        output_time_idx = 0
 
         # Delegate block caching to HDF5 C-level chunk cache to prevent chunk thrashing
         chunk_cache_mem = max_mem if 'max_mem' in locals() else 2**27
@@ -2097,8 +2386,7 @@ class H5Ingest:
 
                     self._ts_cache = None
 
-                    buffer_t_outs.append(output_time_idx)
-                    output_time_idx += 1
+                    buffer_t_outs.append(int(self._out_index[u_idx]))
 
                 for var_key, data_var, vert_indices in batch_items:
                     self._flush_buffered(
