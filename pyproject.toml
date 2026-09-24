@@ -12,7 +12,7 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
   "cfdb>=0.10.0",
-  'cfdb-vars>=0.2.4',
+  'cfdb-vars>=0.2.5',
   "typer>=0.12",
   "typing-extensions>=4.15.0",
   "wrf_to_int>=0.1.1",
