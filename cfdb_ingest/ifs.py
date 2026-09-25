@@ -156,8 +156,17 @@ def _t_rh_from_t_td(src, level_pa):
     return thermo.rh_from_t_td(src['2t'], src['2d'])
 
 
+# The open data has no SST: skin temperature stands in for it over water. Only over (nearly) pure water, though:
+# in a coastal cell that is partly land, skt carries the land's diurnal cycle. Daily skt range, 95th percentile, by
+# IFS land fraction (NZ box, two 00-48 h runs, 2026-09-22/23): 0 -> 0.71 K, <0.05 -> 0.78 K, 0.05-0.1 -> 1.38 K,
+# 0.1-0.2 -> 3.68 K, 0.3-0.4 -> 9.38 K, 0.4-0.5 -> 12.27 K. With the old 0.5 cut-off a 44 %-land cell near Te Waihora
+# fed WRF lake/lagoon cells an "SST" swinging 12.6 K between 06:00 and noon. Cells at or above the cut-off are missing,
+# and WPS fills WRF water there from the nearest valid water point.
+SST_MAX_LAND_FRACTION = 0.1
+
+
 def _t_skt_over_water(src, level_pa):
-    return np.where(src['lsm'] < 0.5, src['skt'], np.nan).astype('float32')
+    return np.where(src['lsm'] < SST_MAX_LAND_FRACTION, src['skt'], np.nan).astype('float32')
 
 
 def _t_thickness_to_flag(src, level_pa):

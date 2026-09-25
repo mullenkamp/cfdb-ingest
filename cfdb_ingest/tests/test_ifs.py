@@ -16,7 +16,9 @@ from cfdb_ingest.ifs import (  # noqa: E402
     IFS_SOIL_DEPTHS,
     IFS_VARIABLE_MAPPING,
     IFS_WPS_PRESET_KEYS,
+    SST_MAX_LAND_FRACTION,
     IfsIngest,
+    _t_skt_over_water,
     required_messages,
 )
 
@@ -348,3 +350,17 @@ def test_unknown_level_type_is_refused_for_a_mapped_source(tmp_path, ifs_cycle_d
     monkeypatch.delitem(ifs_mod.IFS_SOURCE_UNITS, 'msl')  # msl is on meanSea: now unmapped -> tolerated
     ing = IfsIngest(ifs_cycle_dir)
     assert ('msl', 'sfc') in ing._catalog
+
+
+def test_sst_is_skin_temperature_over_nearly_pure_water_only():
+    """A partly-land coastal cell's skt carries the land's diurnal cycle (measured: 95th-percentile daily range 3.7 K
+    at 10-20 % land, 12.3 K at 40-50 %), so SST is kept only below 10 % land; the synthetic cycle's 0/1 mask cannot
+    tell a 0.1 cut-off from 0.5, hence fractional cells here."""
+    lsm = np.array([0.0, 0.05, 0.099, 0.1, 0.2, 0.3, 0.44, 0.49, 0.5, 1.0])
+    skt = np.linspace(280.0, 289.0, lsm.size)
+    got = _t_skt_over_water({'lsm': lsm, 'skt': skt}, None)
+    assert SST_MAX_LAND_FRACTION == 0.1
+    kept = lsm < 0.1
+    np.testing.assert_allclose(got[kept], skt[kept].astype('float32'))
+    assert np.isnan(got[~kept]).all(), f'land fractions {lsm[~kept][~np.isnan(got[~kept])]} leaked through'
+    assert got.dtype == np.float32

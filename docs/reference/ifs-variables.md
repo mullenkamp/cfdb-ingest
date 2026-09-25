@@ -27,7 +27,9 @@ the mapping): `cape`, whose template caps at 6552 J kg-1, and `land_sea_mask`, w
 *missing*, so the ingest checks every block against the range and raises instead. Relative humidity is
 a 0-1 fraction; `sea_ice` is a 0/1 flag derived from sea-ice thickness (the open data carries no
 fraction); `land_sea_mask` is the IFS fraction; `sea_surface_temp` is skin temperature over water
-(the open data carries no SST field and the IFS is ocean-coupled). Accumulated fields (`tp`, `ssrd`,
+(the open data carries no SST field and the IFS is ocean-coupled) -- only where the land fraction is below
+`SST_MAX_LAND_FRACTION` (0.1): a partly-land coastal cell's skin temperature carries the land's diurnal cycle
+(up to ~13 K a day at 40-50 % land), so those cells are missing (since 0.6.1; 0.5 before). Accumulated fields (`tp`, `ssrd`,
 `strd`) become per-lead increments / mean fluxes with lead 0 missing.
 
 ## Pressure-level variables
@@ -58,7 +60,7 @@ fraction); `land_sea_mask` is the IFS fraction; `sea_surface_temp` is skin tempe
 | `MSL` | `mslp` | 0 m | msl | direct |
 | `SP` | `surface_pressure` | 0 m | sp | direct |
 | `SKT` | `skin_temp` | 0 m | skt | direct |
-| `SST` | `sea_surface_temp` | 0 m | skt, lsm | skt over water |
+| `SST` | `sea_surface_temp` | 0 m | skt, lsm | skt where land fraction < 0.1 |
 | `LSM` | `land_sea_mask` | 0 m | lsm | direct |
 | `SEAICE` | `sea_ice` | 0 m | sithick | thickness to flag |
 | `SD` | `snow_water_equiv` | 0 m | sd | m to kg m2 |
