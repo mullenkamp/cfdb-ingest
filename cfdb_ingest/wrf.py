@@ -65,6 +65,7 @@ WRF_VARIABLE_MAPPING = {
         'cfdb_name': 'mixing_ratio',
         'source_vars': ['Q2'],
         'transform': None,
+        'nonneg': True,
         'height': 2.0,
     },
     'Q2_SH': {
@@ -118,8 +119,11 @@ WRF_VARIABLE_MAPPING = {
         'transform': 'wind_direction',
         'height': 10.0,
     },
+    # TSK is WRF's surface skin (radiating) temperature, not a soil layer: stored as skin_temperature since
+    # 0.6.2 (it was 'soil_temp' -> soil_temperature before; appending to an older dataset lands it in a NEW
+    # variable beside the old one).
     'TSK': {
-        'cfdb_name': 'soil_temp',
+        'cfdb_name': 'skin_temp',
         'source_vars': ['TSK'],
         'transform': None,
         'height': 0.0,
@@ -128,18 +132,21 @@ WRF_VARIABLE_MAPPING = {
         'cfdb_name': 'shortwave_radiation',
         'source_vars': ['SWDOWN'],
         'transform': None,
+        'nonneg': True,
         'height': 0.0,
     },
     'GLW': {
         'cfdb_name': 'longwave_radiation',
         'source_vars': ['GLW'],
         'transform': None,
+        'nonneg': True,
         'height': 0.0,
     },
     'SNOWH': {
         'cfdb_name': 'snow_depth',
         'source_vars': ['SNOWH'],
         'transform': None,
+        'nonneg': True,
         'height': 0.0,
     },
     'HFX': {
@@ -333,6 +340,7 @@ WRF_VARIABLE_MAPPING = {
         'cfdb_name': 'snow_water_equiv',
         'source_vars': ['SNOW'],
         'transform': None,
+        'nonneg': True,
         'height': 0.0,
     },
     # --- Column-integrated variables (native 2D if WRF >= 1.12, else 3D→2D) ---
@@ -340,6 +348,7 @@ WRF_VARIABLE_MAPPING = {
         'cfdb_name': 'pwat',
         'source_vars': ['PWAT'],
         'transform': None,
+        'nonneg': True,
         'fallback_source_vars': ['QVAPOR', 'P', 'PB'],
         'fallback_transform': 'precipitable_water',
         'height': 0.0,
@@ -396,6 +405,7 @@ WRF_VARIABLE_MAPPING = {
         'cfdb_name': 'ivt',
         'source_vars': ['IVT'],
         'transform': None,
+        'nonneg': True,
         'height': 0.0,
     },
     # --- Soil variables ---

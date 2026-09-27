@@ -693,6 +693,7 @@ class H5Ingest:
         extend: bool = False,
         time_label: str = 'end',
         squeeze_height: bool = False,
+        clip_nonneg: bool = False,
         **cfdb_kwargs,
     ):
         """
@@ -766,6 +767,11 @@ class H5Ingest:
             Grid mode only (since 0.6.0): store surface fields as ``(time, y, x)`` without the length-1
             ``height_Xm`` axis (the height moves to a ``height`` attribute). ``chunk_shape`` may then be
             3-D ``(time, y, x)``. Surface variables only.
+        clip_nonneg : bool
+            Floor at 0 the variables whose mapping entry says ``'nonneg': True`` -- quantities that cannot be
+            negative (mixing ratio, radiation, snow, precipitable water, IVT) but that a model can undershoot
+            (WRF's 2 m mixing ratio reaches -0.004 kg/kg in a 1 km nest's first hour). NaN is kept. Off by
+            default so diagnostics see the model's raw values; a forecast product turns it on (since 0.6.2).
         **cfdb_kwargs
             Extra kwargs for cfdb.open_dataset (e.g., compression).
         """
@@ -780,6 +786,11 @@ class H5Ingest:
 
         var_keys = self.resolve_variables(variables)
         self._check_var_keys(var_keys)
+        # Stored names (as create_cfdb_data_var names them) of the variables floored at 0 in this call.
+        self._nonneg_names = frozenset(
+            _resolve_var_template(self.variables[k]['cfdb_name'], None)[0]
+            for k in var_keys if self.variables[k].get('nonneg')
+        ) if clip_nonneg else frozenset()
 
         if time_label not in ('end', 'start'):
             raise ValueError(f"time_label must be 'end' or 'start', got {time_label!r}")
@@ -1706,6 +1717,12 @@ class H5Ingest:
                 )
             i = j
 
+    def _floor_nonneg(self, data_var, data):
+        """``data`` with negatives set to 0 when ``convert(clip_nonneg=True)`` marked this variable (NaN kept)."""
+        if data_var.name not in getattr(self, '_nonneg_names', ()):
+            return data
+        return np.where(data < 0, np.zeros((), dtype=data.dtype), data)
+
     def _write_data_var(self, data_var, data, output_time_idx, vert_indices, y_write=None, x_write=None):
         """
         Write data for a single timestep at the correct indices.
@@ -1716,6 +1733,7 @@ class H5Ingest:
         Equivalent to the old len(vert_indices) test for surface/level/soil, and
         additionally correct for a length-1 region axis (3D data, single index).
         """
+        data = self._floor_nonneg(data_var, data)  # before either path: the forecast writer or the direct write
         ys = y_write if y_write is not None else slice(None)
         xs = x_write if x_write is not None else slice(None)
         writer = self._forecast_writer
@@ -1750,6 +1768,7 @@ class H5Ingest:
         soil behavior identical and additionally handles a length-1 region axis,
         where a 4D ``(N, 1, ny, nx)`` block has a single vert index.
         """
+        block = self._floor_nonneg(data_var, block)  # before either path: the forecast writer or the direct write
         ys = y_write if y_write is not None else slice(None)
         xs = x_write if x_write is not None else slice(None)
         writer = self._forecast_writer

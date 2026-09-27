@@ -84,7 +84,7 @@ def test_grid_export_writes_every_wps_field(tmp_path, wrf_wps_cfdb, monkeypatch)
         np.testing.assert_allclose(by[('TT', 85000.0)], _sq(ds['air_temperature'][t_idx, 1, :, :].data), rtol=1e-6)
         np.testing.assert_allclose(by[('PSFC', 200100.0)], _sq(ds['surface_pressure'][t_idx, 0, :, :].data), rtol=1e-6)
         np.testing.assert_allclose(
-            by[('SKINTEMP', 200100.0)], _sq(ds['soil_temperature'][t_idx, 0, :, :].data), rtol=1e-6
+            by[('SKINTEMP', 200100.0)], _sq(ds['skin_temperature'][t_idx, 0, :, :].data), rtol=1e-6
         )
         np.testing.assert_allclose(by[('SM010040', 200100.0)], _sq(ds['soil_moisture'][t_idx, 1, :, :].data), rtol=1e-6)
         # RH: fraction in cfdb, percent in WPS

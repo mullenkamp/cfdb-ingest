@@ -165,7 +165,7 @@ SURFACE_VARS = [
     ('surface_pressure', 'PSFC', 200100.0, 'Pa', 'Surface pressure', 1.0),
     ('mslp', 'PMSL', 201300.0, 'Pa', 'Mean sea level pressure', 1.0),
     ('skin_temp', 'SKINTEMP', 200100.0, 'K', 'Skin temperature', 1.0),
-    ('soil_temp', 'SKINTEMP', 200100.0, 'K', 'Skin temperature', 1.0),  # WRF TSK is stored as soil_temperature
+    ('soil_temp', 'SKINTEMP', 200100.0, 'K', 'Skin temperature', 1.0),  # WRF TSK as stored before 0.6.2 (soil_temperature)
     ('air_temp', 'TT', 200100.0, 'K', 'Temperature', 1.0),
     ('u_wind', 'UU', 200100.0, 'm s-1', 'U-component of wind', 1.0),
     ('v_wind', 'VV', 200100.0, 'm s-1', 'V-component of wind', 1.0),

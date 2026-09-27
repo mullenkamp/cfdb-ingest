@@ -16,6 +16,12 @@ In forecast mode (`dataset_type='grid_forecast'`) `time` becomes the pair `(fore
 
 Fixed height above ground, stored as `(time, height_Xm, y, x)`:
 
+**Non-negative variables (`clip_nonneg`, since 0.6.2).** `Q2`, `SWDOWN`, `GLW`, `SNOW_VAR`, `SNOWH`, `PWAT` and
+`IVT` carry `'nonneg': True` in the mapping: quantities that cannot be negative but that WRF can undershoot (2 m
+mixing ratio reached −0.004 kg/kg in a 1 km nest's first hour). `convert(..., clip_nonneg=True)` floors them at 0
+(NaN kept); the default keeps the model's raw values, for diagnostics. Without the clip a negative mixing ratio is
+refused by the pre-write range check, since its template starts at 0. `PREC_ACC` is always clipped.
+
 | Key | cfdb Name | Height | Source Vars | Transform |
 |-----|-----------|--------|-------------|-----------|
 | `T2` | `air_temp` | 2 m | T2 | direct |
@@ -41,7 +47,7 @@ Fixed height above ground, stored as `(time, height_Xm, y, x)`:
 | `QFX` | `moisture_flux` | 0 m | QFX | direct |
 | `ALBEDO` | `albedo` | 0 m | ALBEDO | direct |
 | `EMISS` | `emissivity` | 0 m | EMISS | direct |
-| `TSK` | `soil_temp` | 0 m | TSK | direct |
+| `TSK` | `skin_temp` | 0 m | TSK | direct (surface skin temperature; stored as `soil_temperature` before 0.6.2) |
 | `SNOWH` | `snow_depth` | 0 m | SNOWH | direct |
 | `HGT` | `terrain_height` | 0 m | HGT | direct |
 | `LU_INDEX` | `land_use_modis` | 0 m | LU_INDEX | direct |
