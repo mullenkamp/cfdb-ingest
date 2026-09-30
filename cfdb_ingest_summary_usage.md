@@ -53,6 +53,21 @@ var_dict = wrf.variables     # dict of available variables
 bbox = wrf.bbox_geographic   # (min_lon, min_lat, max_lon, max_lat)
 ```
 
+### Python API: WRF pressure-level diagnostics (0.7.0)
+```python
+from cfdb_ingest import WrfPlevIngest
+
+# wrfplevels_d0N_* files (namelist &diags p_lev_diags = 1, stream auxhist23); a directory globs wrfplevels*
+ing = WrfPlevIngest('/path/to/run/')
+result = ing.convert('plevels.cfdb', variables=['GHT_PL', 'T_PL', 'Q_PL', 'U_PL', 'V_PL'],
+                     chunk_shape=(24, 1, len(ing.y), len(ing.x)))   # target_levels=[...] selects a subset
+result['masked_cells']   # {source variable: {pressure Pa: cells set to NaN}} -- WRF's -999 below ground
+```
+- `pressure` comes from the files' `P_PL`; no interpolation. U_PL/V_PL are rotated grid -> earth analytically
+  (tangent-cone Lambert validated); other projections need `static_path=<a wrfout of the same domain>`.
+- `Q_PL` is a mixing ratio (`mixing_ratio`); `RH_PL` becomes a clipped 0-1 fraction.
+- `WrfIngest` on a projected file without COSALPHA/SINALPHA withholds the rotated wind keys (0.7.0).
+
 ### Python API: ERA5 Ingestion
 
 Convert ERA5 NetCDF files (e.g., from the NCAR RDA archive) to `cfdb`. Automatically handles combining single-variable ERA5 files into a single database.

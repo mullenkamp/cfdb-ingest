@@ -69,6 +69,13 @@ def wrf(
 
     if preset is not None:
         if preset.lower() == 'wps':
+            # WPS needs the winds: a preset key withheld for want of a grid->earth rotation (0.7.0) is an error,
+            # not an optional field to drop -- else the export succeeds without U/V.
+            withheld = [v for v in WPS_PRESET_VARS if v in getattr(ingest, '_unrotatable', ())]
+            if withheld:
+                print(f"Error: --preset wps needs {withheld}, which are unavailable: "
+                      f"{ingest._rotation_remedy()}", file=__import__('sys').stderr)
+                raise typer.Exit(code=1)
             var_list = [v for v in WPS_PRESET_VARS if v in ingest.variables]
             # Append any extra --variables on top of the preset
             if variables:

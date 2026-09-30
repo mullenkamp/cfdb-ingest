@@ -78,6 +78,7 @@ nav:
         - WPS Export: guide/wps-export.md
     - Reference:
         - WRF Variables: reference/wrf-variables.md
+        - WRF Pressure-Level Variables: reference/wrf-plevel-variables.md
         - ERA5 Variables: reference/era5-variables.md
         - IFS Variables: reference/ifs-variables.md
         - API: reference/cfdb_ingest.md

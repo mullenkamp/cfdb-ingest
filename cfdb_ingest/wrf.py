@@ -9,7 +9,7 @@ import h5py
 import numpy as np
 import pyproj
 
-from cfdb_ingest.base import H5Ingest
+from cfdb_ingest.base import H5Ingest, resolve_variable_keys
 
 
 # WRF/WPS map projections are computed on a sphere of this radius (WPS geogrid/src/constants_module.F:
@@ -471,6 +471,63 @@ def unstagger(data, axis):
     return (data[tuple(slices_lo)] + data[tuple(slices_hi)]) / 2.0
 
 
+def grid_rotation(map_proj, truelat1, truelat2, stand_lon, xlong, pole_lat=90.0):
+    """
+    Grid->earth wind rotation of a WRF grid, analytically: ``(cos_alpha, sin_alpha, validated)`` on the
+    shape of ``xlong`` (degrees), in the sense of WRF's ``COSALPHA``/``SINALPHA`` and of every rotation in
+    this module: ``u_earth = u*cos + v*sin``, ``v_earth = -u*sin + v*cos``.
+
+    Lambert conformal: ``alpha = cone * hemi * (lon - stand_lon)`` (the difference wrapped to [-180, 180),
+    so a grid across the antimeridian is continuous), the cone constant as WPS computes it
+    (``module_map_utils`` ``lc_cone``, tangent or secant) and ``hemi`` the sign of TRUELAT1. Polar
+    stereographic: the same with cone 1. Mercator and a true lat-lon grid: no rotation.
+
+    ``validated`` is True only for the branches measured against WRF's own ``COSALPHA`` on real output:
+    the tangent-cone Lambert (TRUELAT1 == TRUELAT2) and the unrotated lat-lon grid -- measured
+    2026-09-28 on real SH d01/d02 wrfouts: max 2.7e-7 rad, a flipped sign 91-106 deg off. The secant
+    cone, polar stereographic and Mercator are WPS's formulas, not yet checked against a real file;
+    callers must cross-check them against a wrfout's COSALPHA/SINALPHA. A rotated-pole lat-lon grid
+    (``POLE_LAT != 90``) has a rotation this function does not model and raises.
+    """
+    xlong = np.asarray(xlong, dtype='float64')
+    if map_proj == 6:
+        if not np.isclose(pole_lat, 90.0):
+            raise ValueError(f'MAP_PROJ=6 with POLE_LAT={pole_lat}: a rotated-pole grid, whose wind rotation is not '
+                             f'modelled here')
+        return np.ones_like(xlong), np.zeros_like(xlong), True
+    if map_proj == 3:
+        return np.ones_like(xlong), np.zeros_like(xlong), False
+    rad = np.pi / 180.0
+    hemi = -1.0 if truelat1 < 0 else 1.0
+    if map_proj == 1:
+        tangent = abs(truelat1 - truelat2) <= 0.1   # WPS's own tangent test (lc_cone)
+        if tangent:
+            cone = np.sin(abs(truelat1) * rad)
+        else:
+            cone = ((np.log10(np.cos(truelat1 * rad)) - np.log10(np.cos(truelat2 * rad)))
+                    / (np.log10(np.tan((45.0 - abs(truelat1) / 2.0) * rad))
+                       - np.log10(np.tan((45.0 - abs(truelat2) / 2.0) * rad))))
+        validated = bool(tangent)
+    elif map_proj == 2:
+        cone = 1.0
+        validated = False
+    else:
+        raise ValueError(f'Unsupported WRF MAP_PROJ: {map_proj}')
+    dlon = (xlong - stand_lon + 180.0) % 360.0 - 180.0
+    alpha = cone * hemi * dlon * rad
+    return np.cos(alpha), np.sin(alpha), validated
+
+
+# Transforms that turn grid-relative U/V into earth-relative components. Without a known rotation their
+# output would be grid-relative data under an earth-relative name, so they are withheld (speed and
+# vorticity are frame-invariant and stay). Keyed on the ACTIVE transform: native VIMF_U/V (transform None)
+# is written earth-relative by WRF; only the 3-D fallback rotates.
+_ROTATING_TRANSFORMS = frozenset({
+    'wind_direction', 'u_wind', 'v_wind', 'wind_direction_3d', 'u_wind_3d', 'v_wind_3d', 'vimf_u', 'vimf_v',
+    'u_wind_pl', 'v_wind_pl',
+})
+
+
 class WrfIngest(H5Ingest):
     """
     Convert WRF output files to cfdb.
@@ -514,6 +571,9 @@ class WrfIngest(H5Ingest):
                 self._cosalpha = None
                 self._sinalpha = None
 
+            self._map_proj = int(_wrf_attr(h5.attrs, 'MAP_PROJ'))
+            self._pole_lat = float(_wrf_attr(h5.attrs, 'POLE_LAT')) if 'POLE_LAT' in h5.attrs else 90.0
+
             # Extract WRF source info and physics parameters
             self._source_title = _wrf_attr(h5.attrs, 'TITLE').strip()
             # The run's init, for forecast mode: SIMULATION_START_DATE is the true init of a
@@ -556,6 +616,55 @@ class WrfIngest(H5Ingest):
 
     # convert(extend=..., time_label='start', squeeze_height=...) are implemented for WRF only.
     _supports_grid_extend = True
+
+    # Keys withheld because their transform rotates winds and the rotation is unknown (see _init_variables).
+    _unrotatable = ()
+
+    def _rotation_known(self):
+        """True when grid->earth rotation is available: COSALPHA/SINALPHA loaded, or a true lat-lon grid."""
+        return self._cosalpha is not None or (self._map_proj == 6 and np.isclose(self._pole_lat, 90.0))
+
+    def _rotation_remedy(self):
+        return ('the input files carry no COSALPHA/SINALPHA (an auxiliary output stream, or a wrfout pruned '
+                'without them); convert from the wrfout history files instead')
+
+    def _init_variables(self):
+        """
+        The base availability check, then withhold every key whose ACTIVE transform rotates winds when the
+        rotation is unknown (since 0.7.0). Before, the rotation fell back to identity on any projection and
+        stored grid-relative components as ``eastward_wind``/``northward_wind`` -- measured 13 m/s wrong on a
+        real auxiliary-stream file (U10/V10 are written to the aux streams, COSALPHA is not).
+        """
+        super()._init_variables()
+        if self._rotation_known():
+            return
+        self._variables_before_rotation_check = dict(self.variables)
+        dropped = sorted(k for k, info in self.variables.items() if info.get('transform') in _ROTATING_TRANSFORMS)
+        if dropped:
+            for k in dropped:
+                del self.variables[k]
+            self._unrotatable = tuple(dropped)
+            warnings.warn(f'{self.input_paths[0].name}: {dropped} are unavailable: {self._rotation_remedy()}. '
+                          f'Frame-invariant fields (wind speed, vorticity) are still available.')
+
+    def resolve_variables(self, variables):
+        """
+        As the base, but a name that would have resolved to a withheld (rotation-dependent) key is refused with
+        the reason -- rather than reported unknown, or worse resolved by source name to a different field
+        (``'U10'`` would otherwise fall through to ``WIND10``, the speed).
+        """
+        if variables is not None and self._unrotatable:
+            before = resolve_variable_keys(self._variables_before_rotation_check, variables)
+            blocked = [k for k in before if k in self._unrotatable]
+            if blocked:
+                raise ValueError(f'{blocked} need the grid->earth wind rotation, which is unknown: '
+                                 f'{self._rotation_remedy()}')
+        elif variables is None and self._unrotatable:
+            # "Everything available" silently lacks the withheld winds otherwise (the init warning is easy to miss
+            # by the time convert runs).
+            warnings.warn(f'converting every available variable EXCEPT {list(self._unrotatable)}: '
+                          f'{self._rotation_remedy()}')
+        return super().resolve_variables(variables)
 
     def _label_shift(self, var_keys):
         """
@@ -1763,3 +1872,290 @@ class WrfIngest(H5Ingest):
                 from geointerp import GridInterpolator
                 gi = GridInterpolator()
                 self._regrid_func = gi.regrid_levels(levels, axis=0, method='linear')
+
+
+# --------------------------------------------------------------------------------------------------------
+# Pressure-level diagnostics (namelist &diags p_lev_diags = 1, output stream auxhist23, 'wrfplevels' files)
+# --------------------------------------------------------------------------------------------------------
+
+# WRF interpolates these to the namelist press_levels (Registry/registry.diags, phys/module_diag_pld.F) and
+# writes them to their own stream with P_PL, the levels in Pa. U_PL/V_PL are GRID-relative (WRF <= 4.7.1
+# averages the staggered winds without rotating), Q_PL is a MIXING RATIO and RH_PL is in percent.
+WRF_PLEV_VARIABLE_MAPPING = {
+    'GHT_PL': {'cfdb_name': 'geopotential_height', 'source_vars': ['GHT_PL'], 'transform': None, 'height': 'levels'},
+    'T_PL': {'cfdb_name': 'air_temp', 'source_vars': ['T_PL'], 'transform': None, 'height': 'levels'},
+    'Q_PL': {'cfdb_name': 'mixing_ratio', 'source_vars': ['Q_PL'], 'transform': None, 'nonneg': True,
+             'height': 'levels'},
+    'U_PL': {'cfdb_name': 'u_wind', 'source_vars': ['U_PL', 'V_PL'], 'transform': 'u_wind_pl', 'height': 'levels'},
+    'V_PL': {'cfdb_name': 'v_wind', 'source_vars': ['U_PL', 'V_PL'], 'transform': 'v_wind_pl', 'height': 'levels'},
+    # WRF's RH_PL is q/qs*100 without a cap, so it exceeds 100 % in supersaturated cells; clipped to the
+    # 0-1 fraction cfdb stores, as ERA5's R is.
+    'RH_PL': {'cfdb_name': 'relative_humidity', 'source_vars': ['RH_PL'], 'transform': 'percent_to_fraction',
+              'height': 'levels'},
+    'TD_PL': {'cfdb_name': 'dew_temp', 'source_vars': ['TD_PL'], 'transform': None, 'height': 'levels'},
+    'S_PL': {'cfdb_name': 'wind_speed', 'source_vars': ['S_PL'], 'transform': None, 'height': 'levels'},
+}
+
+# The grid attributes a companion wrfout must share to lend its COSALPHA/SINALPHA (the accumulation
+# attributes in _WRF_CONSISTENT_ATTRS may legitimately differ between runs of one domain).
+_WRF_GRID_ATTRS = ('MAP_PROJ', 'TRUELAT1', 'TRUELAT2', 'STAND_LON', 'MOAD_CEN_LAT', 'CEN_LAT', 'CEN_LON',
+                   'POLE_LAT', 'POLE_LON', 'DX', 'DY', 'WEST-EAST_GRID_DIMENSION', 'SOUTH-NORTH_GRID_DIMENSION')
+
+# Largest accepted disagreement (rad) between the analytic rotation and a companion wrfout's
+# COSALPHA/SINALPHA. Measured healthy: 2.7e-7 rad (float32 storage of COSALPHA) on a real SH tangent-cone
+# d02; a sign error is ~1 rad. ~40x headroom over the measured value.
+ROTATION_TOLERANCE_RAD = 1e-5
+
+# Largest accepted XLAT/XLONG difference (deg) between a companion wrfout and the pressure-level files --
+# the moving-nest tolerance of _parse_spatial_coords, ~10 m, far below any grid spacing.
+_COMPANION_XY_ATOL_DEG = 1e-4
+
+
+class WrfPlevIngest(WrfIngest):
+    """
+    Convert WRF pressure-level diagnostics (``wrfplevels`` files, stream auxhist23) to cfdb.
+
+    Variables are stored on a ``pressure`` coordinate taken from the files' own ``P_PL`` -- no
+    interpolation. WRF's missing value (namelist ``p_lev_missing``, default -999; written below the lowest
+    model level when ``extrap_below_grnd = 1``, and above the model top in every mode) becomes NaN before
+    any transform, and the count per variable and level is returned by ``convert`` as ``masked_cells``
+    (the files do not record the extrapolation mode, so this is how a caller tells).
+
+    ``U_PL``/``V_PL`` are grid-relative in the file and are rotated to earth-relative. The auxiliary stream
+    carries no COSALPHA/SINALPHA, so the rotation is computed from the projection attributes
+    (:func:`grid_rotation`). For projections whose formula is not validated against real WRF output
+    (secant-cone Lambert, polar stereographic, Mercator) pass ``static_path`` -- a wrfout of the same
+    domain -- whose COSALPHA/SINALPHA must agree with the formula; without it the winds are unavailable.
+
+    Parameters
+    ----------
+    input_paths : str, Path, or list thereof
+        ``wrfplevels`` files, or a directory holding them.
+    static_path : str or Path, optional
+        A wrfout of the same domain, to cross-check (and, for unvalidated projections, enable) the rotation.
+    missing_value : float
+        WRF's ``p_lev_missing``.
+    """
+
+    file_glob_pattern = 'wrfplevels*'
+    _supports_grid_extend = False
+    _BLOCK_TRANSFORMS = {
+        **WrfIngest._BLOCK_TRANSFORMS,
+        'u_wind_pl': '_block_u_wind_pl',
+        'v_wind_pl': '_block_v_wind_pl',
+        'percent_to_fraction': '_block_percent_to_fraction',
+    }
+
+    def __init__(self, input_paths, static_path=None, missing_value: float = -999.0):
+        self._static_path = pathlib.Path(static_path) if static_path is not None else None
+        self._missing_value = float(missing_value)
+        if not np.isfinite(self._missing_value) or self._missing_value == 0.0:
+            # 0 is a real value of every field here (and the value of the zero pad rows the rechunk blocks carry),
+            # so it cannot mark 'missing'.
+            raise ValueError(f'missing_value={missing_value!r}: must be a finite, non-zero sentinel '
+                             f'(WRF p_lev_missing)')
+        self._masked = {}
+        super().__init__(input_paths)
+
+    def _get_variable_mapping(self):
+        return WRF_PLEV_VARIABLE_MAPPING
+
+    def _init_source_metadata(self):
+        """
+        The WRF grid/header checks, then the pressure axis (identical in every frame of every file, and the
+        level length of every ``*_PL`` field) and the wind rotation. Metadata reads only.
+        """
+        super()._init_source_metadata()
+
+        levels = None
+        for path in self.input_paths:
+            with h5py.File(path, 'r') as h5:
+                if 'P_PL' not in h5:
+                    raise ValueError(f'{path.name}: no P_PL -- not a WRF pressure-level (p_lev_diags) file')
+                p = np.asarray(h5['P_PL'][:], dtype='float64')
+                frames = p.reshape(-1, p.shape[-1])
+                if not (frames == frames[0]).all():
+                    raise ValueError(f'{path.name}: P_PL differs between frames')
+                if levels is None:
+                    levels = frames[0]
+                elif not np.array_equal(frames[0], levels):
+                    raise ValueError(f'{path.name}: P_PL {frames[0].tolist()} differs from {levels.tolist()} in '
+                                     f'{self.input_paths[0].name}; one conversion needs one set of pressure levels')
+                for name in h5:
+                    if name.endswith('_PL') and name != 'P_PL':
+                        shape = h5[name].shape
+                        if len(shape) != 4 or shape[1] != len(levels):
+                            raise ValueError(
+                                f'{path.name}: {name} has shape {shape}, but P_PL has {len(levels)} levels; every '
+                                f'*_PL field must be (time, level, y, x) on the P_PL axis (a file split or pruned '
+                                f'per level is not supported)')
+        if len(np.unique(levels)) != len(levels):
+            raise ValueError(f'P_PL has repeated levels: {levels.tolist()}')
+        if not (np.diff(levels) < 0).all():
+            warnings.warn(f'P_PL {levels.tolist()} is not in descending order: WRF searches the levels in namelist '
+                          f'order and leaves later levels missing when press_levels is not descending '
+                          f'(module_diag_pld.F); expect whole levels of NaN')
+        self._plevels = levels
+
+        self._init_rotation()
+
+    def _init_rotation(self):
+        """Set ``_cosalpha``/``_sinalpha`` (2-D) from the formula, cross-checked against ``static_path`` if given."""
+        with h5py.File(self.input_paths[0], 'r') as h5:
+            attrs = {k: _wrf_attr(h5.attrs, k) for k in _WRF_GRID_ATTRS if k in h5.attrs}
+            xlat = h5['XLAT'][0].astype('float64')
+            xlong = h5['XLONG'][0].astype('float64')
+        self._rotation_note = None
+        try:
+            truelat1 = float(attrs.get('TRUELAT1', 0.0))
+            cosa, sina, validated = grid_rotation(
+                self._map_proj, truelat1, float(attrs.get('TRUELAT2', truelat1)), float(attrs.get('STAND_LON', 0.0)),
+                xlong, pole_lat=self._pole_lat)
+        except ValueError as e:
+            self._cosalpha = self._sinalpha = None
+            self._rotation_note = str(e)
+            return
+
+        if self._static_path is not None:
+            with h5py.File(self._static_path, 'r') as st:
+                for key, ref in attrs.items():
+                    val = _wrf_attr(st.attrs, key) if key in st.attrs else None
+                    same = val is not None and (val == ref if isinstance(ref, str) else
+                                                np.isclose(val, ref, rtol=1e-6, atol=1e-6))
+                    if not same:
+                        raise ValueError(f'static_path {self._static_path.name}: {key}={val!r} differs from {ref!r} '
+                                         f'in {self.input_paths[0].name}; not the same grid')
+                off = max(float(np.max(np.abs(st['XLAT'][0] - xlat))),
+                          float(np.max(np.abs((st['XLONG'][0] - xlong + 180.0) % 360.0 - 180.0))))
+                if off > _COMPANION_XY_ATOL_DEG:
+                    raise ValueError(f'static_path {self._static_path.name}: XLAT/XLONG differ by up to {off:.2e} '
+                                     f'deg from {self.input_paths[0].name}; not the same grid')
+                if 'COSALPHA' not in st or 'SINALPHA' not in st:
+                    raise ValueError(f'static_path {self._static_path.name} has no COSALPHA/SINALPHA')
+                f_cos = st['COSALPHA'][0].astype('float64')
+                f_sin = st['SINALPHA'][0].astype('float64')
+            diff = np.abs(np.angle(np.exp(1j * (np.arctan2(f_sin, f_cos) - np.arctan2(sina, cosa)))))
+            worst = float(np.max(diff))
+            if worst > ROTATION_TOLERANCE_RAD:
+                raise ValueError(
+                    f'wind rotation from the projection attributes disagrees with COSALPHA/SINALPHA of '
+                    f'{self._static_path.name} by up to {worst:.2e} rad (tolerance {ROTATION_TOLERANCE_RAD:g}); '
+                    f'the formula does not describe this grid (MAP_PROJ={self._map_proj}) -- refusing')
+            # WRF's own values, now shown to match the formula.
+            self._cosalpha, self._sinalpha = f_cos, f_sin
+            self._rotation_source = f'COSALPHA/SINALPHA of {self._static_path.name} (formula agrees to {worst:.1e} rad)'
+        elif validated:
+            self._cosalpha, self._sinalpha = cosa, sina
+            self._rotation_source = 'analytic from TRUELAT1/TRUELAT2/STAND_LON/XLONG'
+        else:
+            self._cosalpha = self._sinalpha = None
+            self._rotation_note = (f'the rotation formula for MAP_PROJ={self._map_proj} '
+                                   f'(TRUELAT1={attrs.get("TRUELAT1")}, TRUELAT2={attrs.get("TRUELAT2")}) is not '
+                                   f'validated against real WRF output')
+
+    def _rotation_remedy(self):
+        note = self._rotation_note or 'no grid->earth rotation is known'
+        return f'{note}; pass static_path=<a wrfout of the same domain> to use its COSALPHA/SINALPHA'
+
+    def _native_level_values(self):
+        """``P_PL`` (Pa) in file order: WRF writes press_levels in namelist order, normally descending."""
+        return self._plevels
+
+    def _setup_populate(self, var_key, target_levels):
+        """Native levels only: no vertical interpolation to set up."""
+        return None
+
+    def _get_dataset_attrs(self):
+        attrs = super()._get_dataset_attrs()
+        attrs['p_lev_missing'] = self._missing_value
+        if self._cosalpha is not None:
+            attrs['wind_rotation'] = self._rotation_source
+        return attrs
+
+    def _post_block_transform(self, block, var_key, source_ndim):
+        """
+        WRF's missing value -> NaN in every ``*_PL`` block, before any transform (so a rotated sentinel cannot
+        leave as a plausible wind), counted per output level. Blocks reach here already level-picked into
+        output order (base: ``_populate_with_rechunkit`` / ``_populate_with_multi_rechunker_group``), and the
+        batch path, which skips this hook, is refused for native-level variables.
+        """
+        if not var_key.endswith('_PL') or var_key == 'P_PL':
+            return block
+        miss = block == self._missing_value
+        counts = miss.sum(axis=(0, 2, 3)) if block.ndim == 4 else None
+        if counts is not None:
+            prev = self._masked.get(var_key)
+            self._masked[var_key] = counts if prev is None else prev + counts
+        if not miss.any():
+            return block
+        return np.where(miss, np.array(np.nan, dtype=block.dtype), block)
+
+    def _block_rotated_wind_pl(self, sources, y_sl, x_sl, block_cache):
+        """Earth-relative U/V from grid-relative U_PL/V_PL, ``(N, nz, ny, nx)``, in float32 (one block of each)."""
+        if 'wind_pl' in block_cache:
+            return block_cache['wind_pl']
+        cosa = self._cosalpha[y_sl, x_sl].astype('float32')
+        sina = self._sinalpha[y_sl, x_sl].astype('float32')
+        u = sources['U_PL']
+        v = sources['V_PL']
+        # u_e = u*cos + v*sin, v_e = -u*sin + v*cos, each built in place: one block-sized temporary at a time
+        # instead of three (the block is every requested level of chunk_t frames).
+        u_e = u * cosa
+        u_e += v * sina
+        v_e = v * cosa
+        v_e -= u * sina
+        result = (u_e, v_e)
+        block_cache['wind_pl'] = result
+        return result
+
+    def _block_u_wind_pl(self, sources, y_sl, x_sl, block_cache):
+        return self._block_rotated_wind_pl(sources, y_sl, x_sl, block_cache)[0].astype('float32', copy=False)
+
+    def _block_v_wind_pl(self, sources, y_sl, x_sl, block_cache):
+        return self._block_rotated_wind_pl(sources, y_sl, x_sl, block_cache)[1].astype('float32', copy=False)
+
+    def _block_percent_to_fraction(self, sources, y_sl, x_sl, block_cache):
+        r = next(iter(sources.values()))
+        return np.clip(r / np.float32(100.0), 0.0, 1.0).astype('float32', copy=False)
+
+    def convert(self, cfdb_path, variables=None, start_date=None, end_date=None, bbox=None, target_levels=None,
+                vertical_coord='pressure', max_mem=2**27, chunk_shape=None, dataset_type='grid', extend=False,
+                time_label='end', squeeze_height=False, clip_nonneg=False, **cfdb_kwargs):
+        """
+        Convert to a cfdb on a ``pressure`` coordinate (Pa). ``target_levels`` selects a subset of the
+        files' levels (default: all of them); interpolation is not offered. Grid mode only: ``extend``,
+        ``time_label='start'``, ``squeeze_height`` and forecast mode are refused.
+
+        Returns the base result plus ``masked_cells`` -- ``{source variable: {pressure: cells set to NaN}}``
+        -- and warns for a level that is missing everywhere (e.g. press_levels not descending, or a level
+        above the model top).
+        """
+        if vertical_coord != 'pressure':
+            raise ValueError(f"pressure-level files have a pressure axis; vertical_coord={vertical_coord!r} is not "
+                             f"supported (no interpolation)")
+        refused = [name for name, on in (('extend', extend), ("time_label='start'", time_label != 'end'),
+                                         ('squeeze_height', squeeze_height),
+                                         (f'dataset_type={dataset_type!r}', dataset_type != 'grid')) if on]
+        refused += [k for k in ('forecast_reference_time', 'forecast_step_minutes', 'overwrite', 'leads',
+                                'mark_complete') if k in cfdb_kwargs]
+        if refused:
+            raise ValueError(f'{refused} are not implemented for WRF pressure-level files')
+        levels = sorted(self._plevels.tolist()) if target_levels is None else [float(p) for p in target_levels]
+        self._masked = {}
+        result = super().convert(cfdb_path, variables=variables, start_date=start_date, end_date=end_date,
+                                 bbox=bbox, target_levels=levels, vertical_coord='pressure', max_mem=max_mem,
+                                 chunk_shape=chunk_shape, dataset_type='grid', clip_nonneg=clip_nonneg, **cfdb_kwargs)
+        sorted_levels = sorted(levels)
+        masked = {sv: {float(p): int(c) for p, c in zip(sorted_levels, counts)} for sv, counts in self._masked.items()}
+        result['masked_cells'] = masked
+
+        if bbox is not None:
+            _, _, fx, fy = self._bbox_to_indices(bbox)
+            n_cells = result['n_times'] * len(fx) * len(fy)
+        else:
+            n_cells = result['n_times'] * len(self.x) * len(self.y)
+        whole = [(sv, p) for sv, per in masked.items() for p, c in per.items() if n_cells and c >= n_cells]
+        if whole:
+            warnings.warn(f'levels missing everywhere (all {n_cells} cells NaN): {whole}. press_levels not in '
+                          f'descending order, or a level above the model top?')
+        return result

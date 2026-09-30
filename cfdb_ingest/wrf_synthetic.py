@@ -23,6 +23,8 @@ from typing import Iterable, Optional, Sequence
 import h5py
 import numpy as np
 
+from cfdb_ingest.wrf import grid_rotation
+
 Y_SLOPE = 0.01
 X_SLOPE = 0.001
 
@@ -197,7 +199,7 @@ def write_wrfout(
     """
     Write one lat-lon (``MAP_PROJ=6``) wrfout with ``n_times`` frames from ``start_time`` every
     ``hour_step`` hours, holding ``variables`` (each ``(time, ny, nx)`` float32 with the closed forms
-    of :func:`expected`), ``Times``, ``XLAT``/``XLONG``, ``COSALPHA``/``SINALPHA`` (no rotation), and
+    of :func:`expected`), ``Times``, ``XLAT``/``XLONG``, ``COSALPHA``/``SINALPHA`` (WRF's grid rotation), and
     the attributes ``WrfIngest`` reads. ``simulation_start`` (default ``start_time``) becomes
     ``SIMULATION_START_DATE`` and ``START_DATE``, so a later segment of a run still reports the run's
     init and its leads count from it. ``bucket_mm`` adds ``BUCKET_MM`` and ``I_RAINNC``/``I_RAINC``
@@ -260,8 +262,15 @@ def write_wrfout(
         h5.create_dataset('Times', data=_times_array(times))
         h5.create_dataset('XLAT', data=np.broadcast_to(xlat, (n_times, ny, nx)))
         h5.create_dataset('XLONG', data=np.broadcast_to(xlong, (n_times, ny, nx)))
-        h5.create_dataset('COSALPHA', data=np.ones((n_times, ny, nx), dtype='float32'))
-        h5.create_dataset('SINALPHA', data=np.zeros((n_times, ny, nx), dtype='float32'))
+        # WRF's grid->earth rotation for this grid (identity on lat-lon and Mercator). Before 0.7.0 this was
+        # the identity for every projection, which no real projected wrfout carries.
+        if map_proj == 6:
+            cosa, sina = np.ones((ny, nx)), np.zeros((ny, nx))
+        else:
+            cosa, sina, _ = grid_rotation(map_proj, proj['truelat1'], proj.get('truelat2', proj['truelat1']),
+                                          proj.get('stdlon', 0.0), xlong)
+        h5.create_dataset('COSALPHA', data=np.broadcast_to(cosa.astype('float32'), (n_times, ny, nx)))
+        h5.create_dataset('SINALPHA', data=np.broadcast_to(sina.astype('float32'), (n_times, ny, nx)))
 
         for name in variables:
             field = np.stack([expected(name, lead, ny, nx) for lead in leads])
@@ -308,3 +317,216 @@ def write_run(
                                   simulation_start=init64, **kwargs))
         t += n
     return paths
+
+
+# ------------------------------------------------------------------------------------------------------
+# Pressure-level diagnostics (auxhist23, 'wrfplevels' files)
+# ------------------------------------------------------------------------------------------------------
+
+# Southern-hemisphere tangent Lambert grid that crosses the antimeridian (lon 160 -> ~185 for nx = 30), with
+# |alpha| up to ~11 deg -- the shape of the NZ domains, where a sign error is large and a naive longitude
+# difference breaks.
+PLEV_PROJECTION = dict(dx=60000.0, truelat1=-45.0, truelat2=-45.0, stdlon=175.0)
+PLEV_LEVELS = (90000.0, 85000.0, 60000.0, 50000.0, 30000.0)   # descending, as WRF's press_levels must be
+PLEV_FIELDS = ('GHT_PL', 'T_PL', 'Q_PL', 'U_PL', 'V_PL', 'RH_PL', 'TD_PL', 'S_PL')
+PLEV_MISSING = -999.0
+
+
+def plev_earth_wind(p: float, lead: int):
+    """Earth-relative (u, v) (m/s) at pressure ``p`` (Pa) and ``lead`` hours: uniform in space, distinct per level."""
+    return 10.0 + p / 10000.0 + 0.1 * lead, 5.0 - p / 20000.0 - 0.05 * lead
+
+
+def _plev_rh_fraction_unclipped(p: float, ny: int, nx: int) -> np.ndarray:
+    j = np.arange(ny, dtype='float64')[:, None]
+    i = np.arange(nx, dtype='float64')[None, :]
+    return (40.0 + p / 2000.0 + Y_SLOPE * j + X_SLOPE * i) / 100.0
+
+
+def plev_expected(name: str, p: float, lead: int, ny: int, nx: int) -> np.ndarray:
+    """
+    The (ny, nx) value of ``name`` at pressure ``p`` and ``lead``, as the ingest should STORE it (U/V
+    earth-relative, RH as a clipped fraction), ignoring the missing-value masks of :func:`plev_masks`.
+    """
+    j = np.arange(ny, dtype='float64')[:, None]
+    i = np.arange(nx, dtype='float64')[None, :]
+    g = Y_SLOPE * j + X_SLOPE * i
+    ue, ve = plev_earth_wind(p, lead)
+    if name == 'GHT_PL':
+        return 44330.8 * (1.0 - (p / 101325.0) ** 0.1903) + 0.5 * lead + 10.0 * g
+    if name == 'T_PL':
+        return 200.0 + p / 1000.0 + 0.01 * lead + g
+    if name == 'TD_PL':
+        return 195.0 + p / 1000.0 + 0.01 * lead + g
+    if name == 'Q_PL':
+        return 1e-7 * p + 1e-6 * lead + 1e-5 * g
+    if name == 'RH_PL':   # stored as a fraction; write_wrfplevels writes percent, 104 % at cell (0, 0)
+        return np.clip(_plev_rh_fraction_unclipped(p, ny, nx), 0.0, 1.0)
+    if name == 'U_PL':
+        return np.full((ny, nx), ue)
+    if name == 'V_PL':
+        return np.full((ny, nx), ve)
+    if name == 'S_PL':
+        return np.full((ny, nx), np.hypot(ue, ve))
+    raise KeyError(f'no closed form for {name!r}; known: {PLEV_FIELDS}')
+
+
+def plev_masks(ny: int, nx: int, levels=PLEV_LEVELS):
+    """
+    ``{(field_group, p): bool (ny, nx)}`` -- where :func:`write_wrfplevels` writes the missing value when
+    ``mountain`` is on, mimicking ``module_diag_pld.F`` with ``extrap_below_grnd = 1``: at the highest-pressure
+    level a "mountain" box where everything but GHT is missing (below the lowest half level, above the
+    surface: GHT is interpolated on full levels and stays valid) around a core where GHT is missing too
+    (below ground); at the next level only the core. ``field_group`` is ``'GHT'`` or ``'other'``.
+    """
+    box = np.zeros((ny, nx), bool)
+    box[ny // 4: ny // 2, nx // 3: nx // 2] = True
+    core = np.zeros((ny, nx), bool)
+    core[ny // 4 + 1: ny // 2 - 1, nx // 3 + 1: nx // 2 - 1] = True
+    p_hi = max(levels)
+    p_next = sorted(levels)[-2] if len(levels) > 1 else None
+    masks = {}
+    for p in levels:
+        if p == p_hi:
+            masks[('other', p)], masks[('GHT', p)] = box, core
+        elif p == p_next:
+            masks[('other', p)], masks[('GHT', p)] = core, core
+        else:
+            masks[('other', p)] = masks[('GHT', p)] = np.zeros((ny, nx), bool)
+    return masks
+
+
+def _fd_basis(xlat, xlong):
+    """
+    Unit vectors of the grid +x and +y directions in local (east, north) components, from centred finite
+    differences of the cell centres (longitudes unwrapped per axis, so a grid across the antimeridian is
+    continuous). Independent of any projection formula: it reads the geography, not the map parameters.
+    """
+    lat = np.radians(xlat.astype('float64'))
+    lon_x = np.unwrap(np.radians(xlong.astype('float64')), axis=1)
+    lon_y = np.unwrap(np.radians(xlong.astype('float64')), axis=0)
+    coslat = np.cos(lat)
+    ex = np.stack([np.gradient(lon_x, axis=1) * coslat, np.gradient(lat, axis=1)])
+    ey = np.stack([np.gradient(lon_y, axis=0) * coslat, np.gradient(lat, axis=0)])
+    ex /= np.hypot(*ex)
+    ey /= np.hypot(*ey)
+    return ex, ey
+
+
+def write_wrfplevels(
+    path,
+    start_time,
+    n_times: int,
+    ny: int,
+    nx: int,
+    *,
+    hour_step: int = 3,
+    simulation_start=None,
+    levels: Sequence[float] = PLEV_LEVELS,
+    variables: Iterable[str] = PLEV_FIELDS,
+    map_proj: int = 1,
+    projection: Optional[dict] = None,
+    lat0: float = -50.0,
+    lon0: float = 160.0,
+    mountain: bool = True,
+    missing_levels: Sequence[float] = (),
+    supersaturated_cell: bool = True,
+) -> pathlib.Path:
+    """
+    Write one WRF pressure-level diagnostics file (``p_lev_diags``, stream auxhist23) as WRF lays it out:
+    ``Times``, ``XLAT``/``XLONG``, ``U10``/``V10``/``T2``/``Q2`` (Registry streams {22}{23}), ``P_PL``
+    ``(time, level)`` in the order of ``levels`` (WRF's namelist order), and each ``*_PL`` field
+    ``(time, level, y, x)`` float32 -- and, as in the real stream, NO ``COSALPHA``/``SINALPHA``.
+
+    Values are :func:`plev_expected`, except:
+
+    - ``U_PL``/``V_PL`` (and ``U10``/``V10``) are GRID-relative, built from the uniform earth-relative wind
+      :func:`plev_earth_wind` with the finite-difference grid basis of XLAT/XLONG (:func:`_fd_basis`), never
+      from a rotation formula, so recovering the earth wind tests the ingest's rotation independently;
+    - ``RH_PL`` is in percent and reaches 104 % at cell (0, 0) (``supersaturated_cell``), as WRF's uncapped
+      q/qs can;
+    - ``mountain`` writes ``PLEV_MISSING`` where :func:`plev_masks` says, and every field at a pressure in
+      ``missing_levels`` is missing everywhere (a level above the model top, or a non-descending namelist).
+    """
+    variables = tuple(variables)
+    path = pathlib.Path(path)
+    proj = dict(PLEV_PROJECTION if projection is None else projection)
+    start = np.datetime64(start_time, 'm')
+    sim_start = np.datetime64(simulation_start if simulation_start is not None else start_time, 'm')
+    times = [start + np.timedelta64(k * hour_step, 'h') for k in range(n_times)]
+    leads = [int((t - sim_start).astype('timedelta64[m]').astype('int64') // 60) for t in times]
+    if min(leads) < 0:
+        raise ValueError('start_time precedes simulation_start')
+    levels = [float(p) for p in levels]
+
+    jj, ii = np.meshgrid(np.arange(1, ny + 1), np.arange(1, nx + 1), indexing='ij')
+    la, lo = wps_ijll(map_proj, ii, jj, lat1=lat0, lon1=lon0, dx=proj['dx'], truelat1=proj['truelat1'],
+                      truelat2=proj.get('truelat2'), stdlon=proj.get('stdlon', 0.0))
+    xlat = la.astype('float32')
+    xlong = lo.astype('float32')
+    ex, ey = _fd_basis(xlat, xlong)
+    masks = plev_masks(ny, nx, levels) if mountain else None
+
+    def to_grid(ue, ve):
+        return ue * ex[0] + ve * ex[1], ue * ey[0] + ve * ey[1]
+
+    def stamp(dt64):
+        return str(np.datetime64(dt64, 's')).replace('T', '_')
+
+    # WRF's own netCDF-4 layout for an auxiliary stream, measured on a real wrfzlevels file (2026-09-29,
+    # test3 d01, 534 x 315, 18 levels): every field chunked one frame at a time, 4-D fields holding ALL levels
+    # per chunk, the plane split 2 x 2 into ceil(ny/2) x ceil(nx/2) tiles; gzip level 2 with shuffle.
+    tile = (-(-ny // 2), -(-nx // 2))
+    real_filter = dict(compression='gzip', compression_opts=2, shuffle=True)
+
+    with h5py.File(path, 'w') as h5:
+        h5.attrs['MAP_PROJ'] = np.int32(map_proj)
+        h5.attrs['TITLE'] = ' OUTPUT FROM WRF V4 SYNTHETIC (cfdb_ingest.wrf_synthetic)'.ljust(74)
+        h5.attrs['CEN_LAT'] = np.float32(xlat[ny // 2, nx // 2])
+        h5.attrs['CEN_LON'] = np.float32(xlong[ny // 2, nx // 2])
+        h5.attrs['DX'] = np.float32(proj['dx'])
+        h5.attrs['DY'] = np.float32(proj['dx'])
+        h5.attrs['TRUELAT1'] = np.float32(proj['truelat1'])
+        h5.attrs['TRUELAT2'] = np.float32(proj.get('truelat2', proj['truelat1']))
+        h5.attrs['STAND_LON'] = np.float32(proj.get('stdlon', 0.0))
+        h5.attrs['MOAD_CEN_LAT'] = np.float32(xlat[ny // 2, nx // 2])
+        h5.attrs['SIMULATION_START_DATE'] = stamp(sim_start)
+        h5.attrs['START_DATE'] = stamp(sim_start)
+
+        h5.create_dataset('Times', data=_times_array(times))
+        plane = dict(chunks=(1,) + tile, **real_filter)
+        h5.create_dataset('XLAT', data=np.broadcast_to(xlat, (n_times, ny, nx)), **plane)
+        h5.create_dataset('XLONG', data=np.broadcast_to(xlong, (n_times, ny, nx)), **plane)
+        h5.create_dataset('P_PL', data=np.broadcast_to(np.array(levels, dtype='float32'), (n_times, len(levels))),
+                          chunks=(1, len(levels)))
+
+        u10, v10 = zip(*(to_grid(3.0 + 0.05 * lead, -1.0 + 0.02 * lead) for lead in leads))
+        h5.create_dataset('U10', data=np.stack(u10).astype('float32'), **plane)
+        h5.create_dataset('V10', data=np.stack(v10).astype('float32'), **plane)
+        h5.create_dataset('T2', data=np.stack([expected('T2', lead, ny, nx) for lead in leads]), **plane)
+        # Q2 physical at any grid size (expected()'s generic 0.01/row gradient leaves the packed mixing-ratio range)
+        g = Y_SLOPE * np.arange(ny)[:, None] + X_SLOPE * np.arange(nx)[None, :]
+        h5.create_dataset('Q2', data=np.stack([0.008 + 1e-5 * lead + 1e-4 * g for lead in leads]).astype('float32'),
+                          **plane)
+
+        for name in variables:
+            out = np.empty((n_times, len(levels), ny, nx), dtype='float32')
+            for t, lead in enumerate(leads):
+                for k, p in enumerate(levels):
+                    if name in ('U_PL', 'V_PL'):
+                        ug, vg = to_grid(*plev_earth_wind(p, lead))
+                        field = ug if name == 'U_PL' else vg
+                    elif name == 'RH_PL':
+                        field = 100.0 * _plev_rh_fraction_unclipped(p, ny, nx)
+                        if supersaturated_cell:
+                            field[0, 0] = 104.0
+                    else:
+                        field = plev_expected(name, p, lead, ny, nx)
+                    field = np.array(field, dtype='float64')
+                    if masks is not None:
+                        field[masks[('GHT' if name == 'GHT_PL' else 'other', p)]] = PLEV_MISSING
+                    if p in missing_levels:
+                        field[:] = PLEV_MISSING
+                    out[t, k] = field
+            h5.create_dataset(name, data=out, chunks=(1, len(levels)) + tile, **real_filter)
+    return path

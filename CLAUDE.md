@@ -30,6 +30,7 @@ uv run pytest cfdb_ingest/tests/test_era5.py::TestConvertSurface::test_2m_variab
 - `cfdb_ingest/`
   - `base.py` -- `H5Ingest` abstract base class. Handles variable classification (surface/level/soil), named height coordinates, cfdb dataset creation, and three population strategies (rechunkit, per-timestep, batch). Subclass hooks: `file_glob_pattern`, `x_coord_name`/`y_coord_name`, `_init_source_metadata()`, `_create_spatial_coords()`.
   - `wrf.py` -- `WrfIngest(H5Ingest)` for WRF wrfout files. CRS parsing from MAP_PROJ, wind rotation via COSALPHA/SINALPHA, 3D eta-to-height/pressure interpolation, 53 variable mappings with ~30 transforms.
+  - `wrf.py` (0.7.0) -- `WrfPlevIngest(WrfIngest)` for WRF pressure-level diagnostics (`wrfplevels`, auxhist23): native `pressure` axis from `P_PL`, `p_lev_missing` -> NaN in `_post_block_transform`, U_PL/V_PL rotated with `grid_rotation` (analytic; `static_path` wrfout cross-check). Reference: `docs/reference/wrf-plevel-variables.md`.
   - `era5.py` -- `Era5Ingest(H5Ingest)` for NCAR ERA5 NetCDF files. One-variable-per-file handling with `_var_file_map`/`_var_time_map`. EPSG:4326 lat/lon grid. 94 variable mappings. Z disambiguation (pressure-level vs invariant). Split/combined output modes.
   - `ifs.py` -- `IfsIngest` for ECMWF IFS open-data forecast GRIB2 (one cycle per instance; standalone, no h5py machinery). Two-pass read (headers, then per (variable, level) decode/clip) into a `grid_forecast` dataset via `ForecastWriter`. 31 variable mappings; eccodes is the optional `ifs` extra (`eccodeslib` for CCSDS packing).
   - `forecast_archive.py` -- the S3 archive protocol (extra `archive`): open/refuse-create, retention, two-commit `push_and_mark`, sidecar, flock, SIGTERM, `break_locks`.
@@ -43,10 +44,54 @@ uv run pytest cfdb_ingest/tests/test_era5.py::TestConvertSurface::test_2m_variab
 - `cfdb_ingest/tests/`
   - `test_wrf.py` -- 92 WRF conversion tests using subsetted real data in `tests/data/`
   - `test_era5.py` -- 43 ERA5 conversion tests using synthetic data in `tests/data/era5/`
+  - `test_wrf_plevels.py` (0.7.0) -- pressure-level ingest and the WrfIngest rotation guard; every guard mutation-checked (23 author mutants + 16 from code review + 2 chunk-I/O mutants, all killed). Four tests run on REAL WRF output: `tests/data/wrf_plevels/` is a 50 x 50 Southern Alps crop of the Hetzner `plev_test_2023-02` run (mode 1, as the pipeline uploaded it) and its wrfout, made by `create_test_data.create_plevel_subset`; they fail on 8 re-applied defects. Mutation runners must set `PYTHONDONTWRITEBYTECODE=1` and purge `__pycache__` after each restore: a same-length, same-second restore leaves the mutant's `.pyc` looking current
   - `create_test_data.py` -- generates subsetted WRF test files from full wrfout via ncks
   - `create_era5_test_data.py` -- generates synthetic ERA5 test files via h5py
   - `cfdb_ingest/ifs_synthetic.py` (public module, not under tests/) -- generates a synthetic IFS cycle as real GRIB2 (eccodes) with every production quirk (dateline seam, CCSDS, `soilLayer` indices, `sithick` bitmap, 0 h-only orography, accumulated fields); closed-form values exported for assertions. Generated into a session temp dir by the `ifs_cycle_*` fixtures (deterministic, sub-second) -- nothing binary is committed. Public so `ifs-download` can build the same cycles in its tests.
   - `test_ifs.py`, `test_forecast.py`, `test_wrf_forecast.py`, `test_cfdb_to_int.py`, `test_base_helpers.py` -- forecast mode, the exporter (round-trips through `wps_int_reader.py`, a minimal WPS intermediate-format reader), and the shared helpers
+
+## 0.7.0 (release note)
+
+**New:** `WrfPlevIngest` -- WRF `p_lev_diags` output (`wrfplevels_d0N_*`, stream auxhist23) on a native
+`pressure` coordinate (the files' `P_PL`; no interpolation; grid mode only). WRF's `p_lev_missing` (-999)
+becomes NaN before any transform -- `geopotential_height` is the one template whose packed range would store
+-999 as a real height, so `check_encodable` cannot catch it -- and `convert` returns `masked_cells` per
+(variable, level) and warns about a level missing everywhere (a non-descending `press_levels`, or a level
+above the model top). U_PL/V_PL are grid-relative in the file, and the stream carries no COSALPHA: they are
+rotated with `wrf.grid_rotation`, analytic from TRUELAT1/2, STAND_LON and XLONG, validated for the
+tangent-cone Lambert against real COSALPHA (2.7e-7 rad); secant-cone / polar / Mercator need `static_path=`
+a wrfout whose COSALPHA must agree to 1e-5 rad. `wrf_synthetic.write_wrfplevels` generates such files (winds
+built from the finite-difference grid basis, independent of the formula).
+
+**Fixes (silent before):**
+- **Native levels stored in descending order were mislabelled.** `convert`'s native-level shortcut compared
+  the *sorted* levels, so a file holding the same set in another order wrote level k into slot k (1000 hPa data
+  under the 500 hPa label). Now compared in file order. ERA5 is unaffected (NCAR files are ascending).
+- **The multi-source path ignored level selection** (all of `target_levels`): a subset request wrote the first
+  native levels under the requested labels (850 hPa slot <- 700 hPa data) -- latent: no multi-source level
+  variable existed before `U_PL`/`V_PL`. It now reads the requested span and picks, like the single-source path;
+  both pick the levels BEFORE `_post_block_transform`. Every block writer now refuses a block whose level count
+  differs from its output indices, and a native-level variable reaching the per-timestep batch path (which does
+  neither the selection nor the source hook) is refused.
+
+**Behaviour change:** `WrfIngest` on a projected grid without COSALPHA/SINALPHA (an auxiliary stream, or a
+wrfout pruned without them) no longer rotates by the identity: every key whose *active* transform rotates winds
+(U10/V10/WIND_DIR10, the 3-D U/V/WIND_DIR, the VIMF_U/V fallback) is withheld with a warning, and a request for
+one is refused with the reason (`'U10'` would otherwise have resolved by source name to WIND10, the speed).
+Measured on a real auxhist22 file: the old output was grid-relative wind under `eastward_wind`, 13 m/s wrong.
+Wind speed, vorticity and native VIMF stay. `wrf_synthetic.write_wrfout` now writes WRF's true rotation for
+MAP_PROJ 1-3 (it wrote the identity).
+
+**Guards added by code review `cfdb-ingest-plev-code-1`** (three arms; every defect found was in the TESTS -- 12
+surviving mutants, all now killed): `convert(variables=None)` warns again naming the withheld winds; the CLI
+`--preset wps` refuses instead of exporting without winds; `WrfPlevIngest` refuses `missing_value=0` (a real value,
+and the value of the zero pad rows) and forecast-only kwargs; ERA5's `_block_vimf` refuses a level-selected block
+(it broadcast a 2-level block against the full-column `dp` silently). `grid_rotation`'s secant/polar/Mercator
+branches are now checked against the finite-difference geometry of WPS-placed grids (<= 8.6e-6 rad), not only
+against the circular synthetic companion -- still no real-WRF check, so they still need `static_path`.
+
+**Test counts depend on extras:** the full 429 needs `uv sync --extra ifs --extra archive`; without them
+`test_ifs.py` is skipped at module level and the count is ~40 lower.
 
 ## 0.6.0 (release note)
 

@@ -1136,6 +1136,10 @@ class Era5Ingest(H5Ingest):
             levels = self._get_pressure_levels()
             block_cache['vimf_dp'] = np.diff(levels)
         dp = block_cache['vimf_dp']
+        if q.shape[1] != len(dp) + 1 or wind.shape[1] != len(dp) + 1:
+            # dp spans every native level; a level-selected block would broadcast against it silently.
+            raise ValueError(f'VIMF needs every native pressure level ({len(dp) + 1}); got a block of '
+                             f'{q.shape[1]} / {wind.shape[1]} levels')
         qv = q * wind
         # Sum ((qv[k] + qv[k+1]) / 2) * dp[k] across the pressure axis (axis=1).
         integrated = np.sum(

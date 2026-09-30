@@ -266,6 +266,21 @@ class _ConcatTimeSourceUnstaggered(_ConcatTimeSource):
         return (raw[lo] + raw[hi]) / 2.0
 
 
+def _check_level_count(data_var, n_levels, vert_indices) -> None:
+    """
+    A block's middle axis (levels / soil layers / regions) must match the output indices it is written to,
+    one to one. Every writer maps block level ``i`` to ``vert_indices[i]`` with ``enumerate``, so a longer
+    block would drop its tail and a reordered one would land on the wrong labels -- both silently. Refused
+    instead (since 0.7.0). ``n_levels`` is None for a block without a middle axis.
+    """
+    if n_levels is None or vert_indices is None:
+        return
+    if n_levels != len(vert_indices):
+        raise ValueError(f'{data_var.name!r}: block carries {n_levels} level(s) but is written to '
+                         f'{len(vert_indices)} output index(es) {list(vert_indices)}; refusing a silent '
+                         f'mislabel/truncation')
+
+
 def _check_existing_var(data_var, chunk_shape) -> None:
     """Extend mode: an existing variable must keep its chunk shape (when one is requested)."""
     if chunk_shape is not None and tuple(data_var.chunk_shape) != tuple(chunk_shape):
@@ -1114,12 +1129,15 @@ class H5Ingest:
             # Map requested (sorted, ascending) levels onto source native level indices so
             # the rechunkit path can subset/reorder the level axis. None keeps the original
             # all-native-levels path untouched (computed only when the request differs).
+            # The shortcut compares IN FILE ORDER: a file storing its levels descending (WRF writes
+            # press_levels top-down) holds the same set as the ascending coordinate but not the same
+            # order, and without a selection its level k would be written into slot k (since 0.7.0).
             source_level_sel = None
+            native_levels = self._native_level_values() if has_multi_level else None
             if has_multi_level:
-                native_levels = self._native_level_values()
                 if native_levels is not None and not (
                     len(native_levels) == len(sorted_levels)
-                    and np.allclose(np.sort(native_levels), sorted_levels)
+                    and np.allclose(native_levels, sorted_levels)
                 ):
                     source_level_sel = []
                     for lev in sorted_levels:
@@ -1131,6 +1149,17 @@ class H5Ingest:
                                 f'for non-transform pressure-level variables.'
                             )
                         source_level_sel.append(int(idx[0]))
+
+            # A native-level variable must be written by a block path: the per-timestep batch path neither
+            # selects/reorders native levels nor calls _post_block_transform (a source's missing-value
+            # masking), so an unregistered transform name would reach it and write unmasked data silently.
+            if native_levels is not None:
+                stray = [k for k, _, _ in batch_items if self.variables[k]['height'] == 'levels']
+                if stray:
+                    raise RuntimeError(
+                        f'{stray}: native-level variables reached the per-timestep path (their transform is '
+                        f'not a registered block transform); refusing rather than writing unselected, unmasked levels'
+                    )
 
             # Process each group with its optimal strategy
             for var_key, data_var, vert_indices in rechunkit_items:
@@ -1152,8 +1181,15 @@ class H5Ingest:
             if multi_rechunkit_items:
                 for var_key, _, _ in multi_rechunkit_items:
                     self._setup_populate(var_key, target_levels)
-                self._populate_with_multi_rechunker(multi_rechunkit_items, time_mask, spatial_slice, chunk_4d, max_mem,
-                                                    filtered_y=filtered_y, filtered_x=filtered_x)
+                # Level OUTPUTS take the level selection; everything else (surface, region, and column
+                # integrals of level sources such as ERA5 VIMF, which must see every native level) reads
+                # the full source axis. Separate calls, so one group never mixes the two.
+                level_items = [it for it in multi_rechunkit_items if self.variables[it[0]]['height'] == 'levels']
+                other_items = [it for it in multi_rechunkit_items if self.variables[it[0]]['height'] != 'levels']
+                for items, sls in ((other_items, None), (level_items, source_level_sel)):
+                    self._populate_with_multi_rechunker(items, time_mask, spatial_slice, chunk_4d, max_mem,
+                                                        filtered_y=filtered_y, filtered_x=filtered_x,
+                                                        source_level_sel=sls)
 
             if batch_items:
                 for var_key, _, _ in batch_items:
@@ -1531,11 +1567,13 @@ class H5Ingest:
                 source, source.shape, source.dtype,
                 source_chunks, target_chunks, max_mem, sel=sel,
             ):
+                # Pick (and reorder) the requested levels FIRST, so the source hook and the transform see
+                # the block in output-level order -- the same order the multi-source path presents.
+                if level_pick is not None:
+                    data = data[:, level_pick]
                 block = self._post_block_transform(data, src_var, len(source.shape))
                 if block_fn is not None:
                     block = block_fn({src_var: block}, y_sl, x_sl, {})
-                if level_pick is not None:
-                    block = block[:, level_pick]
                 t_outs = self._plan_t_outs(raw_of, pad, write_slices[0].start, write_slices[0].stop)
                 self._write_block_from_t_outs(
                     data_var, block, t_outs, vert_indices, None, None,
@@ -1733,6 +1771,7 @@ class H5Ingest:
         Equivalent to the old len(vert_indices) test for surface/level/soil, and
         additionally correct for a length-1 region axis (3D data, single index).
         """
+        _check_level_count(data_var, data.shape[0] if data.ndim == 3 else None, vert_indices)
         data = self._floor_nonneg(data_var, data)  # before either path: the forecast writer or the direct write
         ys = y_write if y_write is not None else slice(None)
         xs = x_write if x_write is not None else slice(None)
@@ -1771,6 +1810,7 @@ class H5Ingest:
         block = self._floor_nonneg(data_var, block)  # before either path: the forecast writer or the direct write
         ys = y_write if y_write is not None else slice(None)
         xs = x_write if x_write is not None else slice(None)
+        _check_level_count(data_var, block.shape[1] if block.ndim == 4 else None, vert_indices)
         writer = self._forecast_writer
         if writer is not None:
             if block.ndim == 3:
@@ -1824,7 +1864,7 @@ class H5Ingest:
             yield write_slices, data_blocks
 
     def _populate_with_multi_rechunker(self, items, time_mask, spatial_slice, chunk_4d, max_mem,
-                                       filtered_y=None, filtered_x=None):
+                                       filtered_y=None, filtered_x=None, source_level_sel=None):
         """
         Populate one or more transform variables using a single
         ``_multi_rechunker`` call across all input files.
@@ -1846,6 +1886,9 @@ class H5Ingest:
         if not items:
             return
         if self._heterogeneous_grids:
+            if source_level_sel is not None:
+                raise NotImplementedError('a native-level subset/reorder is not implemented for heterogeneous '
+                                          'grids (per-file multi-source path)')
             return self._populate_with_multi_rechunker_per_file(
                 items, time_mask, spatial_slice, chunk_4d, max_mem,
                 filtered_y=filtered_y, filtered_x=filtered_x,
@@ -1861,7 +1904,7 @@ class H5Ingest:
         for group in groups:
             self._populate_with_multi_rechunker_group(
                 group, time_mask, spatial_slice, chunk_4d, max_mem,
-                filtered_y=filtered_y, filtered_x=filtered_x,
+                filtered_y=filtered_y, filtered_x=filtered_x, source_level_sel=source_level_sel,
             )
 
     def _group_items_for_multi_rechunker(self, items):
@@ -1902,8 +1945,14 @@ class H5Ingest:
 
     def _populate_with_multi_rechunker_group(self, items, time_mask, spatial_slice,
                                               chunk_4d, max_mem,
-                                              filtered_y=None, filtered_x=None):
-        """Run a single ``_multi_rechunker`` call for a shape-compatible group."""
+                                              filtered_y=None, filtered_x=None, source_level_sel=None):
+        """
+        Run a single ``_multi_rechunker`` call for a shape-compatible group.
+
+        ``source_level_sel`` (native level indices, in output order) reads only the contiguous span of the
+        requested levels and picks/reorders them before the source hook and the transforms run, exactly as
+        ``_populate_with_rechunkit`` does; without it every native level is read in file order.
+        """
         # Union of source variable names across all items in this group.
         all_sources = set()
         for var_key, _, _ in items:
@@ -1985,6 +2034,7 @@ class H5Ingest:
                 )
 
             spatial_axes = ref_shape[1:]
+            level_pick = None
             if len(spatial_axes) == 2:
                 y_start, y_stop, _ = y_sl.indices(spatial_axes[0])
                 x_start, x_stop, _ = x_sl.indices(spatial_axes[1])
@@ -1996,11 +2046,18 @@ class H5Ingest:
                 nz = spatial_axes[0]
                 y_start, y_stop, _ = y_sl.indices(spatial_axes[1])
                 x_start, x_stop, _ = x_sl.indices(spatial_axes[2])
-                sel = (slice(0, ref_shape[0]), slice(0, nz),
+                if source_level_sel is not None:
+                    lo, hi = min(source_level_sel), max(source_level_sel) + 1
+                    level_pick = [i - lo for i in source_level_sel]
+                else:
+                    lo, hi = 0, nz
+                sel = (slice(0, ref_shape[0]), slice(lo, hi),
                        slice(y_start, y_stop), slice(x_start, x_stop))
-                target_chunks = (target_t, nz, y_stop - y_start, x_stop - x_start)
+                target_chunks = (target_t, hi - lo, y_stop - y_start, x_stop - x_start)
             else:
                 raise ValueError(f'Unsupported source ndim {len(ref_shape)}')
+            if source_level_sel is not None and len(spatial_axes) != 3:
+                raise ValueError(f'a level selection needs 4-D (time, level, y, x) sources, got {ref_shape}')
 
             # Wrap virtual sources as callables for ``_multi_rechunker``.
             source_callables = {sv: src.__call__ for sv, src in sources.items()}
@@ -2011,6 +2068,8 @@ class H5Ingest:
             ):
                 # Apply per-source-var post-block transform (e.g. lat reversal)
                 # before any block transforms run.
+                if level_pick is not None:
+                    data_blocks = {sv: b[:, level_pick] for sv, b in data_blocks.items()}
                 data_blocks_post = {
                     sv: self._post_block_transform(b, sv, len(ref_shape))
                     for sv, b in data_blocks.items()
