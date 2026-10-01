@@ -152,7 +152,8 @@ def stored_var_name(cfdb_name: str) -> str:
 
 
 def create_cfdb_data_var(ds, cfdb_name: str, coord_names: Tuple[str, ...], chunk_shape: Tuple[int, ...],
-                         dtype=None, attrs: Optional[dict] = None, strict: bool = False):
+                         dtype=None, attrs: Optional[dict] = None, strict: bool = False,
+                         stored_name: Optional[str] = None):
     """
     Create (or, in append mode, reuse) a cfdb data variable.
 
@@ -164,8 +165,13 @@ def create_cfdb_data_var(ds, cfdb_name: str, coord_names: Tuple[str, ...], chunk
     If the resolved name already exists (appending an init to an existing forecast dataset) the
     existing variable is returned after checking its coordinates match -- and with ``strict`` (grid
     extend mode) its stored encoding too, so a changed template cannot mix two encodings in one variable.
+
+    ``stored_name`` (``convert(names=...)``, since 0.8.0) stores the variable under another name; the template is
+    still the one of ``cfdb_name``.
     """
     name, var_params, template_attrs = _resolve_var_template(cfdb_name, chunk_shape, dtype)
+    if stored_name is not None:
+        name = stored_name
     if attrs:
         template_attrs = {**template_attrs, **attrs}
 
@@ -279,6 +285,27 @@ def _check_level_count(data_var, n_levels, vert_indices) -> None:
         raise ValueError(f'{data_var.name!r}: block carries {n_levels} level(s) but is written to '
                          f'{len(vert_indices)} output index(es) {list(vert_indices)}; refusing a silent '
                          f'mislabel/truncation')
+
+
+# Variable attribute recording the mapping key(s) a variable was created from (0.8.0). On every later write to an
+# existing dataset the key must match: with names= a stored name no longer implies its source field.
+KEY_ATTR = 'cfdb_ingest_key'
+
+
+def _key_label(var_keys) -> str:
+    return ','.join(sorted(var_keys))
+
+
+def _snap_minutes(t, step_minutes: int, up: bool):
+    """``t`` moved onto the epoch-aligned grid of ``step_minutes`` (up: the next grid time at or after it; else the
+    last at or before it). None stays None."""
+    if t is None:
+        return None
+    m = int(np.datetime64(t, 'm').astype('int64'))
+    r = m % step_minutes
+    if r:
+        m += (step_minutes - r) if up else -r
+    return np.datetime64(m, 'm')
 
 
 def _check_existing_var(data_var, chunk_shape) -> None:
@@ -709,6 +736,9 @@ class H5Ingest:
         time_label: str = 'end',
         squeeze_height: bool = False,
         clip_nonneg: bool = False,
+        names: Optional[Dict[str, str]] = None,
+        frame_step_minutes: Optional[int] = None,
+        valid_time: Union[str, np.datetime64, None] = None,
         **cfdb_kwargs,
     ):
         """
@@ -787,6 +817,18 @@ class H5Ingest:
             negative (mixing ratio, radiation, snow, precipitable water, IVT) but that a model can undershoot
             (WRF's 2 m mixing ratio reaches -0.004 kg/kg in a 1 km nest's first hour). NaN is kept. Off by
             default so diagnostics see the model's raw values; a forecast product turns it on (since 0.6.2).
+        names : dict or None
+            ``{mapping key: stored name}`` (since 0.8.0): store a variable under another name -- e.g. the term a
+            catalogue requires -- keeping the key's cfdb-vars encoding and attributes. Every key must be converted
+            in this call; keys sharing one stored variable must share one name; names must be unique and must not
+            be a coordinate's.
+        frame_step_minutes : int or None
+            Grid mode, WRF only (since 0.8.0): keep only the frames on the epoch-aligned grid of this step (1440:
+            00 UTC daily from hourly files). The output axis has this step (``extend`` stores it); the phase can
+            never follow ``start_date``. A multiple of the frame spacing; instantaneous fields only.
+        valid_time : str, np.datetime64 or None
+            Grid mode, WRF only (since 0.8.0): a time-invariant field. The window must select exactly one frame,
+            which is stored at ``valid_time`` (e.g. terrain height from a ``wrfinput`` file). Not with ``extend``.
         **cfdb_kwargs
             Extra kwargs for cfdb.open_dataset (e.g., compression).
         """
@@ -801,21 +843,33 @@ class H5Ingest:
 
         var_keys = self.resolve_variables(variables)
         self._check_var_keys(var_keys)
-        # Stored names (as create_cfdb_data_var names them) of the variables floored at 0 in this call.
-        self._nonneg_names = frozenset(
-            _resolve_var_template(self.variables[k]['cfdb_name'], None)[0]
-            for k in var_keys if self.variables[k].get('nonneg')
-        ) if clip_nonneg else frozenset()
+        # Stored names of the variables floored at 0 in this call: set once the groups (and names=) are known.
+        self._nonneg_names = frozenset()
+        self._stored_override = {}
+        self._check_names(names, var_keys)
 
         if time_label not in ('end', 'start'):
             raise ValueError(f"time_label must be 'end' or 'start', got {time_label!r}")
         grid_opts = [name for name, on in (('extend', extend), ("time_label='start'", time_label == 'start'),
-                                           ('squeeze_height', squeeze_height)) if on]
+                                           ('squeeze_height', squeeze_height),
+                                           ('frame_step_minutes', frame_step_minutes is not None),
+                                           ('valid_time', valid_time is not None)) if on]
         if grid_opts and forecast:
             raise ValueError(f'{grid_opts} apply to grid mode only (forecast leads are valid times)')
         if grid_opts and not self._supports_grid_extend:
             raise ValueError(f'{grid_opts} are implemented for WRF sources only ({type(self).__name__})')
+        if valid_time is not None and extend:
+            raise ValueError('valid_time writes one time-invariant frame to a fresh dataset; it cannot extend one')
+        if valid_time is not None and frame_step_minutes is not None:
+            raise ValueError('valid_time stores one frame; frame_step_minutes does not apply')
         label_shift = self._label_shift(var_keys) if time_label == 'start' else None
+        if valid_time is not None:
+            valid_time = self._check_valid_time(valid_time, var_keys, label_shift)
+        if frame_step_minutes is not None:
+            frame_step_minutes = self._check_frame_step(frame_step_minutes, var_keys, label_shift)
+            if not extend:
+                raise ValueError('frame_step_minutes needs extend=True: the strided axis is stored with an explicit '
+                                 'step, and a missing frame becomes a placeholder slot instead of closing up the axis')
 
         has_level_interp = any(self.variables[k]['height'] == 'levels' for k in var_keys)
         if has_level_interp and target_levels is None:
@@ -860,9 +914,20 @@ class H5Ingest:
             filtered_times = labels[time_mask]
         else:
             time_mask, filtered_times = self._filter_time(start_date, end_date)
+        if frame_step_minutes is not None:
+            # Epoch-aligned, so a new dataset cannot take the phase of whatever start_date was passed.
+            time_mask &= (self.times.astype('datetime64[m]').astype('int64') % frame_step_minutes) == 0
+            filtered_times = self.times[time_mask]
 
         self._check_window(var_keys, time_mask)
         all_labels = labels if label_shift is not None else self.times
+        if valid_time is not None:
+            if int(time_mask.sum()) != 1:
+                raise ValueError(f'valid_time stores a time-invariant field and needs exactly one frame; the window '
+                                 f'{start_date} .. {end_date} holds {int(time_mask.sum())} (set start_date = end_date)')
+            all_labels = np.asarray(self.times).astype('datetime64[m]').copy()
+            all_labels[np.flatnonzero(time_mask)[0]] = valid_time
+            filtered_times = all_labels[time_mask]
 
         # Output slots. Default: the kept frames, compacted. Extend mode: every step of the window, so a frame
         # missing from the input is an unwritten slot (read as missing; filled by re-running the window once
@@ -870,8 +935,15 @@ class H5Ingest:
         step_minutes = None
         missing_frames = np.array([], dtype='datetime64[m]')
         if extend:
-            step_minutes = self._grid_step_minutes(label_shift)
-            filtered_times, missing_frames = self._window_slots(filtered_times, start_date, end_date, step_minutes)
+            if frame_step_minutes is not None:
+                step_minutes = frame_step_minutes
+                window_start = _snap_minutes(start_date, frame_step_minutes, up=True)
+                window_end = _snap_minutes(end_date, frame_step_minutes, up=False)
+            else:
+                step_minutes = self._grid_step_minutes(label_shift)
+                window_start, window_end = start_date, end_date
+            filtered_times, missing_frames = self._window_slots(filtered_times, window_start, window_end,
+                                                                step_minutes)
             if missing_frames.size and any(
                     self.variables[k].get('transform') == 'accumulation_increment' for k in var_keys):
                 raise ValueError(
@@ -898,6 +970,11 @@ class H5Ingest:
         level_vars, surface_vars, soil_vars, region_vars = group_variables(
             self.variables, var_keys, self._field_region_size
         )
+        groups = {**level_vars, **{n: keys for n, (_, keys) in surface_vars.items()}, **soil_vars, **region_vars}
+        self._stored_override = self._resolve_names(names, groups)
+        if clip_nonneg:
+            self._nonneg_names = frozenset(self._stored_name(g) for g, keys in groups.items()
+                                           if any(self.variables[k].get('nonneg') for k in keys))
 
         # Collect unique fixed heights needed for surface variables
         fixed_heights = {h for h, _ in surface_vars.values()}
@@ -1013,6 +1090,9 @@ class H5Ingest:
                     depths=soil_depths if (soil_depths is not None and soil_vars) else None,
                     step_minutes=step_minutes, time_label=time_label,
                 )
+            if not created:
+                # Before anything is written: each stored variable must keep holding the same mapping key(s).
+                self._check_key_provenance(ds, groups)
 
             if extend:
                 if created:
@@ -1021,10 +1101,17 @@ class H5Ingest:
                 else:
                     # Refuse a variable mismatch before the time axis is touched.
                     for cfdb_name in surface_vars:
-                        if stored_var_name(cfdb_name) in ds.data_var_names:
+                        if self._stored_name(cfdb_name) in ds.data_var_names:
                             coords = ((*time_coord_names, self.y_coord_name, self.x_coord_name) if squeeze_height else
                                       (*time_coord_names, f'height_{int(surface_vars[cfdb_name][0])}m',
                                        self.y_coord_name, self.x_coord_name))
+                            existing = self._create_cfdb_data_var(ds, cfdb_name, coords, storage_chunk, strict=True)
+                            _check_existing_var(existing, storage_chunk if chunk_shape is not None else None)
+                    middle = {**{n: vertical_coord for n in level_vars}, **{n: 'depth' for n in soil_vars},
+                              **{n: 'wvt_region' for n in region_vars}}
+                    for cfdb_name, axis_name in middle.items():
+                        if self._stored_name(cfdb_name) in ds.data_var_names:
+                            coords = (*time_coord_names, axis_name, self.y_coord_name, self.x_coord_name)
                             existing = self._create_cfdb_data_var(ds, cfdb_name, coords, storage_chunk, strict=True)
                             _check_existing_var(existing, storage_chunk if chunk_shape is not None else None)
                     placed = _grid.place_times(ds, filtered_times, step_minutes=step_minutes)
@@ -1078,7 +1165,10 @@ class H5Ingest:
             # Level-interpolated variables: (time, <vertical_coord>, y, x)
             level_coord_names = (*time_coord_names, vertical_coord, self.y_coord_name, self.x_coord_name)
             for cfdb_name, var_key_list in level_vars.items():
-                data_var = self._create_cfdb_data_var(ds, cfdb_name, level_coord_names, storage_chunk)
+                existed = self._stored_name(cfdb_name) in ds.data_var_names
+                data_var = self._create_cfdb_data_var(ds, cfdb_name, level_coord_names, storage_chunk, strict=extend)
+                if not existed:
+                    self._stamp_new_var(data_var, var_key_list, forecast)
                 for var_key in var_key_list:
                     level_indices = list(range(len(sorted_levels)))
                     _classify((var_key, data_var, level_indices), self.variables[var_key])
@@ -1090,7 +1180,7 @@ class H5Ingest:
                     surface_coord_names = (*time_coord_names, self.y_coord_name, self.x_coord_name)
                 else:
                     surface_coord_names = (*time_coord_names, coord_name, self.y_coord_name, self.x_coord_name)
-                existed = stored_var_name(cfdb_name) in ds.data_var_names
+                existed = self._stored_name(cfdb_name) in ds.data_var_names
                 data_var = self._create_cfdb_data_var(ds, cfdb_name, surface_coord_names, storage_chunk,
                                                       strict=extend)
                 if extend and existed:
@@ -1099,11 +1189,14 @@ class H5Ingest:
                     # Align every write to the variable's REAL time chunk (stored one when it existed).
                     chunk_4d = (data_var.chunk_shape[0],) + tuple(chunk_4d[1:])
                 if not existed:
+                    data_var.attrs[KEY_ATTR] = _key_label(var_key_list)
                     if squeeze_height:
                         data_var.attrs['height'] = f'{h:g} m'
                     if label_shift is not None:
                         data_var.attrs['cell_methods'] = (
                             f'time: sum (interval: {int(label_shift / np.timedelta64(1, "m"))} minutes)')
+                    elif not forecast and self._instantaneous(var_key_list):
+                        data_var.attrs['cell_methods'] = 'time: point'
                 for var_key in var_key_list:
                     # index 0 of the length-1 height coord; None = no middle axis (squeeze_height)
                     _classify((var_key, data_var, None if squeeze_height else [0]), self.variables[var_key])
@@ -1111,7 +1204,14 @@ class H5Ingest:
             # Soil variables: (time, depth, y, x)
             soil_coord_names = (*time_coord_names, 'depth', self.y_coord_name, self.x_coord_name)
             for cfdb_name, var_key_list in soil_vars.items():
-                data_var = self._create_cfdb_data_var(ds, cfdb_name, soil_coord_names, storage_chunk)
+                existed = self._stored_name(cfdb_name) in ds.data_var_names
+                data_var = self._create_cfdb_data_var(ds, cfdb_name, soil_coord_names, storage_chunk, strict=extend)
+                if extend and existed:
+                    _check_existing_var(data_var, storage_chunk if chunk_shape is not None else None)
+                if extend:
+                    chunk_4d = (data_var.chunk_shape[0],) + tuple(chunk_4d[1:])
+                if not existed:
+                    self._stamp_new_var(data_var, var_key_list, forecast)
                 for var_key in var_key_list:
                     depth_indices = list(range(len(soil_depths)))
                     _classify((var_key, data_var, depth_indices), self.variables[var_key])
@@ -1121,7 +1221,10 @@ class H5Ingest:
             # via vert_indices=range(N) by the existing populate paths.
             region_coord_names = (*time_coord_names, 'wvt_region', self.y_coord_name, self.x_coord_name)
             for cfdb_name, var_key_list in region_vars.items():
-                data_var = self._create_cfdb_data_var(ds, cfdb_name, region_coord_names, storage_chunk)
+                existed = self._stored_name(cfdb_name) in ds.data_var_names
+                data_var = self._create_cfdb_data_var(ds, cfdb_name, region_coord_names, storage_chunk, strict=extend)
+                if not existed:
+                    data_var.attrs[KEY_ATTR] = _key_label(var_key_list)   # no 'time: point': WVT semantics unchecked
                 for var_key in var_key_list:
                     region_indices = list(range(self._field_region_size[var_key]))
                     _classify((var_key, data_var, region_indices), self.variables[var_key])
@@ -1277,7 +1380,7 @@ class H5Ingest:
         present = np.asarray(filtered_times).astype('datetime64[m]')
         lo = np.datetime64(start_date, 'm') if start_date is not None else present[0]
         hi = np.datetime64(end_date, 'm') if end_date is not None else present[-1]
-        window = np.arange(lo, hi + step, step)
+        window = np.arange(lo, hi + np.timedelta64(1, 'm'), step)   # never past end_date (off-grid ends)
         off = np.setdiff1d(present, window)
         if off.size:
             raise ValueError(f'frames {[str(o) for o in off[:3]]} are off the {step_minutes}-min grid of the '
@@ -1426,7 +1529,111 @@ class H5Ingest:
         """
         Create a cfdb data variable (see the module-level ``create_cfdb_data_var``).
         """
-        return create_cfdb_data_var(ds, cfdb_name, coord_names, chunk_shape, dtype=dtype, attrs=attrs, strict=strict)
+        return create_cfdb_data_var(ds, cfdb_name, coord_names, chunk_shape, dtype=dtype, attrs=attrs, strict=strict,
+                                    stored_name=getattr(self, '_stored_override', {}).get(cfdb_name))
+
+    # Coordinate names a names= override may not take.
+    _RESERVED_STORED_NAMES = frozenset({'time', 'depth', 'height', 'pressure', 'wvt_region', 'crs', 'lat', 'lon',
+                                        'latitude', 'longitude', _fc.FRT, _fc.LEAD})
+
+    def _check_names(self, names, var_keys) -> None:
+        """``convert(names=...)``: shape checks that need no grouping (see ``_resolve_names`` for the rest)."""
+        if names is None:
+            return
+        if not isinstance(names, dict):
+            raise ValueError(f'names must be a dict {{mapping key: stored name}}, got {type(names).__name__}')
+        unknown = sorted(k for k in names if k not in var_keys)
+        if unknown:
+            raise ValueError(f'names= keys {unknown} are not among the converted variables {list(var_keys)} '
+                             f'(use the mapping keys, e.g. T2)')
+        reserved = self._RESERVED_STORED_NAMES | {self.x_coord_name, self.y_coord_name}
+        for key, name in names.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError(f'names[{key!r}] must be a non-empty string, got {name!r}')
+            if name in reserved or name.startswith('height_'):
+                raise ValueError(f'names[{key!r}] = {name!r} is a coordinate name')
+
+    def _resolve_names(self, names, groups) -> dict:
+        """
+        ``{group: stored name}`` for this call. ``groups`` maps each output variable (as ``group_variables`` names
+        it) to its mapping keys. Keys writing one variable must share one name, and the final stored names must
+        be unique (an override may not land on another variable's name).
+        """
+        override = {}
+        for group, keys in (groups.items() if names else ()):
+            wanted = {names[k] for k in keys if k in names}
+            if not wanted:
+                continue
+            if len(wanted) > 1 or any(k not in names for k in keys):
+                raise ValueError(f'{list(keys)} write one stored variable; give all of them the same name')
+            override[group] = wanted.pop()
+        final = [override.get(g) or stored_var_name(g) for g in groups]
+        dups = sorted({n for n in final if final.count(n) > 1})
+        if dups:
+            raise ValueError(f'two variables would get the same stored name {dups}')
+        return override
+
+    def _check_frame_step(self, frame_step_minutes, var_keys, label_shift) -> int:
+        """``convert(frame_step_minutes=...)``: a positive multiple of the frame spacing, instantaneous fields only."""
+        step = int(frame_step_minutes)
+        if step != frame_step_minutes or step <= 0:
+            raise ValueError(f'frame_step_minutes must be a positive whole number of minutes, '
+                             f'got {frame_step_minutes!r}')
+        accumulated = sorted(k for k in var_keys if self.variables[k].get('accumulated')
+                             or self.variables[k].get('transform') == 'accumulation_increment')
+        if label_shift is not None or accumulated:
+            raise ValueError(f'frame_step_minutes keeps instantaneous frames only; {accumulated} accumulate over '
+                             f'the frame spacing, so a strided frame would not cover its step')
+        d = np.diff(np.unique(np.asarray(self.times).astype('datetime64[m]')))
+        native = int(d.min() / np.timedelta64(1, 'm')) if len(d) else None
+        if native and step % native:
+            raise ValueError(f'frame_step_minutes={step} must be a multiple of the {native}-min frame spacing')
+        return step
+
+    def _stamp_new_var(self, data_var, var_keys, forecast) -> None:
+        """Attributes of a newly created level/soil variable: its mapping key(s), and 'time: point' if instantaneous."""
+        data_var.attrs[KEY_ATTR] = _key_label(var_keys)
+        if not forecast and self._instantaneous(var_keys):
+            data_var.attrs['cell_methods'] = 'time: point'
+
+    def _check_key_provenance(self, ds, groups) -> None:
+        """
+        An existing target (grid extend, forecast append): refuse writing a mapping key into a variable created from
+        another key (same encoding, e.g. TSK into a T2 'temperature'), or storing a key under a second name when the
+        dataset already holds it under another (a band that forgot or misspelt names=). Variables created before
+        0.8.0 carry no record and are not checked.
+        """
+        recorded = {v: ds[v].attrs.data.get(KEY_ATTR) for v in ds.data_var_names}
+        for group, keys in groups.items():
+            want, name = _key_label(keys), self._stored_name(group)
+            have = recorded.get(name)
+            if have is not None and have != want:
+                raise ValueError(f'{name!r} in the target holds {have}; this call would write {want} into it '
+                                 f'(check names=)')
+            elsewhere = sorted(v for v, k in recorded.items() if k == want and v != name)
+            if elsewhere:
+                raise ValueError(f'{want} is already stored as {elsewhere} in the target; this call would store it '
+                                 f'as {name!r} -- pass names={{{keys[0]!r}: {elsewhere[0]!r}}} to extend it')
+
+    def _check_valid_time(self, valid_time, var_keys, label_shift):
+        """``convert(valid_time=...)``: a real time, for instantaneous fields."""
+        if isinstance(valid_time, (bool, int, float)) or (isinstance(valid_time, str) and not valid_time.strip()):
+            raise ValueError(f'valid_time must be a date/time, got {valid_time!r}')
+        t = np.datetime64(valid_time, 'm')
+        if np.isnat(t):
+            raise ValueError(f'valid_time must be a date/time, got {valid_time!r}')
+        if label_shift is not None or not self._instantaneous(var_keys):
+            raise ValueError('valid_time stores one instantaneous frame; accumulations span an interval')
+        return t
+
+    def _instantaneous(self, var_keys) -> bool:
+        """True when none of ``var_keys`` is an accumulation (the field is a value AT the frame time)."""
+        return not any(self.variables[k].get('accumulated')
+                       or self.variables[k].get('transform') == 'accumulation_increment' for k in var_keys)
+
+    def _stored_name(self, group_name):
+        """The name a variable group is stored under in this call: the ``names=`` override, else the template's."""
+        return getattr(self, '_stored_override', {}).get(group_name) or stored_var_name(group_name)
 
     def _setup_populate(self, var_key, target_levels):
         """Hook called before populating a data variable. Override as needed."""
@@ -1826,6 +2033,10 @@ class H5Ingest:
             data_var[(time_slice, ys, xs)] = block
         elif block.ndim == 3:
             data_var[(time_slice, vert_indices[0], ys, xs)] = block
+        elif len(vert_indices) > 1 and np.array_equal(np.diff(vert_indices), np.ones(len(vert_indices) - 1)):
+            # A contiguous run of levels/layers in one assignment: a chunk spanning several of them is then stored
+            # once, not once per level (0.8.0; soil chunks hold all their layers).
+            data_var[(time_slice, slice(int(vert_indices[0]), int(vert_indices[-1]) + 1), ys, xs)] = block
         else:
             for lev_i, v_idx in enumerate(vert_indices):
                 data_var[(time_slice, v_idx, ys, xs)] = block[:, lev_i]

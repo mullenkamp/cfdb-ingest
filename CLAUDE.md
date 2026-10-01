@@ -50,6 +50,31 @@ uv run pytest cfdb_ingest/tests/test_era5.py::TestConvertSurface::test_2m_variab
   - `cfdb_ingest/ifs_synthetic.py` (public module, not under tests/) -- generates a synthetic IFS cycle as real GRIB2 (eccodes) with every production quirk (dateline seam, CCSDS, `soilLayer` indices, `sithick` bitmap, 0 h-only orography, accumulated fields); closed-form values exported for assertions. Generated into a session temp dir by the `ifs_cycle_*` fixtures (deterministic, sub-second) -- nothing binary is committed. Public so `ifs-download` can build the same cycles in its tests.
   - `test_ifs.py`, `test_forecast.py`, `test_wrf_forecast.py`, `test_cfdb_to_int.py`, `test_base_helpers.py` -- forecast mode, the exporter (round-trips through `wps_int_reader.py`, a minimal WPS intermediate-format reader), and the shared helpers
 
+## 0.8.0 (release note)
+
+**New `convert()` options (grid mode, WRF):** `names={key: stored_name}` (store under another name with the
+key's cfdb-vars encoding -- one choke point, `H5Ingest._stored_name`, used by every create/existence/nonneg
+site); `frame_step_minutes` (epoch-aligned strided axis, e.g. daily 00 UTC; instantaneous fields only);
+`valid_time` (one frame stored at a chosen time, for static fields). **`WrfIngest(..., static_path=)`**: a full
+wrfout or wrfinput lends COSALPHA/SINALPHA to files that lack them (`_init_rotation` moved up from
+`WrfPlevIngest`; grid attrs, XLAT/XLONG and the formula must agree). Instantaneous grid-mode fields get
+`cell_methods='time: point'`. `Q2_SH` is `nonneg`. Requires cfdb-vars >= 0.2.8 (`wind_direction` is labelled
+`wind_from_direction`; the stored value always was the FROM direction).
+
+**Key provenance (review `cfdb-ingest-080-code-1`):** every variable created now records its mapping key(s) in
+`cfdb_ingest_key`; an existing target (grid extend, forecast append) refuses another key into it, or the same key
+under a second name. `frame_step_minutes` requires `extend=True`; `valid_time` refuses accumulations and non-times;
+a `static_path` of another grid is refused even when the inputs carry COSALPHA.
+
+**Fixes:** an `extend` window whose `end_date` is off the step grid no longer adds a placeholder slot past it
+(`_window_slots`); level, soil and region variables get the `extend` strict encoding/chunk check and the
+pre-check before the axis is touched (surface ones already had it); soil fields go through the cross-file
+rechunker (`soil_3d` block transform) and a contiguous run of levels/layers is written in one assignment, so each
+chunk is stored once (was once per input file and layer: 48 writes per chunk for 12 files x 4 layers); `clip_nonneg`
+on a height-suffixed name (`mixing_ratio_2m`) was silently skipped -- the floor list is now built from the stored
+names. Tests: `test_wrf_options_080.py` (53); 34 re-applied mutants all killed (after review: the 19 originals,
+the reviewer's survivors, and one per new guard).
+
 ## 0.7.0 (release note)
 
 **New:** `WrfPlevIngest` -- WRF `p_lev_diags` output (`wrfplevels_d0N_*`, stream auxhist23) on a native

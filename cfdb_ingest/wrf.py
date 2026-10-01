@@ -72,6 +72,7 @@ WRF_VARIABLE_MAPPING = {
         'cfdb_name': 'specific_humidity',
         'source_vars': ['Q2'],
         'transform': 'mixing_ratio_to_specific_humidity_2d',
+        'nonneg': True,
         'height': 2.0,
     },
     'RH2': {
@@ -541,6 +542,11 @@ class WrfIngest(H5Ingest):
     ----------
     input_paths : str, Path, or list thereof
         One or more wrfout file paths.
+    static_path : str or Path, optional
+        A full wrfout or a ``wrfinput`` of the same domain, used only when the input files carry no
+        COSALPHA/SINALPHA (a wrfout pruned of them): its grid attributes and XLAT/XLONG must match, its rotation
+        must agree with the projection formula, and WRF's own values from it then rotate U10/V10/WIND_DIR10
+        (since 0.8.0). Without it those keys are withheld.
     """
 
     file_glob_pattern = 'wrfout*'
@@ -550,6 +556,12 @@ class WrfIngest(H5Ingest):
     # Lambert wrfout files (DX 1-27 km, every local run): healthy 1.6-4.7 m (float32 XLAT/XLONG; worst on
     # 12 km d01), so 25 m leaves ~5x headroom; a WGS84 construction is off by 1-8 km.
     xy_tolerance_m = 25.0
+
+    def __init__(self, input_paths, static_path=None):
+        # A companion file of the same domain (a full wrfout, or wrfinput) lending its COSALPHA/SINALPHA when the
+        # input files carry none (since 0.8.0). Set before the base __init__, which reads the metadata.
+        self._static_path = pathlib.Path(static_path) if static_path is not None else None
+        super().__init__(input_paths)
 
     def _init_source_metadata(self):
         """
@@ -573,7 +585,16 @@ class WrfIngest(H5Ingest):
 
             self._map_proj = int(_wrf_attr(h5.attrs, 'MAP_PROJ'))
             self._pole_lat = float(_wrf_attr(h5.attrs, 'POLE_LAT')) if 'POLE_LAT' in h5.attrs else 90.0
-
+        self._rotation_note = None
+        self._rotation_source = None
+        if getattr(self, '_static_path', None) is not None:
+            if self._cosalpha is None:
+                # The files carry no rotation: take the companion's, after its grid and the formula agree with it.
+                self._init_rotation(fallback_to_formula=False)
+            else:
+                # The files' own rotation is used; a companion of another grid is still a caller error.
+                self._check_companion_grid()
+        with h5py.File(self.input_paths[0], 'r') as h5:
             # Extract WRF source info and physics parameters
             self._source_title = _wrf_attr(h5.attrs, 'TITLE').strip()
             # The run's init, for forecast mode: SIMULATION_START_DATE is the true init of a
@@ -620,13 +641,93 @@ class WrfIngest(H5Ingest):
     # Keys withheld because their transform rotates winds and the rotation is unknown (see _init_variables).
     _unrotatable = ()
 
+    def _read_companion(self, attrs, xlat, xlong, need_rotation):
+        """
+        Check that ``static_path`` is the same grid as the inputs (grid attributes, XLAT/XLONG); return its
+        ``(COSALPHA, SINALPHA)`` as float64 when ``need_rotation`` (refused if it has none), else ``(None, None)``.
+        """
+        with h5py.File(self._static_path, 'r') as st:
+            for key, ref in attrs.items():
+                val = _wrf_attr(st.attrs, key) if key in st.attrs else None
+                same = val is not None and (val == ref if isinstance(ref, str) else
+                                            np.isclose(val, ref, rtol=1e-6, atol=1e-6))
+                if not same:
+                    raise ValueError(f'static_path {self._static_path.name}: {key}={val!r} differs from {ref!r} '
+                                     f'in {self.input_paths[0].name}; not the same grid')
+            if st['XLAT'].shape[-2:] != xlat.shape:
+                raise ValueError(f'static_path {self._static_path.name}: XLAT shape {st["XLAT"].shape[-2:]} differs '
+                                 f'from {xlat.shape}; not the same grid')
+            off = max(float(np.max(np.abs(st['XLAT'][0] - xlat))),
+                      float(np.max(np.abs((st['XLONG'][0] - xlong + 180.0) % 360.0 - 180.0))))
+            if off > _COMPANION_XY_ATOL_DEG:
+                raise ValueError(f'static_path {self._static_path.name}: XLAT/XLONG differ by up to {off:.2e} '
+                                 f'deg from {self.input_paths[0].name}; not the same grid')
+            if not need_rotation:
+                return None, None
+            if 'COSALPHA' not in st or 'SINALPHA' not in st:
+                raise ValueError(f'static_path {self._static_path.name} has no COSALPHA/SINALPHA')
+            return st['COSALPHA'][0].astype('float64'), st['SINALPHA'][0].astype('float64')
+
+    def _check_companion_grid(self):
+        """``static_path`` given while the inputs carry their own rotation: still refuse a companion of another grid."""
+        with h5py.File(self.input_paths[0], 'r') as h5:
+            attrs = {k: _wrf_attr(h5.attrs, k) for k in _WRF_GRID_ATTRS if k in h5.attrs}
+            xlat = h5['XLAT'][0].astype('float64')
+            xlong = h5['XLONG'][0].astype('float64')
+        self._read_companion(attrs, xlat, xlong, need_rotation=False)
+
+    def _init_rotation(self, fallback_to_formula=True):
+        """
+        Set ``_cosalpha``/``_sinalpha`` (2-D) from the formula, cross-checked against ``static_path`` if given (then
+        WRF's own values from it are used). Without ``static_path``: the formula where it is validated, if
+        ``fallback_to_formula`` (pressure-level files; ``WrfIngest`` calls this only with a ``static_path``).
+        """
+        with h5py.File(self.input_paths[0], 'r') as h5:
+            attrs = {k: _wrf_attr(h5.attrs, k) for k in _WRF_GRID_ATTRS if k in h5.attrs}
+            xlat = h5['XLAT'][0].astype('float64')
+            xlong = h5['XLONG'][0].astype('float64')
+        self._rotation_note = None
+        try:
+            truelat1 = float(attrs.get('TRUELAT1', 0.0))
+            cosa, sina, validated = grid_rotation(
+                self._map_proj, truelat1, float(attrs.get('TRUELAT2', truelat1)), float(attrs.get('STAND_LON', 0.0)),
+                xlong, pole_lat=self._pole_lat)
+        except ValueError as e:
+            self._cosalpha = self._sinalpha = None
+            self._rotation_note = str(e)
+            return
+
+        if self._static_path is not None:
+            f_cos, f_sin = self._read_companion(attrs, xlat, xlong, need_rotation=True)
+            diff = np.abs(np.angle(np.exp(1j * (np.arctan2(f_sin, f_cos) - np.arctan2(sina, cosa)))))
+            worst = float(np.max(diff))
+            if worst > ROTATION_TOLERANCE_RAD:
+                raise ValueError(
+                    f'wind rotation from the projection attributes disagrees with COSALPHA/SINALPHA of '
+                    f'{self._static_path.name} by up to {worst:.2e} rad (tolerance {ROTATION_TOLERANCE_RAD:g}); '
+                    f'the formula does not describe this grid (MAP_PROJ={self._map_proj}) -- refusing')
+            # WRF's own values, now shown to match the formula.
+            self._cosalpha, self._sinalpha = f_cos, f_sin
+            self._rotation_source = f'COSALPHA/SINALPHA of {self._static_path.name} (formula agrees to {worst:.1e} rad)'
+        elif validated and fallback_to_formula:
+            self._cosalpha, self._sinalpha = cosa, sina
+            self._rotation_source = 'analytic from TRUELAT1/TRUELAT2/STAND_LON/XLONG'
+        else:
+            self._cosalpha = self._sinalpha = None
+            self._rotation_note = (f'the rotation formula for MAP_PROJ={self._map_proj} '
+                                   f'(TRUELAT1={attrs.get("TRUELAT1")}, TRUELAT2={attrs.get("TRUELAT2")}) is not '
+                                   f'validated against real WRF output')
+
     def _rotation_known(self):
         """True when grid->earth rotation is available: COSALPHA/SINALPHA loaded, or a true lat-lon grid."""
         return self._cosalpha is not None or (self._map_proj == 6 and np.isclose(self._pole_lat, 90.0))
 
     def _rotation_remedy(self):
+        if self._rotation_note:
+            return self._rotation_note
         return ('the input files carry no COSALPHA/SINALPHA (an auxiliary output stream, or a wrfout pruned '
-                'without them); convert from the wrfout history files instead')
+                'without them); convert from the wrfout history files instead, or pass static_path=<a wrfout or '
+                'wrfinput of the same domain>')
 
     def _init_variables(self):
         """
@@ -911,6 +1012,8 @@ class WrfIngest(H5Ingest):
         attrs = super()._get_dataset_attrs()
         attrs['source'] = self._source_title
         attrs.update(self._wrf_params)
+        if self._cosalpha is not None and getattr(self, '_rotation_source', None):
+            attrs['wind_rotation'] = self._rotation_source
         return attrs
 
     def _accumulation_source_sum(self, h5, source_vars, time_idx, spatial_slice):
@@ -1595,6 +1698,9 @@ class WrfIngest(H5Ingest):
     # ------------------------------------------------------------------
 
     _BLOCK_TRANSFORMS = {
+        # Soil layers are read as-is; registering them sends SMOIS/TSLB through the cross-file rechunker, so each
+        # (time, depth, y, x) chunk is written once -- not once per input file and layer (0.8.0).
+        'soil_3d': '_block_soil_3d',
         'mixing_ratio_to_specific_humidity_2d': '_block_specific_humidity_2d',
         'relative_humidity_2d': '_block_relative_humidity_2d',
         'dew_point_2d': '_block_dew_point_2d',
@@ -1699,6 +1805,10 @@ class WrfIngest(H5Ingest):
         result = (u_earth, v_earth)
         block_cache['wind_2d'] = result
         return result
+
+    def _block_soil_3d(self, sources, y_sl, x_sl, block_cache):
+        """A soil block (time, layer, y, x) as stored: the same values ``_read_soil_3d`` returns per frame."""
+        return next(iter(sources.values())).astype('float32', copy=False)
 
     def _block_specific_humidity_2d(self, sources, y_sl, x_sl, block_cache):
         q = sources['Q2'].astype('float64')
@@ -1947,7 +2057,6 @@ class WrfPlevIngest(WrfIngest):
     }
 
     def __init__(self, input_paths, static_path=None, missing_value: float = -999.0):
-        self._static_path = pathlib.Path(static_path) if static_path is not None else None
         self._missing_value = float(missing_value)
         if not np.isfinite(self._missing_value) or self._missing_value == 0.0:
             # 0 is a real value of every field here (and the value of the zero pad rows the rechunk blocks carry),
@@ -1955,7 +2064,7 @@ class WrfPlevIngest(WrfIngest):
             raise ValueError(f'missing_value={missing_value!r}: must be a finite, non-zero sentinel '
                              f'(WRF p_lev_missing)')
         self._masked = {}
-        super().__init__(input_paths)
+        super().__init__(input_paths, static_path=static_path)
 
     def _get_variable_mapping(self):
         return WRF_PLEV_VARIABLE_MAPPING
@@ -1998,60 +2107,6 @@ class WrfPlevIngest(WrfIngest):
         self._plevels = levels
 
         self._init_rotation()
-
-    def _init_rotation(self):
-        """Set ``_cosalpha``/``_sinalpha`` (2-D) from the formula, cross-checked against ``static_path`` if given."""
-        with h5py.File(self.input_paths[0], 'r') as h5:
-            attrs = {k: _wrf_attr(h5.attrs, k) for k in _WRF_GRID_ATTRS if k in h5.attrs}
-            xlat = h5['XLAT'][0].astype('float64')
-            xlong = h5['XLONG'][0].astype('float64')
-        self._rotation_note = None
-        try:
-            truelat1 = float(attrs.get('TRUELAT1', 0.0))
-            cosa, sina, validated = grid_rotation(
-                self._map_proj, truelat1, float(attrs.get('TRUELAT2', truelat1)), float(attrs.get('STAND_LON', 0.0)),
-                xlong, pole_lat=self._pole_lat)
-        except ValueError as e:
-            self._cosalpha = self._sinalpha = None
-            self._rotation_note = str(e)
-            return
-
-        if self._static_path is not None:
-            with h5py.File(self._static_path, 'r') as st:
-                for key, ref in attrs.items():
-                    val = _wrf_attr(st.attrs, key) if key in st.attrs else None
-                    same = val is not None and (val == ref if isinstance(ref, str) else
-                                                np.isclose(val, ref, rtol=1e-6, atol=1e-6))
-                    if not same:
-                        raise ValueError(f'static_path {self._static_path.name}: {key}={val!r} differs from {ref!r} '
-                                         f'in {self.input_paths[0].name}; not the same grid')
-                off = max(float(np.max(np.abs(st['XLAT'][0] - xlat))),
-                          float(np.max(np.abs((st['XLONG'][0] - xlong + 180.0) % 360.0 - 180.0))))
-                if off > _COMPANION_XY_ATOL_DEG:
-                    raise ValueError(f'static_path {self._static_path.name}: XLAT/XLONG differ by up to {off:.2e} '
-                                     f'deg from {self.input_paths[0].name}; not the same grid')
-                if 'COSALPHA' not in st or 'SINALPHA' not in st:
-                    raise ValueError(f'static_path {self._static_path.name} has no COSALPHA/SINALPHA')
-                f_cos = st['COSALPHA'][0].astype('float64')
-                f_sin = st['SINALPHA'][0].astype('float64')
-            diff = np.abs(np.angle(np.exp(1j * (np.arctan2(f_sin, f_cos) - np.arctan2(sina, cosa)))))
-            worst = float(np.max(diff))
-            if worst > ROTATION_TOLERANCE_RAD:
-                raise ValueError(
-                    f'wind rotation from the projection attributes disagrees with COSALPHA/SINALPHA of '
-                    f'{self._static_path.name} by up to {worst:.2e} rad (tolerance {ROTATION_TOLERANCE_RAD:g}); '
-                    f'the formula does not describe this grid (MAP_PROJ={self._map_proj}) -- refusing')
-            # WRF's own values, now shown to match the formula.
-            self._cosalpha, self._sinalpha = f_cos, f_sin
-            self._rotation_source = f'COSALPHA/SINALPHA of {self._static_path.name} (formula agrees to {worst:.1e} rad)'
-        elif validated:
-            self._cosalpha, self._sinalpha = cosa, sina
-            self._rotation_source = 'analytic from TRUELAT1/TRUELAT2/STAND_LON/XLONG'
-        else:
-            self._cosalpha = self._sinalpha = None
-            self._rotation_note = (f'the rotation formula for MAP_PROJ={self._map_proj} '
-                                   f'(TRUELAT1={attrs.get("TRUELAT1")}, TRUELAT2={attrs.get("TRUELAT2")}) is not '
-                                   f'validated against real WRF output')
 
     def _rotation_remedy(self):
         note = self._rotation_note or 'no grid->earth rotation is known'

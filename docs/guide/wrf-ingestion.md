@@ -309,6 +309,55 @@ for b0, b1 in bands:
 - `convert` returns `{'status', 'time_index', 'n_times', 'n_new', 'gap_filled', 'missing_frames',
   'variables'}` in grid mode.
 
+### Catalogue names, strided axes and static fields (0.8.0)
+
+Three options for publishing WRF fields as separate datasets (e.g. one envlib dataset per variable):
+
+```python
+from cfdb_ingest import WrfIngest
+
+# Store under the catalogue's term; the key's cfdb-vars encoding and attributes are kept.
+WrfIngest(files).convert('t2.cfdb', variables=['T2'], squeeze_height=True, extend=True,
+                         chunk_shape=(840, 24, 24), names={'T2': 'temperature'})
+
+# Daily 00 UTC samples from hourly files: frames on the epoch-aligned 1440-min grid only.
+WrfIngest(files).convert('smois.cfdb', variables=['SMOIS'], extend=True, chunk_shape=(360, 4, 24, 24),
+                         frame_step_minutes=1440, names={'SMOIS': 'volumetric_water_content'})
+
+# A time-invariant field: one frame, stored at a chosen valid time.
+WrfIngest('wrfout_d03_1990-07-08_00:00:00.nc').convert(
+    'hgt.cfdb', variables=['HGT'], squeeze_height=True, start_date='1990-07-08T00:00',
+    end_date='1990-07-08T00:00', valid_time='1980-01-01T00:00', names={'HGT': 'altitude'})
+```
+
+- **`names={key: stored_name}`.** Keys are mapping keys converted in this call. Keys writing one stored
+  variable must share one name; names must be unique and not a coordinate's. `clip_nonneg` and the `extend`
+  strict checks follow the override. Every variable created by 0.8.0 records its key(s) in the attribute
+  `cfdb_ingest_key`, and a later `extend` or forecast append refuses to write another key into it (TSK into a
+  T2 `temperature` -- same encoding, so the encoding check alone passed it) or to store a key under a second
+  name (a band that forgot or misspelt `names=`). Variables created before 0.8.0 carry no record and are not
+  checked. `cfdb-to-int` matches cfdb-vars names, so a renamed variable is not exported to WPS.
+- **`frame_step_minutes`.** Needs `extend=True` (the axis is stored with this explicit step, and a missing
+  frame becomes a placeholder instead of closing up the axis). A multiple of the frame spacing. The phase is
+  the epoch (1440 = 00 UTC), never `start_date` or the first frame. Instantaneous fields only (accumulations
+  are refused: a strided frame would not cover its step); a target with another step is refused. A frame at
+  a run's cold start (lead 0) is kept like any other -- unlike `time_label='start'`, which drops it -- and
+  where two input files hold the same time, the first in path order wins.
+- **`valid_time`.** The window must select exactly one frame of an instantaneous field. It is a fresh
+  dataset (`extend` is refused), and like every non-extend grid conversion it REPLACES `cfdb_path`.
+- **`static_path`** (`WrfIngest(files, static_path=...)`). Wind keys (`U10`, `V10`, `WIND_DIR10`, the 3-D
+  winds) need WRF's grid rotation. A wrfout pruned of `COSALPHA`/`SINALPHA` can borrow them from a full
+  wrfout or `wrfinput` of the same domain. Its grid attributes and XLAT/XLONG must match, and its rotation
+  must agree with the projection formula (1e-5 rad); the dataset records the source in `wind_rotation`. When
+  the inputs carry their own rotation it is used, but a companion of another grid is still refused.
+- **`cell_methods`.** Instantaneous grid-mode fields are stored with `cell_methods='time: point'`;
+  accumulations are not (interval-start accumulations keep `time: sum (interval: N minutes)`).
+- `WIND_DIR10` is the direction the wind blows FROM, labelled `wind_from_direction` (cfdb-vars >= 0.2.8;
+  `wind_to_direction` before, which was wrong). Attributes are written when a variable is created, so a
+  dataset created earlier keeps its old label and gets no `cell_methods` when extended.
+- **Soil fields** (`SMOIS`, `TSLB`) go through the cross-file rechunker since 0.8.0: each output chunk is
+  stored once (before: once per input file and layer). Values are unchanged.
+
 ### Inspecting metadata before conversion
 
 ```python
