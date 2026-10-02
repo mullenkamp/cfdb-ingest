@@ -321,7 +321,7 @@ WrfIngest(files).convert('t2.cfdb', variables=['T2'], squeeze_height=True, exten
                          chunk_shape=(840, 24, 24), names={'T2': 'temperature'})
 
 # Daily 00 UTC samples from hourly files: frames on the epoch-aligned 1440-min grid only.
-WrfIngest(files).convert('smois.cfdb', variables=['SMOIS'], extend=True, chunk_shape=(360, 4, 24, 24),
+WrfIngest(files).convert('smois.cfdb', variables=['SMOIS'], extend=True, chunk_shape=(360, 1, 24, 24),
                          frame_step_minutes=1440, names={'SMOIS': 'volumetric_water_content'})
 
 # A time-invariant field: one frame, stored at a chosen valid time.

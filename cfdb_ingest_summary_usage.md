@@ -66,7 +66,29 @@ result['masked_cells']   # {source variable: {pressure Pa: cells set to NaN}} --
 - `pressure` comes from the files' `P_PL`; no interpolation. U_PL/V_PL are rotated grid -> earth analytically
   (tangent-cone Lambert validated); other projections need `static_path=<a wrfout of the same domain>`.
 - `Q_PL` is a mixing ratio (`mixing_ratio`); `RH_PL` becomes a clipped 0-1 fraction.
-- `WrfIngest` on a projected file without COSALPHA/SINALPHA withholds the rotated wind keys (0.7.0).
+- `WrfIngest` on a projected file without COSALPHA/SINALPHA withholds the rotated wind keys (0.7.0), unless
+  `WrfIngest(files, static_path=<a full wrfout or wrfinput of the same domain>)` lends them (0.8.0).
+
+### Python API: long grid datasets, one variable per dataset (0.6.0-0.8.0, WRF grid mode)
+```python
+from cfdb_ingest import WrfIngest, grid
+
+# Build a decades-long record in time bands (each call writes or extends; each output chunk written once):
+WrfIngest(band_files).convert('t2.cfdb', variables=['T2'], extend=True, squeeze_height=True,
+                              chunk_shape=(840, 24, 24), start_date=w0, end_date=w1,
+                              names={'T2': 'temperature'})          # store under a catalogue's term (0.8.0)
+# Accumulations labelled by interval START: variables=['PREC_ACC'], time_label='start'
+# Daily 00 UTC from hourly files (instantaneous fields only; needs extend):  frame_step_minutes=1440 (0.8.0)
+# A static field, one frame stored at a chosen time (fresh file):          valid_time='1980-01-01T00:00' (0.8.0)
+bands = grid.time_bands(grid.time_anchor(ds), start, stop, 840, 60)    # band edges on the dataset's chunk grid
+```
+- Instantaneous grid-mode variables carry `cell_methods='time: point'`; every variable records its mapping
+  key(s) in `cfdb_ingest_key`, and an extend or forecast append refuses another key into it, or the same key
+  under a second name (0.8.0).
+- Soil fields (SMOIS, TSLB) go through the cross-file rechunker; a contiguous run of levels/layers is written in
+  one assignment (0.8.0). `WIND_DIR10` is the FROM direction (`wind_from_direction`, cfdb-vars >= 0.2.8).
+- Details: `docs/guide/wrf-ingestion.md`, "Building a long dataset in bands" and "Catalogue names, strided axes
+  and static fields".
 
 ### Python API: ERA5 Ingestion
 
@@ -137,8 +159,10 @@ cfdb-to-int output.cfdb -s 2023-02-10 -e 2023-02-10_06
 ```
 
 ### Advanced Options (Python `convert` method & CLI)
-- `chunk_shape`: Tuple `(time, z, y, x)` to override default chunking (default is `(1, 1, ny, nx)`). CLI: `-c 1,1,50,50`
-- `compression`: `'zstd'` or `'lz4'` (default is `'zstd'`).
+- `chunk_shape`: Tuple `(time, z, y, x)` to override default chunking (default is `(1, 1, ny, nx)`); 3-D
+  `(time, y, x)` with `squeeze_height=True`. CLI: `-c 1,1,50,50`
+- `compression`: `'zstd_shuffle'` (cfdb >= 0.10 default), `'zstd'`, `'lz4_shuffle'` or `'lz4'`. An existing
+  dataset keeps its recorded compression.
 - `max_mem`: Memory budget for read buffers (bytes).
 
 ### Key Rules
