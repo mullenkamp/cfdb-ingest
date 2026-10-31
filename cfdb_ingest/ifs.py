@@ -93,7 +93,7 @@ IFS_VARIABLE_MAPPING = {
     'SSRD': {
         'cfdb_name': 'shortwave_radiation',
         'source_vars': ['ssrd'],
-        'transform': 'accumulation_to_mean_flux',
+        'transform': 'accumulation_to_mean_flux_nonneg',
         'height': 0.0,
     },
     'STRD': {
@@ -145,7 +145,7 @@ IFS_WPS_PRESET_KEYS = [
 
 # Transforms on ONE lead: fn(sources: {shortName: 2-D}, level_pa) -> 2-D. Stack transforms act on
 # the whole (n_lead, ny, nx) stack of a single source: fn(stack, lead_hours) -> stack.
-_STACK_TRANSFORMS = {'accumulation_increment_m_to_mm', 'accumulation_to_mean_flux'}
+_STACK_TRANSFORMS = {'accumulation_increment_m_to_mm', 'accumulation_to_mean_flux', 'accumulation_to_mean_flux_nonneg'}
 
 
 def _t_rh_from_q_t_p(src, level_pa):
@@ -204,6 +204,14 @@ def _t_accumulation_to_mean_flux(stack, lead_hours):
     return out
 
 
+def _t_accumulation_to_mean_flux_nonneg(stack, lead_hours):
+    # Downward shortwave cannot be negative, but the difference of two packed accumulations can be: since
+    # 2026-10-20 the open data packs ssrd in 10 bits (16 before), a step of 32768 J m-2 at 6 h and 262144 at
+    # 144 h, i.e. 3 to 24 W m-2 over 3 h, so a night-time difference dithers about zero (-3.03 W m-2 seen on
+    # 2026-10-30 12z, past the template's -0.9 floor). Clipped like the tp increments; strd never comes near 0.
+    return np.clip(_t_accumulation_to_mean_flux(stack, lead_hours), 0.0, None)
+
+
 _TRANSFORMS = {
     'rh_from_q_t_p': _t_rh_from_q_t_p,
     'rh_from_t_td': _t_rh_from_t_td,
@@ -215,6 +223,7 @@ _TRANSFORMS = {
     'clip_nonneg': _t_clip_nonneg,
     'accumulation_increment_m_to_mm': _t_accumulation_increment_m_to_mm,
     'accumulation_to_mean_flux': _t_accumulation_to_mean_flux,
+    'accumulation_to_mean_flux_nonneg': _t_accumulation_to_mean_flux_nonneg,
 }
 
 # GRIB ``typeOfLevel`` -> catalogue category. A source variable on any OTHER level type is refused:
@@ -223,7 +232,7 @@ _TRANSFORMS = {
 _CATEGORY = {'isobaricInhPa': 'pl', 'soilLayer': 'soil'}
 _SURFACE_LEVEL_TYPES = ('surface', 'heightAboveGround', 'meanSea', 'entireAtmosphere', 'mostUnstableParcel')
 
-# The GRIB ``units`` every source variable is read in (the 0.25 deg open data, 2026-09). The transforms
+# The GRIB ``units`` every source variable is read in (the 0.25 deg open data 2026-09; 0.1 deg 2026-10). The transforms
 # assume these, so a message in other units is refused instead of being converted wrongly -- 50r2's
 # sample carries ``sd`` and ``tp`` in kg m-2 under the SAME shortNames (x1000 against the m-based rows).
 IFS_SOURCE_UNITS = {
@@ -698,7 +707,10 @@ class IfsIngest:
     def _dataset_attrs(self) -> dict:
         return {
             'Conventions': 'CF-1.11',
-            'source': 'ECMWF IFS open data (oper, 0.25 deg), CC-BY-4.0 -- https://www.ecmwf.int/en/forecasts/datasets/open-data',
+            'source': (
+                f'ECMWF IFS open data (oper, {float(self._grid["iDirectionIncrementInDegrees"]):g} deg), '
+                'CC-BY-4.0 -- https://www.ecmwf.int/en/forecasts/datasets/open-data'
+            ),
             'history': f'{datetime.datetime.now(datetime.timezone.utc).isoformat()} created by cfdb-ingest IfsIngest',
             'source_files': [p.name for p in self.input_paths],
         }

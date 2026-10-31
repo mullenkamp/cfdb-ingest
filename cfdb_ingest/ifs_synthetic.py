@@ -35,10 +35,20 @@ SOIL_LAYERS = (1, 2, 3, 4)
 MISSING = 9999.0
 G = 9.80665
 
-def grid_lons_lats():
-    """Raw (unrolled) grid as written: lons 180, 185, ... 535 (mod 360), lats 90 -> -90."""
-    lons = (LON0 + np.arange(NI) * DLON) % 360.0
-    lats = LAT0 - np.arange(NJ) * DLAT
+
+def grid_shape(dlon=DLON):
+    """(Ni, Nj) of the global grid at ``dlon`` degrees (the default 5 deg gives (72, 37))."""
+    ni = round(360.0 / dlon)
+    if abs(ni * dlon - 360.0) > 1e-9:
+        raise ValueError(f'dlon {dlon} does not divide 360')
+    return ni, round(180.0 / dlon) + 1
+
+
+def grid_lons_lats(dlon=DLON):
+    """Raw (unrolled) grid as written: lons 180, 180 + dlon, ... (mod 360), lats 90 -> -90."""
+    ni, nj = grid_shape(dlon)
+    lons = (LON0 + np.arange(ni) * dlon) % 360.0
+    lats = LAT0 - np.arange(nj) * dlon
     return lons, lats
 
 
@@ -200,26 +210,27 @@ ACCUMULATED = {'tp', 'ssrd', 'strd'}
 BITMAPPED = {'sithick'}
 
 
-def field_values(fn, level_or_layer=None, step=0):
-    """Evaluate a closed form on the raw grid -> (NJ, NI) float64, NaN where a bitmap should mask."""
-    lons, lats = grid_lons_lats()
+def field_values(fn, level_or_layer=None, step=0, dlon=DLON):
+    """Evaluate a closed form on the raw grid -> (Nj, Ni) float64, NaN where a bitmap should mask."""
+    lons, lats = grid_lons_lats(dlon)
     lon2, lat2 = np.meshgrid(lons, lats)
     if level_or_layer is None:
         return np.asarray(fn(lat2, lon2, step), dtype='float64') + np.zeros_like(lon2)
     return np.asarray(fn(lat2, lon2, level_or_layer, step), dtype='float64') + np.zeros_like(lon2)
 
 
-def _new_message(ec, sample, short_name, date, time, step):
+def _new_message(ec, sample, short_name, date, time, step, dlon=DLON):
+    ni, nj = grid_shape(dlon)
     h = ec.codes_grib_new_from_samples(sample)
     ec.codes_set(h, 'centre', 'ecmf')
-    ec.codes_set(h, 'Ni', NI)
-    ec.codes_set(h, 'Nj', NJ)
+    ec.codes_set(h, 'Ni', ni)
+    ec.codes_set(h, 'Nj', nj)
     ec.codes_set(h, 'latitudeOfFirstGridPointInDegrees', LAT0)
     ec.codes_set(h, 'longitudeOfFirstGridPointInDegrees', LON0)
-    ec.codes_set(h, 'latitudeOfLastGridPointInDegrees', LAT0 - (NJ - 1) * DLAT)
-    ec.codes_set(h, 'longitudeOfLastGridPointInDegrees', (LON0 + (NI - 1) * DLON) % 360.0)
-    ec.codes_set(h, 'iDirectionIncrementInDegrees', DLON)
-    ec.codes_set(h, 'jDirectionIncrementInDegrees', DLAT)
+    ec.codes_set(h, 'latitudeOfLastGridPointInDegrees', LAT0 - (nj - 1) * dlon)
+    ec.codes_set(h, 'longitudeOfLastGridPointInDegrees', (LON0 + (ni - 1) * dlon) % 360.0)
+    ec.codes_set(h, 'iDirectionIncrementInDegrees', dlon)
+    ec.codes_set(h, 'jDirectionIncrementInDegrees', dlon)
     ec.codes_set(h, 'jScansPositively', 0)
     ec.codes_set(h, 'dataDate', date)
     ec.codes_set(h, 'dataTime', time)
@@ -246,11 +257,13 @@ def _finish(ec, h, values, f):
     ec.codes_release(h)
 
 
-def write_cycle(out_dir, init='2026-09-13T00', steps=STEPS, levels_hpa=LEVELS_HPA, extras=True):
+def write_cycle(out_dir, init='2026-09-13T00', steps=STEPS, levels_hpa=LEVELS_HPA, extras=True, dlon=DLON):
     """
     Write one cycle as ``<out_dir>/YYYYMMDDHH0000-<step>h-oper-fc.grib2`` files. Returns the paths.
 
     ``extras=False`` omits the non-WRF surface bundle (10fg, tcwv, mucape, ssrd, strd, 100u/v).
+    ``dlon`` is the grid spacing in degrees (both directions; it must divide 360). The default 5 deg
+    keeps fixtures sub-second; the closed forms do not depend on it.
     """
     ec = _require_eccodes()
 
@@ -268,24 +281,24 @@ def write_cycle(out_dir, init='2026-09-13T00', steps=STEPS, levels_hpa=LEVELS_HP
             for short, fn in SFC_FIELDS.items():
                 if not extras and short in extras_set:
                     continue
-                h = _new_message(ec, 'regular_ll_sfc_grib2', short, date, time, step)
+                h = _new_message(ec, 'regular_ll_sfc_grib2', short, date, time, step, dlon)
                 ec.codes_set(h, 'shortName', short)
-                _finish(ec, h, field_values(fn, None, step), f)
+                _finish(ec, h, field_values(fn, None, step, dlon), f)
             if step == steps[0]:
                 for short, fn in STEP0_ONLY_FIELDS.items():
-                    h = _new_message(ec, 'regular_ll_sfc_grib2', short, date, time, step)
+                    h = _new_message(ec, 'regular_ll_sfc_grib2', short, date, time, step, dlon)
                     ec.codes_set(h, 'shortName', short)
-                    _finish(ec, h, field_values(fn, None, step), f)
+                    _finish(ec, h, field_values(fn, None, step, dlon), f)
             for short, fn in PL_FIELDS.items():
                 for level in levels_hpa:
-                    h = _new_message(ec, 'regular_ll_pl_grib2', short, date, time, step)
+                    h = _new_message(ec, 'regular_ll_pl_grib2', short, date, time, step, dlon)
                     ec.codes_set(h, 'shortName', short)
                     ec.codes_set(h, 'typeOfLevel', 'isobaricInhPa')
                     ec.codes_set(h, 'level', int(level))
-                    _finish(ec, h, field_values(fn, level, step), f)
+                    _finish(ec, h, field_values(fn, level, step, dlon), f)
             for short, fn in SOIL_FIELDS.items():
                 for layer in SOIL_LAYERS:
-                    h = _new_message(ec, 'regular_ll_sfc_grib2', short, date, time, step)
+                    h = _new_message(ec, 'regular_ll_sfc_grib2', short, date, time, step, dlon)
                     ec.codes_set(h, 'shortName', short)
                     ec.codes_set(h, 'typeOfFirstFixedSurface', 151)
                     ec.codes_set(h, 'scaleFactorOfFirstFixedSurface', 0)
@@ -293,7 +306,7 @@ def write_cycle(out_dir, init='2026-09-13T00', steps=STEPS, levels_hpa=LEVELS_HP
                     ec.codes_set(h, 'typeOfSecondFixedSurface', 151)
                     ec.codes_set(h, 'scaleFactorOfSecondFixedSurface', 0)
                     ec.codes_set(h, 'scaledValueOfSecondFixedSurface', layer)
-                    _finish(ec, h, field_values(fn, layer, step), f)
+                    _finish(ec, h, field_values(fn, layer, step, dlon), f)
         paths.append(path)
     return paths
 

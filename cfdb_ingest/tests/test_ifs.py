@@ -55,6 +55,19 @@ def test_index_metadata(ifs_cycle_dir):
     assert ing._lon_axis[0] == 0.0 and np.all(np.diff(ing._lon_axis) > 0)  # seam rolled away
 
 
+@pytest.mark.parametrize('dlon, spelled', [(5.0, '5 deg'), (2.5, '2.5 deg')])
+def test_source_attr_names_the_grid_resolution(tmp_path, dlon, spelled):
+    # the open data comes at 0.25 and 0.1 deg; the attr is baked in at creation, so it is read from the grid
+    src = tmp_path / 'cycle'
+    syn.write_cycle(src, steps=(0, 3), levels_hpa=(1000, 850), dlon=dlon)
+    ing = IfsIngest(src)
+    assert ing._grid['iDirectionIncrementInDegrees'] == dlon
+    assert len(ing._lon_axis) == syn.grid_shape(dlon)[0]
+    ing.convert(tmp_path / 'ifs.cfdb', variables=['T2'], bbox=BBOX)
+    with cfdb.open_dataset(tmp_path / 'ifs.cfdb') as ds:
+        assert f'(oper, {spelled})' in ds.attrs['source']
+
+
 def test_mixed_inits_refused(ifs_cycle_dir, ifs_cycle_b):
     with pytest.raises(ValueError, match='mix forecast inits'):
         IfsIngest([ifs_cycle_dir, ifs_cycle_b])
@@ -311,6 +324,31 @@ def test_soil_moisture_is_clipped_at_zero():
 
     out = _TRANSFORMS['clip_nonneg']({'vsw': np.array([-3.6e-12, 0.0, 0.3], dtype='float32')}, None)
     assert out.dtype == np.dtype('float32') and out.tolist() == [0.0, 0.0, pytest.approx(0.3)]
+
+
+def test_ssrd_packing_dither_below_zero_is_clipped_not_refused(tmp_path, monkeypatch):
+    # since 2026-10-20 the open data packs ssrd in 10 bits: a night-time 3 h difference of two packed
+    # accumulations can be one quantum below zero (-3.03 W m-2 on 2026-10-30 12z; the template floor is -0.9)
+    assert IFS_VARIABLE_MAPPING['SSRD']['transform'] == 'accumulation_to_mean_flux_nonneg'
+    assert IFS_VARIABLE_MAPPING['STRD']['transform'] == 'accumulation_to_mean_flux'  # strd never comes near 0
+
+    def ssrd_dithered(lat, lon, step):  # the accumulation drops by one 32768 J m-2 quantum at 6 h, south of 40S
+        base = syn.ssrd(lat, lon, min(step, 3))
+        return base - np.where(np.asarray(lat) < -40, 32768.0, 0.0) * (step >= 6)
+
+    monkeypatch.setitem(syn.SFC_FIELDS, 'ssrd', ssrd_dithered)
+    src = tmp_path / 'cycle'
+    syn.write_cycle(src, steps=(0, 3, 6), levels_hpa=(1000, 850))
+    IfsIngest(src).convert(tmp_path / 'ifs.cfdb', variables=['SSRD'], bbox=BBOX)
+    with cfdb.open_dataset(tmp_path / 'ifs.cfdb') as ds:
+        sw = np.squeeze(np.asarray(ds['shortwave_radiation'][0, 2, 0, :, :], dtype='float64'))  # lead 6
+        lat = np.asarray(ds['latitude'].data)
+    south = lat < -40
+    assert np.all(sw[south] == 0.0) and np.all(sw >= 0.0)  # the dither is stored as 0, never refused or missing
+    # without the clip the same cycle is refused by the packed-range guard
+    monkeypatch.setitem(IFS_VARIABLE_MAPPING['SSRD'], 'transform', 'accumulation_to_mean_flux')
+    with pytest.raises(ValueError, match='shortwave_radiation.*exceed the packed template range'):
+        IfsIngest(src).convert(tmp_path / 'raw.cfdb', variables=['SSRD'], bbox=BBOX)
 
 
 # ---------------------------------------------------------------- fail-loudly guards (0.4.2, ahead of IFS Cycle 50r2)

@@ -50,6 +50,19 @@ uv run pytest cfdb_ingest/tests/test_era5.py::TestConvertSurface::test_2m_variab
   - `cfdb_ingest/ifs_synthetic.py` (public module, not under tests/) -- generates a synthetic IFS cycle as real GRIB2 (eccodes) with every production quirk (dateline seam, CCSDS, `soilLayer` indices, `sithick` bitmap, 0 h-only orography, accumulated fields); closed-form values exported for assertions. Generated into a session temp dir by the `ifs_cycle_*` fixtures (deterministic, sub-second) -- nothing binary is committed. Public so `ifs-download` can build the same cycles in its tests.
   - `test_ifs.py`, `test_forecast.py`, `test_wrf_forecast.py`, `test_cfdb_to_int.py`, `test_base_helpers.py` -- forecast mode, the exporter (round-trips through `wps_int_reader.py`, a minimal WPS intermediate-format reader), and the shared helpers
 
+## 0.8.1 (release note)
+
+**IFS 0.1 deg.** The `IfsIngest` dataset `source` attr names the grid's resolution, read from the GRIB
+(`iDirectionIncrementInDegrees`), instead of the literal "0.25 deg"; the attr is set at creation, so a 0.1 deg archive
+created with 0.8.0 would carry the wrong one. Nothing else in the reader assumed 0.25 deg. `ifs_synthetic.write_cycle(...,
+dlon=5.0)` (and `grid_shape`, `grid_lons_lats(dlon)`, `field_values(..., dlon)`) takes the grid spacing; the default and
+every value are unchanged. Test: `test_source_attr_names_the_grid_resolution` (fails with the literal restored).
+**SSRD clipped at 0** (`accumulation_to_mean_flux_nonneg`): since 2026-10-20 the open data packs `ssrd` in 10 bits
+(16 before, at both 0.25 and 0.1 deg), so a night-time 3 h difference of two packed accumulations dips one quantum
+below zero (-3.03 W m-2 on 2026-10-30 12z) and the packed-range guard refused the whole init. `tp` increments were
+already clipped; `strd` never comes near 0 and is unchanged. Test: `test_ssrd_packing_dither_below_zero_is_clipped_not_refused`
+(fails with the mapping or the clip reverted).
+
 ## 0.8.0 (release note)
 
 **New `convert()` options (grid mode, WRF):** `names={key: stored_name}` (store under another name with the

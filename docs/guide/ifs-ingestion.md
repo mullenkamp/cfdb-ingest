@@ -9,12 +9,16 @@ pip install 'cfdb-ingest[ifs]'      # eccodes + eccodeslib (bundled libeccodes w
 
 ## The source
 
-ECMWF publishes its 0.25° IFS forecasts as open data (CC-BY-4.0) on AWS (`s3://ecmwf-forecasts`) and
-`https://data.ecmwf.int/forecasts`, one GRIB2 file per forecast step:
+ECMWF publishes its IFS forecasts as open data (CC-BY-4.0) on AWS (`s3://ecmwf-forecasts`), Google Cloud and
+`https://data.ecmwf.int/forecasts`, at 0.25° as one GRIB2 file per forecast step and, since 2026-10-20, at 0.1° as
+two (pressure levels, and everything else including soil):
 
 ```
-YYYYMMDD/HHz/ifs/0p25/oper/YYYYMMDDHH0000-<step>h-oper-fc.grib2   (+ .index)
+YYYYMMDD/HHz/ifs/0p25/oper/YYYYMMDDHH0000-<step>h-oper-fc.grib2          (+ .index)
+YYYYMMDD/HHz/ifs/0p1/oper/YYYYMMDDHH0000-<step>h-oper-fc-{pl,sfc}.grib2  (+ .index)
 ```
+
+The field inventory and encoding are the same at both resolutions; the reader takes the grid from the GRIB.
 
 An `IfsIngest` takes the files of ONE cycle (any split of that cycle's messages -- whole step files,
 or byte-range subsets assembled from the `.index`) and refuses files that mix inits.
@@ -102,7 +106,7 @@ and a source on a level type it cannot place (`snowLayer` in IFS Cycle 50r2). Ea
 `ValueError` naming the file and message; the fix is a mapping change, never a silent conversion.
 
 Synthetic cycles for tests come from `cfdb_ingest.ifs_synthetic.write_cycle(out_dir, init, steps,
-levels_hpa)` -- real GRIB2 with the production quirks (dateline seam, CCSDS packing, `soilLayer`
+levels_hpa, dlon=5.0)` -- real GRIB2 with the production quirks (dateline seam, CCSDS packing, `soilLayer`
 indices, `sithick` bitmap, 0 h-only orography) and closed-form values for assertions.
 
 ## Downstream: WRF forcing

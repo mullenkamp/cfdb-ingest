@@ -30,7 +30,10 @@ fraction); `land_sea_mask` is the IFS fraction; `sea_surface_temp` is skin tempe
 (the open data carries no SST field and the IFS is ocean-coupled) -- only where the land fraction is below
 `SST_MAX_LAND_FRACTION` (0.1): a partly-land coastal cell's skin temperature carries the land's diurnal cycle
 (up to ~13 K a day at 40-50 % land), so those cells are missing (since 0.6.1; 0.5 before). Accumulated fields (`tp`, `ssrd`,
-`strd`) become per-lead increments / mean fluxes with lead 0 missing.
+`strd`) become per-lead increments / mean fluxes with lead 0 missing. Since 2026-10-20 the open data packs them
+much more coarsely (`ssrd` 10 bits, was 16), so a 3 h difference carries one packing step of noise: about
+3 W m-2 at 6 h and 24 W m-2 at 144 h for `ssrd`, 0.06 to 0.24 mm for `tp`. `tp` increments and (since 0.8.1)
+the `ssrd` mean flux are clipped at 0, where that noise would otherwise go negative.
 
 ## Pressure-level variables
 
@@ -67,7 +70,7 @@ fraction); `land_sea_mask` is the IFS fraction; `sea_surface_temp` is skin tempe
 | `SNOWH` | `snow_depth` | 0 m | sd, rsn | snow physical depth |
 | `RSN` | `snow_density` | 0 m | rsn | direct |
 | `TP` | `precip` | 0 m | tp | accumulation increment m to mm |
-| `SSRD` | `shortwave_radiation` | 0 m | ssrd | accumulation to mean flux |
+| `SSRD` | `shortwave_radiation` | 0 m | ssrd | accumulation to mean flux, clipped at 0 (0.8.1) |
 | `STRD` | `longwave_radiation` | 0 m | strd | accumulation to mean flux |
 | `TCWV` | `pwat` | 0 m | tcwv | direct |
 | `CAPE` | `cape` | 0 m | mucape | direct |
